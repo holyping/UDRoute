@@ -1,0 +1,32 @@
+UDRoute - High-performance UDP Hole-punching & Port Forwarding Tool
+
+Usage:
+  udroute [Options] [Commands] [Quick Setup]
+
+Options:
+  -c [file]             Specify configuration file path (defaults to udroute.ini if no file provided)
+  -log <level>          Set log level: trace, debug, info, warn, error, none
+  -d, -daemon, -service Run in background as a system service or daemon (headless mode)
+
+Commands:
+  -h, -?, -help, --help Show this help message
+  -status               Connect to all running udroute processes on this machine and show their operational status and active data channels
+  -init, -create [file] Generate a well-commented default configuration template file
+  -i [ServiceName]      Install the program as a system service and start automatically (Windows / Linux Systemd)
+  -u [ServiceName]      Stop and uninstall the specified system service
+
+Quick Setup:
+  You can bypass the .ini file and provide configurations directly via command-line syntax:
+  Client: udroute 33890/tcp=rdp_home@your_proxy_ip.com
+  Server: udroute rdp_home=127.0.0.1:3389/tcp@your_proxy_ip.com
+
+Common Examples:
+  1. Generate a commented configuration template:
+     udroute -init
+
+  2. Run in standard foreground console mode (loads udroute.ini automatically):
+     udroute -c
+
+  3. Install as a system service named "UDRoute-Node1" using a specific config file:
+     udroute -i UDRoute-Node1 -c my_config.ini
+

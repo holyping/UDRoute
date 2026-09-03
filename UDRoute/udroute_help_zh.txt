@@ -1,0 +1,32 @@
+UDRoute - 基于 UDP 穿透的高性能端口转发/内网穿透工具
+
+用法 (Usage):
+  udroute [选项] [命令] [快捷配置]
+
+基本选项 (Options):
+  -c [file]             指定配置文件路径 (无后续内容则默认加载当前目录下的 udroute.ini)
+  -log <level>          设置日志级别: trace, debug, info, warn, error, none
+  -d, -daemon, -service 以系统服务或后台守护进程模式无头运行
+
+命令参数 (Commands):
+  -h, -?, -help, --help 显示此帮助信息
+  -status               连接本机所有运行中的 udroute 进程并显示其工作状态、活动数据通道等
+  -init, -create [file] 在当前目录生成一份带有详尽注释的默认配置文件模板
+  -i [ServiceName]      将当前程序注册为系统服务并自动启动 (支持 Windows / Linux Systemd)
+  -u [ServiceName]      停止并卸载指定的系统服务
+
+快捷配置 (Command-line Quick Setup):
+  支持不使用 ini 文件，直接在命令行中按规范传入配置项，如：
+  客户端: udroute 33890/tcp=rdp_home@your_proxy_ip.com
+  服务端: udroute rdp_home=127.0.0.1:3389/tcp@your_proxy_ip.com
+
+常见使用示例:
+  1. 生成一份带有注释说明的配置文件:
+     udroute -init
+
+  2. 以前台控制台模式启动 (自动加载 udroute.ini):
+     udroute -c
+
+  3. 指定配置文件并安装为名为 "UDRoute-Node1" 的系统服务:
+     udroute -i UDRoute-Node1 -c my_config.ini
+
