@@ -185,7 +185,7 @@ namespace UDRoute
                         case "password": case "pwd": case "pass":
                             if (!val.StartsWith("$HWHash$"))
                             {
-                                string protectedVal = ConfigProtector.ComputeHWHash(val);
+                                string protectedVal = ConfigProtector.ComputeHWHash(val, cfg.DevId);
                                 lines[i] = lines[i].Replace(val, protectedVal);
                                 configModified = true;
                                 val = protectedVal;
@@ -207,6 +207,7 @@ namespace UDRoute
                         case "kcpnc": currentKcpConfig.Nc = int.Parse(val); break;
                         case "kcpsndwnd": currentKcpConfig.SndWnd = int.Parse(val); break;
                         case "kcprcvwnd": currentKcpConfig.RcvWnd = int.Parse(val); break;
+                        case "forcerelay": cfg.ForceRelay = val == "1" || val.Equals("true", StringComparison.OrdinalIgnoreCase); break;
                         default:
                             // 解析C模式：15389/tcp=rdp@www.pserver.com
                             if (char.IsDigit(key[0]))
@@ -259,7 +260,7 @@ namespace UDRoute
                         case "password": case "pwd": case "pass":
                             if (!val.StartsWith("$HWHash$"))
                             {
-                                string protectedVal = ConfigProtector.ComputeHWHash(val);
+                                string protectedVal = ConfigProtector.ComputeHWHash(val, cfg.DevId);
                                 lines[i] = lines[i].Replace(val, protectedVal);
                                 configModified = true;
                                 val = protectedVal;
@@ -331,7 +332,8 @@ namespace UDRoute
             {
                 Port = int.Parse(parts[0]),
                 IsTcp = parts.Length == 1 || parts[1].ToLower() == "tcp",
-                Mtu = defaultMtu
+                Mtu = defaultMtu,
+                ForceRelay = cfg.ForceRelay
             };
 
             var valParts = val.Split('@');
@@ -380,6 +382,13 @@ namespace UDRoute
         {
             foreach (var arg in args)
             {
+                if (arg.Equals("-forcerelay", StringComparison.OrdinalIgnoreCase))
+                {
+                    cfg.ForceRelay = true;
+                    // Update any previously added client records that might have missed this flag
+                    foreach (var cr in cfg.ClientRecords) cr.ForceRelay = true;
+                    continue;
+                }
                 if (arg.StartsWith("-")) continue; // 跳过 flags
 
                 int eqIdx = arg.IndexOf('=');

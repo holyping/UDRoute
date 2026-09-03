@@ -3,6 +3,8 @@ using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading.Channels;
+using System.Linq;
+using System.Text;
 using UDRoute.Logging;
 
 namespace UDRoute
@@ -109,12 +111,19 @@ namespace UDRoute
             }
         }
 
-        public async Task<bool> AuthenticateClientAsync(byte[] passwordHash, long sTimestamp, long pRecvTimeTicks, CancellationToken ct)
+        public async Task<bool> AuthenticateClientAsync(byte[] passwordHash, Guid targetDevId, long sTimestamp, long pRecvTimeTicks, CancellationToken ct)
         {
             long tAuth = sTimestamp + (DateTime.UtcNow.Ticks - pRecvTimeTicks);
-            byte[] hashInput = new byte[passwordHash.Length + 8];
-            passwordHash.CopyTo(hashInput, 0);
-            BinaryPrimitives.WriteInt64LittleEndian(hashInput.AsSpan(passwordHash.Length, 8), tAuth);
+            
+            // C端存储的 passwordHash 是 SHA256(plain)
+            // 需要先计算出 S端 期望的 hash2Bytes = SHA256(hash1 + t1)
+            string hash1 = "$SHA256$" + string.Concat(passwordHash.Select(b => b.ToString("x2")));
+            string t1 = ConfigProtector.GetMachineId(targetDevId);
+            byte[] hash2Bytes = ManagedSHA256.ComputeHashBytes(Encoding.UTF8.GetBytes(hash1 + t1));
+            
+            byte[] hashInput = new byte[hash2Bytes.Length + 8];
+            hash2Bytes.CopyTo(hashInput, 0);
+            BinaryPrimitives.WriteInt64LittleEndian(hashInput.AsSpan(hash2Bytes.Length, 8), tAuth);
             byte[] authHash = ManagedSHA256.ComputeHashBytes(hashInput);
 
             byte[] req = new byte[57];
