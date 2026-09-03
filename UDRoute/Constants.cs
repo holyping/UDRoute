@@ -7,6 +7,8 @@ namespace UDRoute
         public const int DefaultRegInterval = 300;
         public const int DefaultRegTimeout = 600;
         public const int DefaultTimeout = 300;
+        public const int DefaultMaxUnauthNamesPerUser = 20;
+        public const int DefaultMaxUnauthNamesTotal = 2000;
     }
 }
 

@@ -13,6 +13,7 @@ namespace UDRoute
         Disconnect = 6,
         EchoReq = 7,
         EchoResp = 8,
-        AuthFail = 9
+        AuthFail = 9,
+        RegFail = 10
     }
 }

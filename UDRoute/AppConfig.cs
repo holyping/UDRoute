@@ -1,5 +1,19 @@
 namespace UDRoute
 {
+    public enum AuthMode
+    {
+        None,
+        Strict,
+        Optional
+    }
+
+    public enum AllowUnauthRelay
+    {
+        Default,
+        Allow,
+        Deny
+    }
+
     // ==========================================
     // 9. 配置解析 (无反射，纯字符串处理)
     // ==========================================
@@ -19,9 +33,12 @@ namespace UDRoute
         
         public string ConfigPath { get; set; } = "";
         public string AuthFile { get; set; } = "";
-        public string AuthMode { get; set; } = "none"; // none, strict, optional
+        public AuthMode AuthMode { get; set; } = AuthMode.None;
+        public AllowUnauthRelay AllowUnauthRelay { get; set; } = AllowUnauthRelay.Default;
+        public int MaxUnauthNamesPerUser { get; set; } = Constants.DefaultMaxUnauthNamesPerUser;
+        public int MaxUnauthNamesTotal { get; set; } = Constants.DefaultMaxUnauthNamesTotal;
         public string Username { get; set; } = "";
-        public string Password { get; set; } = "";
+        public byte[]? Password { get; set; }
 
         public List<ClientRecord> ClientRecords { get; set; } = new();
         public List<ServerRecord> ServerRecords { get; set; } = new();

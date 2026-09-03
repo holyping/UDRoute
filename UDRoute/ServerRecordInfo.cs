@@ -9,6 +9,7 @@ namespace UDRoute
     {
         public Guid DevId { get; set; }
         public EndPoint PublicEp { get; set; } = null!;
+        public string ServiceName { get; set; } = "";
         public int WanPort { get; set; }
         public bool IsTcp { get; set; }
         public KcpConfig KcpConfig { get; set; } = new();

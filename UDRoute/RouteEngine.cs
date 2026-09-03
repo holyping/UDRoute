@@ -157,6 +157,14 @@ namespace UDRoute
                                 Log.Error($"[S] 鉴权失败：收到来自代理服务器({remoteEp})的拒绝连接响应！请检查配置中的 Username 和 Password。");
                                 break;
 
+                            case MsgType.RegFail:
+                                if (span.Length >= 5)
+                                {
+                                    var (reason, _) = ProtocolHelper.ReadString(span.Slice(1));
+                                    Log.Warn($"[S] 注册被代理服务器({remoteEp})拒绝: {reason}");
+                                }
+                                break;
+
                             default:
                                 Log.Debug($"[RouteEngine] Unknown MsgType {(byte)type} from {remoteEp}");
                                 break;

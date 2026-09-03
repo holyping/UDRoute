@@ -17,6 +17,9 @@ namespace UDRoute
         // 存储 Username -> Hash 的字典，大小写不敏感
         private Dictionary<string, string> _users = new(StringComparer.OrdinalIgnoreCase);
         
+        public bool HasUsers => _users.Count > 0;
+        public int UserCount => _users.Count;
+        
         // 用于防止多个变更事件同时触发导致的并发问题
         private readonly object _processLock = new object();
         
@@ -208,7 +211,39 @@ namespace UDRoute
             if (_users.TryGetValue(username, out string? storedHash))
             {
                 if (storedHash == null) return false;
-                // 将用户传入的密码也计算成 Hash，进行比对
+                if (inputPassword.StartsWith("$HW$"))
+                {
+                    var parts = inputPassword.Substring(4).Split('|');
+                    if (parts.Length == 3 && long.TryParse(parts[0], out long ts))
+                    {
+                        // 30秒抗重放攻击验证
+                        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                        if (Math.Abs(now - ts) > 30)
+                        {
+                            Log.Warn($"[Auth] 检测到重放攻击或时间偏移过大: 用户 {username}");
+                            return false;
+                        }
+
+                        string t1 = parts[1];
+                        string hash3 = parts[2];
+
+                        // storedHash 就是 hash1
+                        byte[] expectedHash2Bytes = ManagedSHA256.ComputeHashBytes(Encoding.UTF8.GetBytes(storedHash + t1));
+                        
+                        byte[] tsBytes = Encoding.UTF8.GetBytes(ts.ToString());
+                        byte[] bufferToHash = new byte[32 + tsBytes.Length];
+                        Buffer.BlockCopy(expectedHash2Bytes, 0, bufferToHash, 0, 32);
+                        Buffer.BlockCopy(tsBytes, 0, bufferToHash, 32, tsBytes.Length);
+                        
+                        byte[] expectedHash4Bytes = ManagedSHA256.ComputeHashBytes(bufferToHash);
+                        string expectedHash3Base64 = Convert.ToBase64String(expectedHash4Bytes);
+
+                        return string.Equals(hash3, expectedHash3Base64, StringComparison.OrdinalIgnoreCase);
+                    }
+                    return false;
+                }
+
+                // 将用户传入的明文密码也计算成 Hash，进行比对（向下兼容）
                 string inputHash = HashPrefix + ComputeSha256(inputPassword);
                 return string.Equals(storedHash, inputHash, StringComparison.OrdinalIgnoreCase);
             }
@@ -217,16 +252,7 @@ namespace UDRoute
 
         private string ComputeSha256(string input)
         {
-            using (SHA256 sha256 = SHA256.Create())
-            {
-                byte[] bytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(input));
-                StringBuilder sb = new StringBuilder();
-                for (int i = 0; i < bytes.Length; i++)
-                {
-                    sb.Append(bytes[i].ToString("x2"));
-                }
-                return sb.ToString();
-            }
+            return ManagedSHA256.ComputeHash(input);
         }
 
         public void Dispose()

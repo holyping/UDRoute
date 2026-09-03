@@ -3,6 +3,7 @@ using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
+using System.Text;
 using UDRoute.Logging;
 
 namespace UDRoute
@@ -181,8 +182,27 @@ namespace UDRoute
                         }
                         buffer[countPos] = epCount;
 
-                        offset += ProtocolHelper.WriteString(buffer.AsSpan(offset), _config.Username ?? "");
-                        offset += ProtocolHelper.WriteString(buffer.AsSpan(offset), _config.Password ?? "");
+                        offset += ProtocolHelper.WriteString(buffer.AsSpan(offset), rec.Username ?? _config.Username ?? "");
+                        byte[]? hash2Bytes = rec.Password ?? _config.Password;
+                        string finalPassPayload = "";
+                        
+                        if (hash2Bytes != null && hash2Bytes.Length == 32)
+                        {
+                            string t1 = ConfigProtector.GetMachineId(); // Base64
+                            long ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                            
+                            byte[] tsBytes = Encoding.UTF8.GetBytes(ts.ToString());
+                            byte[] bufferToHash = new byte[32 + tsBytes.Length];
+                            Buffer.BlockCopy(hash2Bytes, 0, bufferToHash, 0, 32);
+                            Buffer.BlockCopy(tsBytes, 0, bufferToHash, 32, tsBytes.Length);
+                            
+                            byte[] hash3Bytes = ManagedSHA256.ComputeHashBytes(bufferToHash);
+                            string hash3 = Convert.ToBase64String(hash3Bytes);
+                            
+                            finalPassPayload = $"$HW${ts}|{t1}|{hash3}";
+                        }
+                        
+                        offset += ProtocolHelper.WriteString(buffer.AsSpan(offset), finalPassPayload);
 
                         string proto = rec.IsTcp ? "tcp" : "udp";
                         // Now we just send the register to the first resolved P endpoint (e.g., IPv4)
@@ -221,16 +241,19 @@ namespace UDRoute
         public async ValueTask ProcessRelayStartAsync(ReadOnlyMemory<byte> packetMem, EndPoint remoteEp, CancellationToken ct)
         {
             var data = packetMem.Span;
-            // [MsgType 1][SessionId 16][TargetName string][ClientPublicEp]
+            // [MsgType 1][SessionId 16][TargetName string][ClientPublicEp][AllowRelay 1]
             if (data.Length < 21) return;
 
             Guid sessionId = new Guid(data.Slice(1, 16));
             int offset = 17;
             var (targetName, nLen) = ProtocolHelper.ReadString(data.Slice(offset));
             offset += nLen;
-            var (cPublicEp, _) = ProtocolHelper.ReadIPEndPoint(data.Slice(offset));
+            var (cPublicEp, epLen) = ProtocolHelper.ReadIPEndPoint(data.Slice(offset));
+            offset += epLen;
 
-            Log.Info($"[S] RelayStart: Session {sessionId} for '{targetName}', Client: {cPublicEp}");
+            bool allowRelay = data[offset++] != 0;
+
+            Log.Info($"[S] RelayStart: Session {sessionId} for '{targetName}', Client: {cPublicEp}, AllowRelay: {allowRelay}");
 
             var rec = _config.ServerRecords.FirstOrDefault(r =>
             {
@@ -244,47 +267,100 @@ namespace UDRoute
             if (rec != null)
             {
                 int mtu = rec.Mtu > 0 ? rec.Mtu : Constants.DefaultMtu;
-                // 初始通过 P 进行中继 (remoteEp 即为 P 的地址)，使用对应目标服务的 KCP 配置
-                var session = new TunnelSession(_udp, remoteEp, sessionId, mtu, rec.IsTcp, rec.KcpConfig, rec.Timeout);
-                session.ChannelDesc = $"{rec.TargetIp}:{rec.TargetPort}";
-                _sessions[sessionId] = session;
 
-                // 向 C 发起直接 UDP 打洞
-                _ = StartPunchingAsync(session, cPublicEp, ct);
-
-                // 连接目标后端服务 (根据 TCP/UDP 分流)
-                _ = Task.Run(async () =>
+                if (!allowRelay)
                 {
-                    try
+                    Log.Info($"[S] P relay is disabled for session {sessionId}. Waiting for UDP punch before bridging backend target...");
+                    // 初始目标指向 C 的公网地址 (而非 P 的地址)
+                    var session = new TunnelSession(_udp, cPublicEp, sessionId, mtu, rec.IsTcp, rec.KcpConfig, rec.Timeout);
+                    session.ChannelDesc = $"{rec.TargetIp}:{rec.TargetPort}";
+                    _sessions[sessionId] = session;
+
+                    _ = Task.Run(async () =>
                     {
-                        if (rec.IsTcp)
+                        try
                         {
-                            var targetClient = new TcpClient();
-                            await targetClient.ConnectAsync(rec.TargetIp, rec.TargetPort, ct);
-                            Log.Info($"[S] Connected to Target TCP {rec.TargetIp}:{rec.TargetPort} for Session {sessionId}");
-                            await session.RunTcpBridgeAsync(targetClient, ct);
+                            bool punchSuccess = await StartPunchingAsync(session, cPublicEp, ct);
+                            if (!punchSuccess)
+                            {
+                                Log.Warn($"[S] P relay is disabled and UDP punch timed out for session {sessionId}. Aborting backend connection.");
+                                return;
+                            }
+
+                            Log.Info($"[S] UDP punch succeeded without P relay! Connecting to backend target {rec.TargetIp}:{rec.TargetPort} for Session {sessionId}");
+                            if (rec.IsTcp)
+                            {
+                                var targetClient = new TcpClient();
+                                await targetClient.ConnectAsync(rec.TargetIp, rec.TargetPort, ct);
+                                Log.Info($"[S] Connected to Target TCP {rec.TargetIp}:{rec.TargetPort} for Session {sessionId}");
+                                await session.RunTcpBridgeAsync(targetClient, ct);
+                            }
+                            else
+                            {
+                                using var targetUdp = new ZeroCopyUdpSocket(0);
+                                var targetEp = new IPEndPoint(IPAddress.Parse(rec.TargetIp), rec.TargetPort);
+                                Log.Info($"[S] Started Target UDP forwarder to {rec.TargetIp}:{rec.TargetPort} for Session {sessionId}");
+                                await session.RunUdpBridgeAsync(targetUdp, targetEp, ct);
+                            }
                         }
-                        else
+                        catch (Exception ex)
                         {
-                            using var targetUdp = new ZeroCopyUdpSocket(0);
-                            var targetEp = new IPEndPoint(IPAddress.Parse(rec.TargetIp), rec.TargetPort);
-                            Log.Info($"[S] Started Target UDP forwarder to {rec.TargetIp}:{rec.TargetPort} for Session {sessionId}");
-                            await session.RunUdpBridgeAsync(targetUdp, targetEp, ct);
+                            Log.Debug($"[S] Target bridge error: {ex.Message}");
                         }
-                    }
-                    catch (Exception ex)
+                        finally
+                        {
+                            if (_sessions.TryRemove(sessionId, out _))
+                            {
+                                Log.Info($"[S] Session {sessionId} closed.");
+                            }
+                            session.Dispose();
+                        }
+                    }, ct);
+                }
+                else
+                {
+                    // 初始通过 P 进行中继 (remoteEp 即为 P 的地址)，使用对应目标服务的 KCP 配置
+                    var session = new TunnelSession(_udp, remoteEp, sessionId, mtu, rec.IsTcp, rec.KcpConfig, rec.Timeout);
+                    session.ChannelDesc = $"{rec.TargetIp}:{rec.TargetPort}";
+                    _sessions[sessionId] = session;
+
+                    // 向 C 发起直接 UDP 打洞
+                    _ = StartPunchingAsync(session, cPublicEp, ct);
+
+                    // 连接目标后端服务 (根据 TCP/UDP 分流)
+                    _ = Task.Run(async () =>
                     {
-                        Log.Debug($"[S] Target bridge error: {ex.Message}");
-                    }
-                    finally
-                    {
-                        if (_sessions.TryRemove(sessionId, out _))
+                        try
                         {
-                            Log.Info($"[S] Session {sessionId} closed.");
+                            if (rec.IsTcp)
+                            {
+                                var targetClient = new TcpClient();
+                                await targetClient.ConnectAsync(rec.TargetIp, rec.TargetPort, ct);
+                                Log.Info($"[S] Connected to Target TCP {rec.TargetIp}:{rec.TargetPort} for Session {sessionId}");
+                                await session.RunTcpBridgeAsync(targetClient, ct);
+                            }
+                            else
+                            {
+                                using var targetUdp = new ZeroCopyUdpSocket(0);
+                                var targetEp = new IPEndPoint(IPAddress.Parse(rec.TargetIp), rec.TargetPort);
+                                Log.Info($"[S] Started Target UDP forwarder to {rec.TargetIp}:{rec.TargetPort} for Session {sessionId}");
+                                await session.RunUdpBridgeAsync(targetUdp, targetEp, ct);
+                            }
                         }
-                        session.Dispose();
-                    }
-                }, ct);
+                        catch (Exception ex)
+                        {
+                            Log.Debug($"[S] Target bridge error: {ex.Message}");
+                        }
+                        finally
+                        {
+                            if (_sessions.TryRemove(sessionId, out _))
+                            {
+                                Log.Info($"[S] Session {sessionId} closed.");
+                            }
+                            session.Dispose();
+                        }
+                    }, ct);
+                }
             }
         }
 
@@ -329,7 +405,7 @@ namespace UDRoute
             return false;
         }
 
-        private async Task StartPunchingAsync(TunnelSession session, IPEndPoint cPublicEp, CancellationToken ct)
+        private async Task<bool> StartPunchingAsync(TunnelSession session, IPEndPoint cPublicEp, CancellationToken ct)
         {
             byte[] punchBuf = new byte[34];
             punchBuf[0] = (byte)MsgType.Punch;
@@ -358,6 +434,8 @@ namespace UDRoute
             {
                 Log.Info($"[S] Session {session.SessionId} UDP punch timed out. Continuing with Proxy relay.");
             }
+
+            return session.IsDirect;
         }
     }
 }

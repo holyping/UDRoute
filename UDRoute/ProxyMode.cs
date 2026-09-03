@@ -14,8 +14,14 @@ namespace UDRoute
         private readonly AppConfig _config;
         private readonly ZeroCopyUdpSocket _udp;
 
-        // Key: name / name.suffix / name.devId | Value: Server Info
-        private readonly ConcurrentDictionary<string, ServerRecordInfo> _routingTable = new(StringComparer.OrdinalIgnoreCase);
+        // Key: name / name.suffix / name.devId | Value: Server Info (鉴权用户)
+        private readonly ConcurrentDictionary<string, ServerRecordInfo> _authRoutingTable = new(StringComparer.OrdinalIgnoreCase);
+        // Key: name / name.suffix / name.devId | Value: Server Info (非鉴权用户)
+        private readonly ConcurrentDictionary<string, ServerRecordInfo> _unauthRoutingTable = new(StringComparer.OrdinalIgnoreCase);
+
+        // 追踪非鉴权用户（按 DevId）注册的 distinct service name 集合 (如 "rdp/tcp")
+        private readonly ConcurrentDictionary<Guid, HashSet<string>> _unauthDevServices = new();
+        private readonly object _unauthLock = new();
 
         // SessionId -> Relay Session (ClientEp <-> ServerEp)
         private readonly ConcurrentDictionary<Guid, RelaySession> _relaySessions = new();
@@ -31,19 +37,43 @@ namespace UDRoute
             _authManager.Start();
         }
 
+        public bool IsRelayAllowed(ServerRecordInfo sInfo)
+        {
+            if (sInfo.IsAuthenticated) return true;
+            return _config.AllowUnauthRelay switch
+            {
+                AllowUnauthRelay.Allow => true,
+                AllowUnauthRelay.Deny => false,
+                _ => !_authManager.HasUsers // Default: 无预定义用户则允许，否则不允许
+            };
+        }
+
         public List<string> GetRegisteredServers()
         {
             var list = new List<string>();
-            foreach (var kvp in _routingTable)
+            foreach (var kvp in _authRoutingTable)
             {
-                list.Add($"{kvp.Key} -> {kvp.Value.PublicEp} [Auth: {kvp.Value.IsAuthenticated}]");
+                list.Add($"{kvp.Key} -> {kvp.Value.PublicEp} [Auth: true, User: {kvp.Value.OwnerUser}]");
+            }
+            foreach (var kvp in _unauthRoutingTable)
+            {
+                list.Add($"{kvp.Key} -> {kvp.Value.PublicEp} [Auth: false, DevId: {kvp.Value.DevId}]");
             }
             return list;
         }
 
         public ServerRecordInfo? DirectQuery(string name)
         {
-            return _routingTable.TryGetValue(name, out var info) ? info : null;
+            // 流程上完全让鉴权用户的注册凌驾于非鉴权用户之上：优先查鉴权用户，再查非鉴权用户
+            if (_authRoutingTable.TryGetValue(name, out var authInfo))
+            {
+                return authInfo;
+            }
+            if (_unauthRoutingTable.TryGetValue(name, out var unauthInfo))
+            {
+                return unauthInfo;
+            }
+            return null;
         }
 
         public Task RunAsync(CancellationToken ct) => CleanupLoopAsync(ct);
@@ -98,7 +128,7 @@ namespace UDRoute
             bool isAuthenticated = false;
             bool providedAuth = !string.IsNullOrEmpty(username) || !string.IsNullOrEmpty(password);
             
-            if (_config.AuthMode == "strict")
+            if (_config.AuthMode == AuthMode.Strict)
             {
                 if (!providedAuth || !_authManager.Authenticate(username, password))
                 {
@@ -107,7 +137,7 @@ namespace UDRoute
                 }
                 isAuthenticated = true;
             }
-            else if (_config.AuthMode == "optional")
+            else if (_config.AuthMode == AuthMode.Optional)
             {
                 if (providedAuth)
                 {
@@ -134,13 +164,12 @@ namespace UDRoute
             string key1 = $"{name}/{proto}";
             string key2 = $"{name}.{devId}/{proto}";
             string? key3 = string.IsNullOrEmpty(suffix) ? null : $"{name}.{suffix}/{proto}";
-
-            // 防覆盖逻辑
-            if (!CanOverwrite(key1, isAuthenticated, username)) return;
+            string serviceName = $"{name}/{proto}";
 
             var info = new ServerRecordInfo
             {
                 DevId = devId,
+                ServiceName = name,
                 PublicEp = remoteEp,
                 WanPort = wanPort,
                 IsTcp = isTcp,
@@ -152,25 +181,74 @@ namespace UDRoute
                 OwnerUser = username
             };
 
-            _routingTable[key1] = info;
-            _routingTable[key2] = info;
-            if (key3 != null) _routingTable[key3] = info;
+            if (isAuthenticated)
+            {
+                // 鉴权用户防覆盖检查：已被其他鉴权用户占用的不能抢占
+                if (!CanOverwriteAuth(key1, username, remoteEp)) return;
 
-            Log.Info($"[P] S Registered: {name}/{proto} (User: {username}, Auth: {isAuthenticated}, Suffix: {suffix}) from {remoteEp}");
+                _authRoutingTable[key1] = info;
+                _authRoutingTable[key2] = info;
+                if (key3 != null) _authRoutingTable[key3] = info;
+
+                // 鉴权用户凌驾于非鉴权用户之上：若非鉴权表中存在同名主 key，将其收回移除
+                _unauthRoutingTable.TryRemove(key1, out _);
+
+                Log.Info($"[P] S Registered (Auth): {name}/{proto} (User: {username}, Suffix: {suffix}) from {remoteEp}");
+            }
+            else
+            {
+                // 非鉴权用户注册逻辑
+                // 1. 鉴权用户的注册凌驾于非鉴权用户之上：如果鉴权字典中已存在主 key，非鉴权用户严禁注册覆盖
+                if (_authRoutingTable.ContainsKey(key1))
+                {
+                    RejectRegistration(remoteEp, $"{key1} 已被鉴权用户占用，未鉴权用户不能注册或覆盖。");
+                    return;
+                }
+
+                lock (_unauthLock)
+                {
+                    bool isRenewal = _unauthDevServices.TryGetValue(devId, out var userServices) && userServices.Contains(serviceName);
+                    if (!isRenewal)
+                    {
+                        // 新服务注册，检查数量限制
+                        int userCount = userServices?.Count ?? 0;
+                        if (_config.MaxUnauthNamesPerUser > 0 && userCount >= _config.MaxUnauthNamesPerUser)
+                        {
+                            RejectRegistration(remoteEp, $"非鉴权用户 {devId} 注册服务数已达上限 ({_config.MaxUnauthNamesPerUser})，丢弃注册: {name}/{proto}");
+                            return;
+                        }
+
+                        int totalCount = _unauthDevServices.Values.Sum(s => s.Count);
+                        if (_config.MaxUnauthNamesTotal > 0 && totalCount >= _config.MaxUnauthNamesTotal)
+                        {
+                            RejectRegistration(remoteEp, $"非鉴权用户注册服务总数已达上限 ({_config.MaxUnauthNamesTotal})，丢弃注册: {name}/{proto}");
+                            return;
+                        }
+
+                        if (userServices == null)
+                        {
+                            userServices = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                            _unauthDevServices[devId] = userServices;
+                        }
+                        userServices.Add(serviceName);
+                    }
+
+                    _unauthRoutingTable[key1] = info;
+                    _unauthRoutingTable[key2] = info;
+                    if (key3 != null) _unauthRoutingTable[key3] = info;
+                }
+
+                Log.Info($"[P] S Registered (Unauth): {name}/{proto} (DevId: {devId}, Suffix: {suffix}) from {remoteEp}");
+            }
         }
 
-        private bool CanOverwrite(string key, bool newIsAuth, string newUser)
+        private bool CanOverwriteAuth(string key, string newUser, EndPoint remoteEp)
         {
-            if (_routingTable.TryGetValue(key, out var existing))
+            if (_authRoutingTable.TryGetValue(key, out var existing))
             {
-                if (existing.IsAuthenticated && !newIsAuth)
+                if (existing.OwnerUser != newUser)
                 {
-                    Log.Warn($"[P] 拒绝覆盖: {key} 已被认证用户占用，未认证的请求被丢弃。");
-                    return false;
-                }
-                if (existing.IsAuthenticated && newIsAuth && existing.OwnerUser != newUser)
-                {
-                    Log.Warn($"[P] 拒绝覆盖: {key} 已被用户 '{existing.OwnerUser}' 占用，用户 '{newUser}' 尝试抢占被丢弃。");
+                    RejectRegistration(remoteEp, $"拒绝覆盖: {key} 已被鉴权用户 '{existing.OwnerUser}' 占用，用户 '{newUser}' 尝试抢占被丢弃。");
                     return false;
                 }
             }
@@ -185,12 +263,23 @@ namespace UDRoute
             _ = _udp.SendAsync(rejectBuf, remoteEp, default);
         }
 
+        private void RejectRegistration(EndPoint remoteEp, string reason)
+        {
+            Log.Warn($"[P] 拒绝注册: {reason}");
+            byte[] rejectBuf = new byte[1 + 256];
+            rejectBuf[0] = (byte)MsgType.RegFail;
+            int offset = 1;
+            offset += ProtocolHelper.WriteString(rejectBuf.AsSpan(offset), reason);
+            _ = _udp.SendAsync(rejectBuf.AsMemory(0, offset), remoteEp, default);
+        }
+
         public void ProcessRegisterDirect(ServerRecord rec, Guid devId, int wanPort, string devName)
         {
             string proto = rec.IsTcp ? "tcp" : "udp";
             var info = new ServerRecordInfo
             {
                 DevId = devId,
+                ServiceName = rec.Name,
                 PublicEp = _udp.LocalEndPoint,
                 WanPort = wanPort,
                 IsTcp = rec.IsTcp,
@@ -201,12 +290,16 @@ namespace UDRoute
                 OwnerUser = "localhost"
             };
 
-            _routingTable[$"{rec.Name}/{proto}"] = info;
-            _routingTable[$"{rec.Name}.{devId}/{proto}"] = info;
-            if (!string.IsNullOrEmpty(devName))
-            {
-                _routingTable[$"{rec.Name}.{devName}/{proto}"] = info;
-            }
+            string key1 = $"{rec.Name}/{proto}";
+            string key2 = $"{rec.Name}.{devId}/{proto}";
+            string? key3 = !string.IsNullOrEmpty(devName) ? $"{rec.Name}.{devName}/{proto}" : null;
+
+            _authRoutingTable[key1] = info;
+            _authRoutingTable[key2] = info;
+            if (key3 != null) _authRoutingTable[key3] = info;
+
+            // 收回非鉴权同名服务
+            _unauthRoutingTable.TryRemove(key1, out _);
 
             Log.Info($"[P] S Registered (direct): {rec.Name}/{proto} (DevName: {devName}, WanPort: {wanPort})");
         }
@@ -225,16 +318,21 @@ namespace UDRoute
             var sInfo = DirectQuery(targetName);
             if (sInfo != null)
             {
-                // 记录中继映射，确保即使打洞未完成也能立刻中继数据
-                _relaySessions[sessionId] = new RelaySession
+                bool allowRelay = IsRelayAllowed(sInfo);
+
+                if (allowRelay)
                 {
-                    ClientEp = remoteEp,
-                    ServerEp = sInfo.PublicEp,
-                    LastSeen = DateTime.UtcNow
-                };
+                    // 仅在允许转发时记录中继映射，确保即使打洞未完成也能立刻中继数据
+                    _relaySessions[sessionId] = new RelaySession
+                    {
+                        ClientEp = remoteEp,
+                        ServerEp = sInfo.PublicEp,
+                        LastSeen = DateTime.UtcNow
+                    };
+                }
 
                 // 1. 通知 S 端发起准备与打洞 (RelayStart)
-                // [MsgType 1][SessionId 16][TargetName string][ClientPublicEp]
+                // [MsgType 1][SessionId 16][TargetName string][ClientPublicEp][AllowRelay 1]
                 byte[] relayStartBuf = ArrayPool<byte>.Shared.Rent(512);
                 try
                 {
@@ -243,6 +341,7 @@ namespace UDRoute
                     int offset = 17;
                     offset += ProtocolHelper.WriteString(relayStartBuf.AsSpan(offset), targetName);
                     offset += ProtocolHelper.WriteIPEndPoint(relayStartBuf.AsSpan(offset), remoteEp);
+                    relayStartBuf[offset++] = (byte)(allowRelay ? 1 : 0);
 
                     await _udp.SendAsync(relayStartBuf.AsMemory(0, offset), sInfo.PublicEp, ct);
                 }
@@ -252,7 +351,7 @@ namespace UDRoute
                 }
 
                 // 2. 向 C 端返回 S 的地址信息用于中继与打洞 (Punch / QueryResponse)
-                // [MsgType 1][SessionId 16][DevId 16][Status 1 (1=Success)][ServerPublicEp][ServerWanPort 4][Timeout 4][KcpConfig 21][LocalEps...]
+                // [MsgType 1][SessionId 16][DevId 16][Status 1 (1=Success)][ServerPublicEp][ServerWanPort 4][Timeout 4][KcpConfig 21][LocalEps...][AllowRelay 1]
                 byte[] punchRespBuf = ArrayPool<byte>.Shared.Rent(1024);
                 try
                 {
@@ -278,6 +377,7 @@ namespace UDRoute
                         if (epCount >= 10) break;
                     }
                     punchRespBuf[countPos] = epCount;
+                    punchRespBuf[offset++] = (byte)(allowRelay ? 1 : 0);
 
                     await _udp.SendAsync(punchRespBuf.AsMemory(0, offset), remoteEp, ct);
                 }
@@ -286,7 +386,7 @@ namespace UDRoute
                     ArrayPool<byte>.Shared.Return(punchRespBuf);
                 }
 
-                Log.Info($"[P] Query success: Routed {sessionId} to S ({sInfo.PublicEp})");
+                Log.Info($"[P] Query success: Routed {sessionId} to S ({sInfo.PublicEp}), AllowRelay={allowRelay}");
             }
             else
             {
@@ -343,11 +443,41 @@ namespace UDRoute
                     var timeout = TimeSpan.FromSeconds(_config.RegTimeout);
                     var now = DateTime.UtcNow;
 
-                    foreach (var kvp in _routingTable)
+                    // 清理鉴权表
+                    foreach (var kvp in _authRoutingTable)
                     {
                         if (now - kvp.Value.LastSeen > timeout)
                         {
-                            _routingTable.TryRemove(kvp.Key, out _);
+                            _authRoutingTable.TryRemove(kvp.Key, out _);
+                        }
+                    }
+
+                    // 清理非鉴权表并归还配额
+                    lock (_unauthLock)
+                    {
+                        var expiredKeys = new List<string>();
+                        foreach (var kvp in _unauthRoutingTable)
+                        {
+                            if (now - kvp.Value.LastSeen > timeout)
+                            {
+                                expiredKeys.Add(kvp.Key);
+                            }
+                        }
+
+                        foreach (var key in expiredKeys)
+                        {
+                            if (_unauthRoutingTable.TryRemove(key, out var info))
+                            {
+                                if (_unauthDevServices.TryGetValue(info.DevId, out var services))
+                                {
+                                    string sName = $"{info.ServiceName}/{(info.IsTcp ? "tcp" : "udp")}";
+                                    services.Remove(sName);
+                                    if (services.Count == 0)
+                                    {
+                                        _unauthDevServices.TryRemove(info.DevId, out _);
+                                    }
+                                }
+                            }
                         }
                     }
 

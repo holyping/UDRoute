@@ -84,7 +84,8 @@ namespace UDRoute
             int currentRegInterval = Constants.DefaultRegInterval;
             var currentKcpConfig = new KcpConfig();
             int timeout = Constants.DefaultTimeout;
-            bool rewriteIni = false;
+            bool missingDevId = !lines.Any(l => l.TrimStart().StartsWith("devid", StringComparison.OrdinalIgnoreCase));
+            bool configModified = missingDevId;
             ServerRecord? sRec = null;
 
             for (int i = 0; i < lines.Length; i++)
@@ -127,7 +128,7 @@ namespace UDRoute
                         case "server": currentServer = val; break;
                         case "mtu": currentMtu = int.Parse(val); break;
                         case "devname": cfg.DevName = val; break;
-                        case "devid": cfg.DevId = Guid.Parse(val); rewriteIni = false; break;
+                        case "devid": cfg.DevId = Guid.Parse(val); break;
                         case "regtimeout": cfg.RegTimeout = int.Parse(val); cfg.EnableProxy = true; break;
                         case "reginterval": currentRegInterval = int.Parse(val); break;
                         case "timeout": timeout = int.Parse(val); break;
@@ -154,9 +155,43 @@ namespace UDRoute
                             break;
                         case "logfile": cfg.LogFile = val; break;
                         case "authfile": cfg.AuthFile = val; break;
-                        case "authmode": cfg.AuthMode = val.ToLower(); break;
+                        case "authmode":
+                            cfg.AuthMode = val.ToLower() switch
+                            {
+                                "strict" => AuthMode.Strict,
+                                "optional" => AuthMode.Optional,
+                                _ => AuthMode.None
+                            };
+                            break;
+                        case "allowunauthrelay" or "allowanonymousrelay" or "allowrelay":
+                            cfg.AllowUnauthRelay = val.ToLower() switch
+                            {
+                                "allow" or "true" or "1" or "yes" => AllowUnauthRelay.Allow,
+                                "deny" or "false" or "0" or "no" => AllowUnauthRelay.Deny,
+                                _ => AllowUnauthRelay.Default
+                            };
+                            break;
+                        case "maxunauthnamesperuser" or "maxunauthnames" or "maxunauthperuser": cfg.MaxUnauthNamesPerUser = int.Parse(val); break;
+                        case "maxunauthnamestotal" or "maxtotalunauthnames": cfg.MaxUnauthNamesTotal = int.Parse(val); break;
                         case "username": case "user": cfg.Username = val; break;
-                        case "password": case "pwd": case "pass": cfg.Password = val; break;
+                        case "password": case "pwd": case "pass":
+                            if (!val.StartsWith("$HWHash$"))
+                            {
+                                string protectedVal = ConfigProtector.ComputeHWHash(val);
+                                lines[i] = lines[i].Replace(val, protectedVal);
+                                configModified = true;
+                                val = protectedVal;
+                            }
+                            try
+                            {
+                                cfg.Password = Convert.FromBase64String(val.Substring(8));
+                            }
+                            catch
+                            {
+                                Log.Warn($"[Config] Global password Base64 format error");
+                                cfg.Password = null;
+                            }
+                            break;
                         case "kcp": currentKcpConfig.SetProfile(val); break;
                         case "kcpnodelay": currentKcpConfig.NoDelay = val == "1" || bool.Parse(val); break;
                         case "kcpinterval": currentKcpConfig.Interval = int.Parse(val); break;
@@ -197,6 +232,25 @@ namespace UDRoute
                             sRec.TargetPort = int.Parse(parts[1]);
                             sRec.IsTcp = parts.Length < 3 || parts[2].ToLower() == "tcp";
                             break;
+                        case "username": case "user": sRec.Username = val; break;
+                        case "password": case "pwd": case "pass":
+                            if (!val.StartsWith("$HWHash$"))
+                            {
+                                string protectedVal = ConfigProtector.ComputeHWHash(val);
+                                lines[i] = lines[i].Replace(val, protectedVal);
+                                configModified = true;
+                                val = protectedVal;
+                            }
+                            try
+                            {
+                                sRec.Password = Convert.FromBase64String(val.Substring(8));
+                            }
+                            catch
+                            {
+                                Log.Warn($"[Config] Server '{sRec.Name}' password Base64 format error");
+                                sRec.Password = null;
+                            }
+                            break;
                     }
                 }
             }
@@ -215,11 +269,23 @@ namespace UDRoute
                 }
             }
 
-            // 如果ini中没有DevId，尝试写入
-            if (rewriteIni)
+            // 将发生变化的行写入配置文件
+            if (configModified)
             {
-                var txt = $"DevId={cfg.DevId}\n" + File.ReadAllText(path);
-                try { File.WriteAllText(path, txt, Encoding.UTF8); } catch { }
+                try
+                {
+                    if (missingDevId && cfg.DevId != Guid.Empty)
+                    {
+                        var newLines = new List<string> { $"DevId={cfg.DevId}" };
+                        newLines.AddRange(lines);
+                        File.WriteAllLines(path, newLines, Encoding.UTF8);
+                    }
+                    else
+                    {
+                        File.WriteAllLines(path, lines, Encoding.UTF8);
+                    }
+                }
+                catch { }
             }
         }
 

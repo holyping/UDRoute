@@ -102,9 +102,11 @@ namespace UDRoute
                     }
                 }
 
+                bool allowRelay = data[offset++] != 0;
+
                 if (_pendingQueries.TryRemove(sessionId, out var tcs))
                 {
-                    tcs.TrySetResult(new QueryResponse(true, devId, sPublicEp, sWanPort, timeout, kcpConfig, localEps));
+                    tcs.TrySetResult(new QueryResponse(true, devId, sPublicEp, sWanPort, timeout, kcpConfig, localEps, allowRelay));
                     return true;
                 }
             }
@@ -205,6 +207,7 @@ namespace UDRoute
                                 int offset = 17;
                                 offset += ProtocolHelper.WriteString(relayStartBuf.AsSpan(offset), queryName);
                                 offset += ProtocolHelper.WriteIPEndPoint(relayStartBuf.AsSpan(offset), _udp.LocalEndPoint);
+                                relayStartBuf[offset++] = (byte)((_localProxy?.IsRelayAllowed(sInfo) ?? true) ? 1 : 0);
                                 await _udp.SendAsync(relayStartBuf.AsMemory(0, offset), sInfo.PublicEp, ct);
                             }
                             finally
@@ -283,25 +286,59 @@ namespace UDRoute
                                 return;
                             }
 
-                            // 初始通过 P 中继通信，应用协商好的 KCP 参数
-                            var session = new TunnelSession(_udp, pEndPoint, sessionId, rec.Mtu, rec.IsTcp, resp.KcpConfig, resp.Timeout);
-                            session.ChannelDesc = rec.Port.ToString();
-                            _sessions[sessionId] = session;
-
-                            // 并行启动对 S 的公网地址及 WanPort 进行 UDP 打洞
-                            _ = StartPunchingAsync(session, resp.DevId, resp.ServerPublicEp, resp.ServerWanPort, resp.LocalEps, ct);
-
-                            try
+                            if (!resp.AllowRelay)
                             {
-                                await session.RunTcpBridgeAsync(client, ct);
-                            }
-                            finally
-                            {
-                                if (_sessions.TryRemove(sessionId, out _))
+                                Log.Info($"[C] P relay not allowed for {queryName}. Waiting for UDP punch before bridging TCP...");
+                                var session = new TunnelSession(_udp, resp.ServerPublicEp, sessionId, rec.Mtu, rec.IsTcp, resp.KcpConfig, resp.Timeout);
+                                session.ChannelDesc = rec.Port.ToString();
+                                _sessions[sessionId] = session;
+
+                                bool punchSuccess = await StartPunchingAsync(session, resp.DevId, resp.ServerPublicEp, resp.ServerWanPort, resp.LocalEps, ct);
+                                if (!punchSuccess)
                                 {
-                                    Log.Info($"[C] Session {sessionId} closed.");
+                                    Log.Warn($"[C] P relay is disabled and UDP punch timed out for session {sessionId}. Connection closed.");
+                                    _sessions.TryRemove(sessionId, out _);
+                                    session.Dispose();
+                                    client.Close();
+                                    return;
                                 }
-                                session.Dispose();
+
+                                Log.Info($"[C] UDP punch succeeded without P relay! Starting direct P2P bridge for session {sessionId}.");
+                                try
+                                {
+                                    await session.RunTcpBridgeAsync(client, ct);
+                                }
+                                finally
+                                {
+                                    if (_sessions.TryRemove(sessionId, out _))
+                                    {
+                                        Log.Info($"[C] Session {sessionId} closed.");
+                                    }
+                                    session.Dispose();
+                                }
+                            }
+                            else
+                            {
+                                // 初始通过 P 中继通信，应用协商好的 KCP 参数
+                                var session = new TunnelSession(_udp, pEndPoint, sessionId, rec.Mtu, rec.IsTcp, resp.KcpConfig, resp.Timeout);
+                                session.ChannelDesc = rec.Port.ToString();
+                                _sessions[sessionId] = session;
+
+                                // 并行启动对 S 的公网地址及 WanPort 进行 UDP 打洞
+                                _ = StartPunchingAsync(session, resp.DevId, resp.ServerPublicEp, resp.ServerWanPort, resp.LocalEps, ct);
+
+                                try
+                                {
+                                    await session.RunTcpBridgeAsync(client, ct);
+                                }
+                                finally
+                                {
+                                    if (_sessions.TryRemove(sessionId, out _))
+                                    {
+                                        Log.Info($"[C] Session {sessionId} closed.");
+                                    }
+                                    session.Dispose();
+                                }
                             }
                         }
                         catch (Exception ex)
@@ -323,7 +360,7 @@ namespace UDRoute
             }
         }
 
-        private async Task StartPunchingAsync(TunnelSession session, Guid expectedDevId, IPEndPoint sPublicEp, int sWanPort, List<IPEndPoint> localEps, CancellationToken ct)
+        private async Task<bool> StartPunchingAsync(TunnelSession session, Guid expectedDevId, IPEndPoint sPublicEp, int sWanPort, List<IPEndPoint> localEps, CancellationToken ct)
         {
             byte[] punchBuf = new byte[34];
             punchBuf[0] = (byte)MsgType.Punch;
@@ -363,6 +400,8 @@ namespace UDRoute
             {
                 Log.Info($"[C] Session {session.SessionId} UDP punch timed out. Continuing with Proxy relay.");
             }
+
+            return session.IsDirect;
         }
 
         private async Task AcceptUdpLoopAsync(ClientRecord rec, CancellationToken ct)
@@ -415,6 +454,7 @@ namespace UDRoute
                                                 int offset = 17;
                                                 offset += ProtocolHelper.WriteString(relayStartBuf.AsSpan(offset), queryName);
                                                 offset += ProtocolHelper.WriteIPEndPoint(relayStartBuf.AsSpan(offset), _udp.LocalEndPoint);
+                                                relayStartBuf[offset++] = (byte)((_localProxy?.IsRelayAllowed(sInfo) ?? true) ? 1 : 0);
                                                 await _udp.SendAsync(relayStartBuf.AsMemory(0, offset), sInfo.PublicEp, ct);
                                             }
                                             finally
@@ -476,8 +516,24 @@ namespace UDRoute
                                             return;
                                         }
 
-                                        session = new TunnelSession(_udp, pEndPoint, sessionId, rec.Mtu, isTcp: false, null, resp.Timeout);
-                                        _ = StartPunchingAsync(session, resp.DevId, resp.ServerPublicEp, resp.ServerWanPort, resp.LocalEps, ct);
+                                        if (!resp.AllowRelay)
+                                        {
+                                            Log.Info($"[C] P relay not allowed for UDP service {queryName}. Waiting for UDP punch before bridging UDP...");
+                                            session = new TunnelSession(_udp, resp.ServerPublicEp, sessionId, rec.Mtu, isTcp: false, null, resp.Timeout);
+                                            bool punchSuccess = await StartPunchingAsync(session, resp.DevId, resp.ServerPublicEp, resp.ServerWanPort, resp.LocalEps, ct);
+                                            if (!punchSuccess)
+                                            {
+                                                Log.Warn($"[C] P relay is disabled and UDP punch timed out for UDP session {sessionId}.");
+                                                clientChannelMap.TryRemove(clientEp, out _);
+                                                session.Dispose();
+                                                return;
+                                            }
+                                        }
+                                        else
+                                        {
+                                            session = new TunnelSession(_udp, pEndPoint, sessionId, rec.Mtu, isTcp: false, null, resp.Timeout);
+                                            _ = StartPunchingAsync(session, resp.DevId, resp.ServerPublicEp, resp.ServerWanPort, resp.LocalEps, ct);
+                                        }
                                     }
 
                                     session.ChannelDesc = rec.Port.ToString();
@@ -564,6 +620,6 @@ namespace UDRoute
             }
         }
 
-        private record QueryResponse(bool Success, Guid DevId, IPEndPoint ServerPublicEp, int ServerWanPort, int Timeout, KcpConfig? KcpConfig, List<IPEndPoint> LocalEps);
+        private record QueryResponse(bool Success, Guid DevId, IPEndPoint ServerPublicEp, int ServerWanPort, int Timeout, KcpConfig? KcpConfig, List<IPEndPoint> LocalEps, bool AllowRelay = true);
     }
 }

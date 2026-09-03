@@ -11,6 +11,8 @@ namespace UDRoute
         public int RegInterval { get; set; } = Constants.DefaultRegInterval;
         public int Mtu { get; set; } = Constants.DefaultMtu;
         public int Timeout { get; set; } = 0;
+        public string? Username { get; set; }
+        public byte[]? Password { get; set; }
         public KcpConfig KcpConfig { get; set; } = new();
     }
 }
