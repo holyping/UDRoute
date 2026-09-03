@@ -11,14 +11,26 @@ Options:
 Commands:
   -h, -?, -help, --help Show this help message
   -status               Connect to all running udroute processes on this machine and show their operational status and active data channels
+  -hash [password]      Generate a secure hash for a password (interactive mode if no password provided)
   -init, -create [file] Generate a well-commented default configuration template file
   -i [ServiceName]      Install the program as a system service and start automatically (Windows / Linux Systemd)
   -u [ServiceName]      Stop and uninstall the specified system service
 
 Quick Setup:
   You can bypass the .ini file and provide configurations directly via command-line syntax:
-  Client: udroute 33890/tcp=rdp_home@your_proxy_ip.com
-  Server: udroute rdp_home=127.0.0.1:3389/tcp@your_proxy_ip.com
+  [Client Syntax]: <LocalPort>[/<tcp|udp>]=<TargetName>[.suffix][:password]@<PServerAddress>
+  Example (with pass): udroute 33890/tcp=rdp_home:mypassword@your_proxy_ip.com
+
+  [Server TCP/UDP Syntax]: <TargetName>[.suffix]=<TargetAddress>:<TargetPort>[/<tcp|udp>]@<PServerAddress>
+  Example: udroute rdp_home=127.0.0.1:3389/tcp@your_proxy_ip.com
+
+  [Server File Syntax]: <TargetName>[.suffix]=<BaseDir>;/file@<PServerAddress>
+  Example: udroute my_files=C:\Data\Shared;/file@your_proxy_ip.com
+
+File Transfer:
+  Directly transfer files via the built-in File protocol:
+  Push file: udroute -push name[:password]@PAddress SFilePath LocalFilePath/con:
+  Pull file: udroute -pull name[:password]@PAddress SFilePath LocalFilePath/con:
 
 Common Examples:
   1. Generate a commented configuration template:

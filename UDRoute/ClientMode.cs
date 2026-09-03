@@ -81,6 +81,10 @@ namespace UDRoute
                 offset += 4;
                 int timeout = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(offset, 4));
                 offset += 4;
+                long sTimestamp = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(offset, 8));
+                offset += 8;
+                bool reqPass = data[offset++] != 0;
+
                 KcpConfig? kcpConfig = null;
                 if (data.Length >= offset + 21)
                 {
@@ -106,7 +110,7 @@ namespace UDRoute
 
                 if (_pendingQueries.TryRemove(sessionId, out var tcs))
                 {
-                    tcs.TrySetResult(new QueryResponse(true, devId, sPublicEp, sWanPort, timeout, kcpConfig, localEps, allowRelay));
+                    tcs.TrySetResult(new QueryResponse(true, devId, sPublicEp, sWanPort, timeout, sTimestamp, reqPass, kcpConfig, localEps, allowRelay));
                     return true;
                 }
             }
@@ -114,7 +118,7 @@ namespace UDRoute
             {
                 if (_pendingQueries.TryRemove(sessionId, out var tcs))
                 {
-                    tcs.TrySetResult(new QueryResponse(false, Guid.Empty, null!, 0, 0, null, null!));
+                    tcs.TrySetResult(new QueryResponse(false, Guid.Empty, null!, 0, 0, 0, false, null, null!));
                     return true;
                 }
             }
@@ -141,6 +145,27 @@ namespace UDRoute
                 return true;
             }
             return false;
+        }
+
+        public void TryHandleAuthRes(ReadOnlySpan<byte> span, EndPoint remoteEp)
+        {
+            if (span.Length < 18) return;
+            Guid sessionId = new Guid(span.Slice(1, 16));
+            bool success = span[17] != 0;
+
+            if (_sessions.TryGetValue(sessionId, out var session))
+            {
+                if (success)
+                {
+                    Log.Info($"[C] Auth succeeded for session {sessionId}");
+                    session.AuthTcs.TrySetResult(true);
+                }
+                else
+                {
+                    Log.Warn($"[C] Auth failed for session {sessionId}");
+                    session.AuthTcs.TrySetResult(false);
+                }
+            }
         }
 
         public bool TryHandleData(Guid sessionId, ReadOnlySpan<byte> payload)
@@ -198,6 +223,14 @@ namespace UDRoute
                         var sInfo = _localProxy.DirectQuery(queryName);
                         if (sInfo != null)
                         {
+                            if (sInfo.RequiresPassword && (rec.Password == null || rec.Password.Length == 0))
+                            {
+                                Log.Info($"[C] Password required for {queryName}.");
+                                Console.Write($"Password for {queryName}: ");
+                                string input = ReadPassword();
+                                rec.Password = ManagedSHA256.ComputeHashBytes(System.Text.Encoding.UTF8.GetBytes(input));
+                            }
+
                             // 通知 S 端发起准备与打洞 (RelayStart)
                             byte[] relayStartBuf = ArrayPool<byte>.Shared.Rent(512);
                             try
@@ -220,7 +253,15 @@ namespace UDRoute
                             _sessions[sessionId] = session;
                             _ = Task.Run(async () =>
                             {
-                                try { await session.RunTcpBridgeAsync(client, ct); }
+                                try
+                                {
+                                    if (rec.Password != null)
+                                    {
+                                        bool authOk = await session.AuthenticateClientAsync(rec.Password, sInfo.STimestamp, sInfo.PRecvTimeTicks, ct);
+                                        if (!authOk) { Log.Warn($"[C] Auth failed for session {sessionId}"); return; }
+                                    }
+                                    await session.RunTcpBridgeAsync(client, ct);
+                                }
                                 finally { _sessions.TryRemove(sessionId, out _); session.Dispose(); }
                             }, ct);
                         }
@@ -286,6 +327,14 @@ namespace UDRoute
                                 return;
                             }
 
+                            if (resp.RequiresPassword && (rec.Password == null || rec.Password.Length == 0))
+                            {
+                                Log.Info($"[C] Password required for {queryName}.");
+                                Console.Write($"Password for {queryName}: ");
+                                string input = ReadPassword();
+                                rec.Password = ManagedSHA256.ComputeHashBytes(System.Text.Encoding.UTF8.GetBytes(input));
+                            }
+
                             if (!resp.AllowRelay)
                             {
                                 Log.Info($"[C] P relay not allowed for {queryName}. Waiting for UDP punch before bridging TCP...");
@@ -306,6 +355,11 @@ namespace UDRoute
                                 Log.Info($"[C] UDP punch succeeded without P relay! Starting direct P2P bridge for session {sessionId}.");
                                 try
                                 {
+                                    if (rec.Password != null)
+                                    {
+                                        bool authOk = await session.AuthenticateClientAsync(rec.Password, resp.STimestamp, DateTime.UtcNow.Ticks, ct);
+                                        if (!authOk) { Log.Warn($"[C] Auth failed for session {sessionId}"); return; }
+                                    }
                                     await session.RunTcpBridgeAsync(client, ct);
                                 }
                                 finally
@@ -329,6 +383,11 @@ namespace UDRoute
 
                                 try
                                 {
+                                    if (rec.Password != null)
+                                    {
+                                        bool authOk = await session.AuthenticateClientAsync(rec.Password, resp.STimestamp, DateTime.UtcNow.Ticks, ct);
+                                        if (!authOk) { Log.Warn($"[C] Auth failed for session {sessionId}"); return; }
+                                    }
                                     await session.RunTcpBridgeAsync(client, ct);
                                 }
                                 finally
@@ -438,6 +497,7 @@ namespace UDRoute
                             _ = Task.Run(async () =>
                             {
                                 TunnelSession? session = null;
+                                QueryResponse? resp = null;
                                 try
                                 {
                                     if (rec.IsThis && _localProxy != null)
@@ -498,7 +558,6 @@ namespace UDRoute
                                         using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
                                         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
 
-                                        QueryResponse resp;
                                         try
                                         {
                                             resp = await tcs.Task.WaitAsync(linkedCts.Token);
@@ -514,6 +573,14 @@ namespace UDRoute
                                         {
                                             Log.Warn($"[C] P returned NotFound for UDP service {queryName}");
                                             return;
+                                        }
+
+                                        if (resp.RequiresPassword && (rec.Password == null || rec.Password.Length == 0))
+                                        {
+                                            Log.Info($"[C] Password required for {queryName}.");
+                                            Console.Write($"Password for {queryName}: ");
+                                            string input = ReadPassword();
+                                            rec.Password = ManagedSHA256.ComputeHashBytes(System.Text.Encoding.UTF8.GetBytes(input));
                                         }
 
                                         if (!resp.AllowRelay)
@@ -538,6 +605,30 @@ namespace UDRoute
 
                                     session.ChannelDesc = rec.Port.ToString();
                                     _sessions[sessionId] = session;
+
+                                    if (rec.Password != null)
+                                    {
+                                        long st = 0, pt = 0;
+                                        if (rec.IsThis && _localProxy != null)
+                                        {
+                                            var info = _localProxy.DirectQuery(queryName);
+                                            st = info?.STimestamp ?? 0;
+                                            pt = info?.PRecvTimeTicks ?? 0;
+                                        }
+                                        else if (resp != null)
+                                        {
+                                            st = resp.STimestamp;
+                                            pt = DateTime.UtcNow.Ticks;
+                                        }
+                                        bool authOk = await session.AuthenticateClientAsync(rec.Password, st, pt, ct);
+                                        if (!authOk)
+                                        {
+                                            Log.Warn($"[C] UDP Auth failed for session {sessionId}");
+                                            clientChannelMap.TryRemove(clientEp, out _);
+                                            session.Dispose();
+                                            return;
+                                        }
+                                    }
 
                                     var sessionToken = session.SessionToken;
                                     byte[] sendBuf = ArrayPool<byte>.Shared.Rent(rec.Mtu + 17);
@@ -620,6 +711,26 @@ namespace UDRoute
             }
         }
 
-        private record QueryResponse(bool Success, Guid DevId, IPEndPoint ServerPublicEp, int ServerWanPort, int Timeout, KcpConfig? KcpConfig, List<IPEndPoint> LocalEps, bool AllowRelay = true);
+        private string ReadPassword()
+        {
+            string pass = "";
+            while (true)
+            {
+                var key = Console.ReadKey(true);
+                if (key.Key == ConsoleKey.Enter) break;
+                if (key.Key == ConsoleKey.Backspace)
+                {
+                    if (pass.Length > 0) pass = pass.Substring(0, pass.Length - 1);
+                }
+                else if (key.KeyChar != '\0')
+                {
+                    pass += key.KeyChar;
+                }
+            }
+            Console.WriteLine();
+            return pass;
+        }
+
+        private record QueryResponse(bool Success, Guid DevId, IPEndPoint ServerPublicEp, int ServerWanPort, int Timeout, long STimestamp, bool RequiresPassword, KcpConfig? KcpConfig, List<IPEndPoint> LocalEps, bool AllowRelay = true);
     }
 }

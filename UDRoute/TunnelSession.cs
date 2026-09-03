@@ -27,6 +27,8 @@ namespace UDRoute
         private long _lastUdpOutTick = 0;
         private int _udpSrtt = 0;
 
+        public readonly TaskCompletionSource<bool> AuthTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
         public Guid SessionId => _sessionId;
         public EndPoint ActiveRemoteEp => _activeRemoteEp;
         public bool IsDirect => _isDirect;
@@ -34,6 +36,7 @@ namespace UDRoute
         public Channel<byte[]> InboundChannel => _inboundChannel;
         public CancellationToken SessionToken => _sessionCts.Token;
         public string ChannelDesc { get; set; } = string.Empty;
+        public byte[]? PasswordHash { get; set; }
 
         public TunnelSession(ZeroCopyUdpSocket udpCore, EndPoint initialEp, Guid sessionId, int mtu, bool isTcp = true, KcpConfig? kcpConfig = null, int timeoutSeconds = 0)
         {
@@ -103,6 +106,49 @@ namespace UDRoute
                 _kcp.SetMtu(_mtu);
                 _kcp.SetNoDelay(_kcpConfig.NoDelay ? 1 : 0, _kcpConfig.Interval, _kcpConfig.Resend, _kcpConfig.Nc);
                 _kcp.SetWindowSize(_kcpConfig.SndWnd, _kcpConfig.RcvWnd);
+            }
+        }
+
+        public async Task<bool> AuthenticateClientAsync(byte[] passwordHash, long sTimestamp, long pRecvTimeTicks, CancellationToken ct)
+        {
+            long tAuth = sTimestamp + (DateTime.UtcNow.Ticks - pRecvTimeTicks);
+            byte[] hashInput = new byte[passwordHash.Length + 8];
+            passwordHash.CopyTo(hashInput, 0);
+            BinaryPrimitives.WriteInt64LittleEndian(hashInput.AsSpan(passwordHash.Length, 8), tAuth);
+            byte[] authHash = ManagedSHA256.ComputeHashBytes(hashInput);
+
+            byte[] req = new byte[57];
+            req[0] = (byte)MsgType.AuthReq;
+            _sessionId.TryWriteBytes(req.AsSpan(1, 16));
+            BinaryPrimitives.WriteInt64LittleEndian(req.AsSpan(17, 8), tAuth);
+            authHash.CopyTo(req, 25);
+
+            using var linkCts = CancellationTokenSource.CreateLinkedTokenSource(ct, _sessionCts.Token);
+            var token = linkCts.Token;
+
+            // Start sending loop
+            var sendTask = Task.Run(async () =>
+            {
+                try
+                {
+                    while (!AuthTcs.Task.IsCompleted && !token.IsCancellationRequested)
+                    {
+                        var targetEp = _activeRemoteEp;
+                        await _udpCore.SendAsync(req, targetEp, token);
+                        await Task.Delay(200, token);
+                    }
+                }
+                catch { }
+            }, token);
+
+            try
+            {
+                await Task.WhenAny(AuthTcs.Task, Task.Delay(5000, token));
+                return AuthTcs.Task.IsCompletedSuccessfully && AuthTcs.Task.Result;
+            }
+            finally
+            {
+                linkCts.Cancel();
             }
         }
 

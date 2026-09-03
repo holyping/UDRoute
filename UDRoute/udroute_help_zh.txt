@@ -11,14 +11,26 @@ UDRoute - 基于 UDP 穿透的高性能端口转发/内网穿透工具
 命令参数 (Commands):
   -h, -?, -help, --help 显示此帮助信息
   -status               连接本机所有运行中的 udroute 进程并显示其工作状态、活动数据通道等
+  -hash [password]      生成可用于配置文件的密码安全哈希（不带参数则进入无回显交互式输入模式）
   -init, -create [file] 在当前目录生成一份带有详尽注释的默认配置文件模板
   -i [ServiceName]      将当前程序注册为系统服务并自动启动 (支持 Windows / Linux Systemd)
   -u [ServiceName]      停止并卸载指定的系统服务
 
 快捷配置 (Command-line Quick Setup):
-  支持不使用 ini 文件，直接在命令行中按规范传入配置项，如：
-  客户端: udroute 33890/tcp=rdp_home@your_proxy_ip.com
-  服务端: udroute rdp_home=127.0.0.1:3389/tcp@your_proxy_ip.com
+  支持不使用 ini 文件，直接在命令行中按规范传入配置项。
+  [C端 (Client) 语法]: <LocalPort>[/<tcp|udp>]=<TargetName>[.suffix][:password]@<PServerAddress>
+  示例 (带密码): udroute 33890/tcp=rdp_home:mypassword@your_proxy_ip.com
+
+  [S端 (Server) TCP/UDP语法]: <TargetName>[.suffix]=<TargetAddress>:<TargetPort>[/<tcp|udp>]@<PServerAddress>
+  示例: udroute rdp_home=127.0.0.1:3389/tcp@your_proxy_ip.com
+
+  [S端 (Server) File协议语法]: <TargetName>[.suffix]=<BaseDir>;/file@<PServerAddress>
+  示例: udroute my_files=D:\Data\Shared;/file@your_proxy_ip.com
+
+文件传输 (File Transfer):
+  基于内置的 File 协议，可以直接传输文件：
+  上传文件: udroute -push name[:password]@PAddress SFilePath LocalFilePath/con:
+  下载文件: udroute -pull name[:password]@PAddress SFilePath LocalFilePath/con:
 
 常见使用示例:
   1. 生成一份带有注释说明的配置文件:

@@ -53,6 +53,21 @@ namespace UDRoute
 
         public async Task RunAsync(CancellationToken ct)
         {
+
+            foreach (var rec in _config.ServerRecords)
+            {
+                if (rec.IsFile)
+                {
+                    var listener = new TcpListener(IPAddress.Loopback, 0);
+                    listener.Start();
+                    rec.TargetIp = "127.0.0.1";
+                    rec.TargetPort = ((IPEndPoint)listener.LocalEndpoint).Port;
+                    rec.IsTcp = true;
+                    _ = FileProtocolHelper.RunServerAsync(listener, rec.BaseDir, rec.ReadOnly, ct);
+                    Log.Info($"[S] Started internal File Protocol server on 127.0.0.1:{rec.TargetPort} for base dir {rec.BaseDir}");
+                }
+            }
+
             byte[] buffer = new byte[1024];
             while (!ct.IsCancellationRequested)
             {
@@ -160,13 +175,15 @@ namespace UDRoute
                             }
                         }
 
-                        // 构造注册包: [MsgType 1][DevId 16][WanPort 4][IsTcp 1][Timeout 4][KcpConfig 21][Name string][Suffix string][LocalEps...]
+                        // 构造注册包: [MsgType 1][DevId 16][WanPort 4][IsTcp 1][Timeout 4][Timestamp 8][ReqPass 1][KcpConfig 21][Name string][Suffix string][LocalEps...]
                         buffer[0] = (byte)MsgType.Register;
                         _config.DevId.TryWriteBytes(buffer.AsSpan(1, 16));
                         BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(17, 4), _config.WanPort);
                         buffer[21] = (byte)(rec.IsTcp ? 1 : 0);
                         BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(22, 4), rec.Timeout);
-                        int offset = 26;
+                        BinaryPrimitives.WriteInt64LittleEndian(buffer.AsSpan(26, 8), DateTime.UtcNow.Ticks);
+                        buffer[34] = (byte)(rec.Password != null && rec.Password.Length > 0 ? 1 : 0);
+                        int offset = 35;
                         offset += ProtocolHelper.WriteKcpConfig(buffer.AsSpan(offset), rec.KcpConfig);
                         offset += ProtocolHelper.WriteString(buffer.AsSpan(offset), rec.Name);
                         offset += ProtocolHelper.WriteString(buffer.AsSpan(offset), _config.DevName);
@@ -274,6 +291,8 @@ namespace UDRoute
                     // 初始目标指向 C 的公网地址 (而非 P 的地址)
                     var session = new TunnelSession(_udp, cPublicEp, sessionId, mtu, rec.IsTcp, rec.KcpConfig, rec.Timeout);
                     session.ChannelDesc = $"{rec.TargetIp}:{rec.TargetPort}";
+                    session.PasswordHash = rec.Password;
+                    if (rec.Password == null || rec.Password.Length == 0) session.AuthTcs.TrySetResult(true);
                     _sessions[sessionId] = session;
 
                     _ = Task.Run(async () =>
@@ -288,6 +307,13 @@ namespace UDRoute
                             }
 
                             Log.Info($"[S] UDP punch succeeded without P relay! Connecting to backend target {rec.TargetIp}:{rec.TargetPort} for Session {sessionId}");
+                            bool authOk = await session.AuthTcs.Task;
+                            if (!authOk)
+                            {
+                                Log.Warn($"[S] Auth failed for session {sessionId}, aborting bridge.");
+                                return;
+                            }
+
                             if (rec.IsTcp)
                             {
                                 var targetClient = new TcpClient();
@@ -322,6 +348,8 @@ namespace UDRoute
                     // 初始通过 P 进行中继 (remoteEp 即为 P 的地址)，使用对应目标服务的 KCP 配置
                     var session = new TunnelSession(_udp, remoteEp, sessionId, mtu, rec.IsTcp, rec.KcpConfig, rec.Timeout);
                     session.ChannelDesc = $"{rec.TargetIp}:{rec.TargetPort}";
+                    session.PasswordHash = rec.Password;
+                    if (rec.Password == null || rec.Password.Length == 0) session.AuthTcs.TrySetResult(true);
                     _sessions[sessionId] = session;
 
                     // 向 C 发起直接 UDP 打洞
@@ -332,6 +360,13 @@ namespace UDRoute
                     {
                         try
                         {
+                            bool authOk = await session.AuthTcs.Task;
+                            if (!authOk)
+                            {
+                                Log.Warn($"[S] Auth failed for session {sessionId}, aborting bridge.");
+                                return;
+                            }
+
                             if (rec.IsTcp)
                             {
                                 var targetClient = new TcpClient();
@@ -383,6 +418,62 @@ namespace UDRoute
                 return true;
             }
             return false;
+        }
+
+        public void TryHandleAuthReq(ReadOnlySpan<byte> span, EndPoint remoteEp)
+        {
+            if (span.Length < 57) return;
+            Guid sessionId = new Guid(span.Slice(1, 16));
+            if (_sessions.TryGetValue(sessionId, out var session))
+            {
+                if (session.PasswordHash == null || session.PasswordHash.Length == 0)
+                {
+                    // S doesn't require password, just ack success
+                    SendAuthRes(sessionId, remoteEp, true);
+                    session.AuthTcs.TrySetResult(true);
+                    return;
+                }
+
+                long tAuth = BinaryPrimitives.ReadInt64LittleEndian(span.Slice(17, 8));
+                byte[] clientHash = span.Slice(25, 32).ToArray();
+                
+                // Validate timestamp (within 15 seconds)
+                long nowTicks = DateTime.UtcNow.Ticks;
+                if (Math.Abs(nowTicks - tAuth) > 15 * 10000000L)
+                {
+                    Log.Warn($"[S] AuthReq timestamp out of bounds for session {sessionId}");
+                    SendAuthRes(sessionId, remoteEp, false);
+                    session.AuthTcs.TrySetResult(false);
+                    return;
+                }
+
+                byte[] hashInput = new byte[session.PasswordHash.Length + 8];
+                session.PasswordHash.CopyTo(hashInput, 0);
+                BinaryPrimitives.WriteInt64LittleEndian(hashInput.AsSpan(session.PasswordHash.Length, 8), tAuth);
+                byte[] expectedHash = ManagedSHA256.ComputeHashBytes(hashInput);
+
+                if (clientHash.SequenceEqual(expectedHash))
+                {
+                    Log.Info($"[S] Auth succeeded for session {sessionId}");
+                    SendAuthRes(sessionId, remoteEp, true);
+                    session.AuthTcs.TrySetResult(true);
+                }
+                else
+                {
+                    Log.Warn($"[S] Auth failed for session {sessionId}");
+                    SendAuthRes(sessionId, remoteEp, false);
+                    session.AuthTcs.TrySetResult(false);
+                }
+            }
+        }
+
+        private void SendAuthRes(Guid sessionId, EndPoint remoteEp, bool success)
+        {
+            byte[] res = new byte[18];
+            res[0] = (byte)MsgType.AuthRes;
+            sessionId.TryWriteBytes(res.AsSpan(1, 16));
+            res[17] = (byte)(success ? 1 : 0);
+            _ = _udp.SendAsync(res, remoteEp, default);
         }
 
         public bool TryHandleData(Guid sessionId, ReadOnlySpan<byte> payload)

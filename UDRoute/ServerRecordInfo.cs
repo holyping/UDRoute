@@ -18,5 +18,8 @@ namespace UDRoute
         public bool IsAuthenticated { get; set; }
         public string OwnerUser { get; set; } = "";
         public List<IPEndPoint> LocalEps { get; set; } = new();
+        public long STimestamp { get; set; }
+        public long PRecvTimeTicks { get; set; }
+        public bool RequiresPassword { get; set; }
     }
 }

@@ -80,17 +80,19 @@ namespace UDRoute
 
         public void ProcessRegister(ReadOnlySpan<byte> data, EndPoint remoteEp)
         {
-            // 解析 S 端的注册包 [MsgType 1][DevId 16][WanPort 4][IsTcp 1][Timeout 4][KcpConfig 21][NameString][SuffixString][LocalEps...][User][Pass]
-            if (data.Length < 47) return;
+            // 解析 S 端的注册包: [MsgType 1][DevId 16][WanPort 4][IsTcp 1][Timeout 4][Timestamp 8][ReqPass 1][KcpConfig 21][NameString][SuffixString][LocalEps...][User][Pass]
+            if (data.Length < 56) return;
 
             Guid devId = new Guid(data.Slice(1, 16));
             int wanPort = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(17, 4));
             bool isTcp = data[21] != 0;
             string proto = isTcp ? "tcp" : "udp";
             int timeout = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(22, 4));
+            long sTimestamp = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(26, 8));
+            bool reqPass = data[34] != 0;
 
-            var (kcpConfig, kLen) = ProtocolHelper.ReadKcpConfig(data.Slice(26));
-            int offset = 26 + kLen;
+            var (kcpConfig, kLen) = ProtocolHelper.ReadKcpConfig(data.Slice(35));
+            int offset = 35 + kLen;
 
             var (name, nLen) = ProtocolHelper.ReadString(data.Slice(offset));
             offset += nLen;
@@ -178,7 +180,10 @@ namespace UDRoute
                 LastSeen = DateTime.UtcNow,
                 LocalEps = localEps,
                 IsAuthenticated = isAuthenticated,
-                OwnerUser = username
+                OwnerUser = username,
+                STimestamp = sTimestamp,
+                PRecvTimeTicks = DateTime.UtcNow.Ticks,
+                RequiresPassword = reqPass
             };
 
             if (isAuthenticated)
@@ -287,7 +292,10 @@ namespace UDRoute
                 Timeout = rec.Timeout,
                 LastSeen = DateTime.UtcNow,
                 IsAuthenticated = true,
-                OwnerUser = "localhost"
+                OwnerUser = "localhost",
+                STimestamp = DateTime.UtcNow.Ticks,
+                PRecvTimeTicks = DateTime.UtcNow.Ticks,
+                RequiresPassword = rec.Password != null && rec.Password.Length > 0
             };
 
             string key1 = $"{rec.Name}/{proto}";
@@ -351,7 +359,7 @@ namespace UDRoute
                 }
 
                 // 2. 向 C 端返回 S 的地址信息用于中继与打洞 (Punch / QueryResponse)
-                // [MsgType 1][SessionId 16][DevId 16][Status 1 (1=Success)][ServerPublicEp][ServerWanPort 4][Timeout 4][KcpConfig 21][LocalEps...][AllowRelay 1]
+                // [MsgType 1][SessionId 16][DevId 16][Status 1 (1=Success)][ServerPublicEp][ServerWanPort 4][Timeout 4][Timestamp 8][ReqPass 1][KcpConfig 21][LocalEps...][AllowRelay 1]
                 byte[] punchRespBuf = ArrayPool<byte>.Shared.Rent(1024);
                 try
                 {
@@ -365,6 +373,13 @@ namespace UDRoute
                     offset += 4;
                     BinaryPrimitives.WriteInt32LittleEndian(punchRespBuf.AsSpan(offset, 4), sInfo.Timeout);
                     offset += 4;
+                    
+                    long elapsed = DateTime.UtcNow.Ticks - sInfo.PRecvTimeTicks;
+                    long approxTime = sInfo.STimestamp + elapsed;
+                    BinaryPrimitives.WriteInt64LittleEndian(punchRespBuf.AsSpan(offset, 8), approxTime);
+                    offset += 8;
+                    punchRespBuf[offset++] = (byte)(sInfo.RequiresPassword ? 1 : 0);
+
                     offset += ProtocolHelper.WriteKcpConfig(punchRespBuf.AsSpan(offset), sInfo.KcpConfig);
 
                     int countPos = offset++;

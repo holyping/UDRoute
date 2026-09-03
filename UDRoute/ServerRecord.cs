@@ -6,6 +6,9 @@ namespace UDRoute
         public string TargetIp { get; set; } = "";
         public int TargetPort { get; set; }
         public bool IsTcp { get; set; }
+        public bool IsFile { get; set; }
+        public string BaseDir { get; set; } = "";
+        public bool ReadOnly { get; set; }
         public bool IsThis { get; set; }
         public string TargetServer { get; set; } = "";
         public int RegInterval { get; set; } = Constants.DefaultRegInterval;

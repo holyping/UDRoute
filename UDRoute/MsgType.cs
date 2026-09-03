@@ -14,6 +14,8 @@ namespace UDRoute
         EchoReq = 7,
         EchoResp = 8,
         AuthFail = 9,
-        RegFail = 10
+        RegFail = 10,
+        AuthReq = 11,
+        AuthRes = 12
     }
 }

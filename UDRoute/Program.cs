@@ -21,6 +21,13 @@ namespace UDRoute
                 PrintHelp();
                 return;
             }
+            
+            string cmd = args[0].ToLower();
+            if (cmd == "-push" || cmd == "-pull")
+            {
+                await FileClientHelper.RunAsync(args);
+                return;
+            }
             else if (HandleServiceCommands(args)) return;
 
             bool isServiceMode = args.Any(a =>
@@ -86,7 +93,58 @@ namespace UDRoute
                 QueryStatus();
                 return true;
             }
+            if (cmd == "-hash")
+            {
+                if (args.Length > 1)
+                {
+                    string pass = args[1];
+                    byte[] hash = ManagedSHA256.ComputeHashBytes(System.Text.Encoding.UTF8.GetBytes(pass));
+                    Console.WriteLine("$HASH256$" + Convert.ToBase64String(hash));
+                }
+                else
+                {
+                    Console.Write("Enter Password: ");
+                    string pass1 = ReadPassword();
+                    Console.Write("Confirm Password: ");
+                    string pass2 = ReadPassword();
+                    if (pass1 != pass2)
+                    {
+                        Console.WriteLine("Passwords do not match.");
+                    }
+                    else if (string.IsNullOrEmpty(pass1))
+                    {
+                        Console.WriteLine("Password cannot be empty.");
+                    }
+                    else
+                    {
+                        byte[] hash = ManagedSHA256.ComputeHashBytes(System.Text.Encoding.UTF8.GetBytes(pass1));
+                        Console.WriteLine("$HASH256$" + Convert.ToBase64String(hash));
+                    }
+                }
+                return true;
+            }
+
             return false;
+        }
+
+        static string ReadPassword()
+        {
+            string pass = "";
+            while (true)
+            {
+                var key = Console.ReadKey(true);
+                if (key.Key == ConsoleKey.Enter) break;
+                if (key.Key == ConsoleKey.Backspace)
+                {
+                    if (pass.Length > 0) pass = pass.Substring(0, pass.Length - 1);
+                }
+                else if (key.KeyChar != '\0')
+                {
+                    pass += key.KeyChar;
+                }
+            }
+            Console.WriteLine();
+            return pass;
         }
 
         static void PrintHelp()

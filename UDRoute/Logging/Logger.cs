@@ -39,5 +39,17 @@ namespace UDRoute.Logging
 
         public virtual void Dispose() { }
     }
+
+    public class NullLogger : Logger
+    {
+        public override void Trace(string message) { }
+        public override void Debug(string message) { }
+        public override void Info(string message) { }
+        public override void Warn(string message) { }
+        public override void Error(string message) { }
+        public override void Error(string message, Exception ex) { }
+        
+        protected override void WriteCore(LogLevel level, string message) { }
+    }
 }
 

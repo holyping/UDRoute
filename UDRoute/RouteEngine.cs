@@ -165,6 +165,14 @@ namespace UDRoute
                                 }
                                 break;
 
+                            case MsgType.AuthReq:
+                                _server?.TryHandleAuthReq(span, remoteEp);
+                                break;
+
+                            case MsgType.AuthRes:
+                                _client?.TryHandleAuthRes(span, remoteEp);
+                                break;
+
                             default:
                                 Log.Debug($"[RouteEngine] Unknown MsgType {(byte)type} from {remoteEp}");
                                 break;
