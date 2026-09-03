@@ -1,2 +1,6 @@
 /.vs
 /.svn
+/UDRoute/obj
+/UDRoute/bin
+/UDRoute.Tests/bin
+/UDRoute.Tests/obj
