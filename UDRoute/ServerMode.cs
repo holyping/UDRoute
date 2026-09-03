@@ -436,7 +436,7 @@ namespace UDRoute
 
                 long tAuth = BinaryPrimitives.ReadInt64LittleEndian(span.Slice(17, 8));
                 byte[] clientHash = span.Slice(25, 32).ToArray();
-                
+
                 // Validate timestamp (within 15 seconds)
                 long nowTicks = DateTime.UtcNow.Ticks;
                 if (Math.Abs(nowTicks - tAuth) > 15 * 10000000L)
@@ -444,6 +444,15 @@ namespace UDRoute
                     Log.Warn($"[S] AuthReq timestamp out of bounds for session {sessionId}");
                     SendAuthRes(sessionId, remoteEp, false);
                     session.AuthTcs.TrySetResult(false);
+                    return;
+                }
+
+                bool isChallenge = true;
+                foreach (byte b in clientHash) if (b != 0) { isChallenge = false; break; }
+
+                if (isChallenge)
+                {
+                    SendAuthRes(sessionId, remoteEp, false, ConfigProtector.GetMachineId());
                     return;
                 }
 
@@ -467,12 +476,16 @@ namespace UDRoute
             }
         }
 
-        private void SendAuthRes(Guid sessionId, EndPoint remoteEp, bool success)
+        private void SendAuthRes(Guid sessionId, EndPoint remoteEp, bool success, string? t1 = null)
         {
-            byte[] res = new byte[18];
+            byte[] res = new byte[18 + (t1 != null ? 4 + Encoding.UTF8.GetByteCount(t1) : 0)];
             res[0] = (byte)MsgType.AuthRes;
             sessionId.TryWriteBytes(res.AsSpan(1, 16));
             res[17] = (byte)(success ? 1 : 0);
+            if (t1 != null)
+            {
+                ProtocolHelper.WriteString(res.AsSpan(18), t1);
+            }
             _ = _udp.SendAsync(res, remoteEp, default);
         }
 

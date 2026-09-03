@@ -3,6 +3,8 @@ using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading.Channels;
+using System.Linq;
+using System.Text;
 using UDRoute.Logging;
 
 namespace UDRoute
@@ -109,29 +111,28 @@ namespace UDRoute
             }
         }
 
+        public string? ServerT1 { get; set; }
+
         public async Task<bool> AuthenticateClientAsync(byte[] passwordHash, long sTimestamp, long pRecvTimeTicks, CancellationToken ct)
         {
             long tAuth = sTimestamp + (DateTime.UtcNow.Ticks - pRecvTimeTicks);
-            byte[] hashInput = new byte[passwordHash.Length + 8];
-            passwordHash.CopyTo(hashInput, 0);
-            BinaryPrimitives.WriteInt64LittleEndian(hashInput.AsSpan(passwordHash.Length, 8), tAuth);
-            byte[] authHash = ManagedSHA256.ComputeHashBytes(hashInput);
-
+            
+            // 第一次发送全0的AuthReq作为 Challenge 探测，向S端索取 t1
             byte[] req = new byte[57];
             req[0] = (byte)MsgType.AuthReq;
             _sessionId.TryWriteBytes(req.AsSpan(1, 16));
             BinaryPrimitives.WriteInt64LittleEndian(req.AsSpan(17, 8), tAuth);
-            authHash.CopyTo(req, 25);
+            // authHash (25..56) 保持为 0
 
             using var linkCts = CancellationTokenSource.CreateLinkedTokenSource(ct, _sessionCts.Token);
             var token = linkCts.Token;
 
-            // Start sending loop
+            // Start sending loop for Challenge
             var sendTask = Task.Run(async () =>
             {
                 try
                 {
-                    while (!AuthTcs.Task.IsCompleted && !token.IsCancellationRequested)
+                    while (ServerT1 == null && !AuthTcs.Task.IsCompleted && !token.IsCancellationRequested)
                     {
                         var targetEp = _activeRemoteEp;
                         await _udpCore.SendAsync(req, targetEp, token);
@@ -143,6 +144,42 @@ namespace UDRoute
 
             try
             {
+                // 等待 S 端回复带 t1 的 AuthRes (或者直接 AuthFail)
+                int waitTime = 0;
+                while (ServerT1 == null && waitTime < 5000 && !AuthTcs.Task.IsCompleted)
+                {
+                    await Task.Delay(100, token);
+                    waitTime += 100;
+                }
+                
+                if (AuthTcs.Task.IsCompleted) return await AuthTcs.Task;
+                if (ServerT1 == null) return false;
+
+                // 收到 t1，重新计算真实的 authHash
+                string hash1 = "$SHA256$" + string.Concat(passwordHash.Select(b => b.ToString("x2")));
+                byte[] hash2Bytes = ManagedSHA256.ComputeHashBytes(Encoding.UTF8.GetBytes(hash1 + ServerT1));
+                
+                byte[] hashInput = new byte[hash2Bytes.Length + 8];
+                hash2Bytes.CopyTo(hashInput, 0);
+                BinaryPrimitives.WriteInt64LittleEndian(hashInput.AsSpan(hash2Bytes.Length, 8), tAuth);
+                byte[] authHash = ManagedSHA256.ComputeHashBytes(hashInput);
+                authHash.CopyTo(req, 25);
+
+                // 启动真实的 Auth 发送循环
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        while (!AuthTcs.Task.IsCompleted && !token.IsCancellationRequested)
+                        {
+                            var targetEp = _activeRemoteEp;
+                            await _udpCore.SendAsync(req, targetEp, token);
+                            await Task.Delay(200, token);
+                        }
+                    }
+                    catch { }
+                }, token);
+
                 await Task.WhenAny(AuthTcs.Task, Task.Delay(5000, token));
                 return AuthTcs.Task.IsCompletedSuccessfully && AuthTcs.Task.Result;
             }

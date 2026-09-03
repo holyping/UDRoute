@@ -162,8 +162,16 @@ namespace UDRoute
                 }
                 else
                 {
-                    Log.Warn($"[C] Auth failed for session {sessionId}");
-                    session.AuthTcs.TrySetResult(false);
+                    if (span.Length > 18)
+                    {
+                        var (t1, _) = ProtocolHelper.ReadString(span.Slice(18));
+                        session.ServerT1 = t1;
+                    }
+                    else
+                    {
+                        Log.Warn($"[C] Auth failed for session {sessionId}");
+                        session.AuthTcs.TrySetResult(false);
+                    }
                 }
             }
         }
