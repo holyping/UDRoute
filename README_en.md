@@ -31,6 +31,13 @@ graph TD
     P == "3.2 P2P Failed (Proxy Relay)" ==> S
 ```
 
+## 🌍 Public Test Server
+
+To help users quickly get started and test the application, a public Proxy ([P] Node) server has been provisioned:
+* **Server Address**: `www.qzsoft.top`
+* **Instructions**: This server allows connections **without authentication**, but to prevent abuse, **the traffic relay (forwarding) feature has been disabled**.
+* **Use Cases**: Ideal for temporary testing or experiencing UDP P2P direct hole-punching. If your network topology is highly complex and P2P hole-punching fails, the connection will drop instead of falling back to relay mode. In such scenarios, it is recommended to deploy your own Proxy server.
+
 ## 📦 Build & Run (Native AOT)
 
 It is highly recommended to publish this project using **Native AOT**. The compiled executable is incredibly small, starts instantly, and does not require the target machine to have the .NET runtime installed.
