@@ -1,5 +1,7 @@
 # udroute 🚀
 
+[English](README_en.md) | [简体中文](README.md)
+
 **udroute** 是一款基于 .NET 10 开发的高性能、跨平台 UDP P2P 打洞与中继隧道工具。它旨在帮助用户轻松穿透 NAT 网络，将内网的 TCP/UDP 服务安全、稳定地暴露或映射到外部环境。无论您是需要极低延迟的游戏联机，还是可靠的内网穿透访问，udroute 都能为您提供完美的解决方案。
 
 ## 🌟 核心特性 (Key Features)
