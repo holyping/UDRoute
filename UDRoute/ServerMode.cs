@@ -205,7 +205,7 @@ namespace UDRoute
                         
                         if (hash2Bytes != null && hash2Bytes.Length == 32)
                         {
-                            string t1 = ConfigProtector.GetMachineId(_config.DevId); // Base64
+                            string t1 = ConfigProtector.GetMachineId(); // Base64
                             long ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
                             
                             byte[] tsBytes = Encoding.UTF8.GetBytes(ts.ToString());
@@ -353,10 +353,7 @@ namespace UDRoute
                     _sessions[sessionId] = session;
 
                     // 向 C 发起直接 UDP 打洞
-                    if (!_config.ForceRelay)
-                    {
-                        _ = StartPunchingAsync(session, cPublicEp, ct);
-                    }
+                    _ = StartPunchingAsync(session, cPublicEp, ct);
 
                     // 连接目标后端服务 (根据 TCP/UDP 分流)
                     _ = Task.Run(async () =>

@@ -257,7 +257,7 @@ namespace UDRoute
                                 {
                                     if (rec.Password != null)
                                     {
-                                        bool authOk = await session.AuthenticateClientAsync(rec.Password, sInfo.DevId, sInfo.STimestamp, sInfo.PRecvTimeTicks, ct);
+                                        bool authOk = await session.AuthenticateClientAsync(rec.Password, sInfo.STimestamp, sInfo.PRecvTimeTicks, ct);
                                         if (!authOk) { Log.Warn($"[C] Auth failed for session {sessionId}"); return; }
                                     }
                                     await session.RunTcpBridgeAsync(client, ct);
@@ -357,7 +357,7 @@ namespace UDRoute
                                 {
                                     if (rec.Password != null)
                                     {
-                                        bool authOk = await session.AuthenticateClientAsync(rec.Password, resp.DevId, resp.STimestamp, DateTime.UtcNow.Ticks, ct);
+                                        bool authOk = await session.AuthenticateClientAsync(rec.Password, resp.STimestamp, DateTime.UtcNow.Ticks, ct);
                                         if (!authOk) { Log.Warn($"[C] Auth failed for session {sessionId}"); return; }
                                     }
                                     await session.RunTcpBridgeAsync(client, ct);
@@ -385,7 +385,7 @@ namespace UDRoute
                                 {
                                     if (rec.Password != null)
                                     {
-                                        bool authOk = await session.AuthenticateClientAsync(rec.Password, resp.DevId, resp.STimestamp, DateTime.UtcNow.Ticks, ct);
+                                        bool authOk = await session.AuthenticateClientAsync(rec.Password, resp.STimestamp, DateTime.UtcNow.Ticks, ct);
                                         if (!authOk) { Log.Warn($"[C] Auth failed for session {sessionId}"); return; }
                                     }
                                     await session.RunTcpBridgeAsync(client, ct);
@@ -608,22 +608,19 @@ namespace UDRoute
 
                                     if (rec.Password != null)
                                     {
-                                        Guid targetDevId = Guid.Empty;
                                         long st = 0, pt = 0;
                                         if (rec.IsThis && _localProxy != null)
                                         {
                                             var info = _localProxy.DirectQuery(queryName);
                                             st = info?.STimestamp ?? 0;
                                             pt = info?.PRecvTimeTicks ?? 0;
-                                            targetDevId = info?.DevId ?? Guid.Empty;
                                         }
                                         else if (resp != null)
                                         {
                                             st = resp.STimestamp;
                                             pt = DateTime.UtcNow.Ticks;
-                                            targetDevId = resp.DevId;
                                         }
-                                        bool authOk = await session.AuthenticateClientAsync(rec.Password, targetDevId, st, pt, ct);
+                                        bool authOk = await session.AuthenticateClientAsync(rec.Password, st, pt, ct);
                                         if (!authOk)
                                         {
                                             Log.Warn($"[C] UDP Auth failed for session {sessionId}");
