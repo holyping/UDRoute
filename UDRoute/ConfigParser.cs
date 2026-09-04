@@ -207,6 +207,7 @@ namespace UDRoute
                         case "kcpnc": currentKcpConfig.Nc = int.Parse(val); break;
                         case "kcpsndwnd": currentKcpConfig.SndWnd = int.Parse(val); break;
                         case "kcprcvwnd": currentKcpConfig.RcvWnd = int.Parse(val); break;
+                        case "forcerelay": cfg.ForceRelay = val == "1" || val.Equals("true", StringComparison.OrdinalIgnoreCase); break;
                         default:
                             // 解析C模式：15389/tcp=rdp@www.pserver.com
                             if (char.IsDigit(key[0]))
@@ -331,7 +332,8 @@ namespace UDRoute
             {
                 Port = int.Parse(parts[0]),
                 IsTcp = parts.Length == 1 || parts[1].ToLower() == "tcp",
-                Mtu = defaultMtu
+                Mtu = defaultMtu,
+                ForceRelay = cfg.ForceRelay
             };
 
             var valParts = val.Split('@');

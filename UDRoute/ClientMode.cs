@@ -386,8 +386,15 @@ namespace UDRoute
                                 session.ChannelDesc = rec.Port.ToString();
                                 _sessions[sessionId] = session;
 
-                                // 并行启动对 S 的公网地址及 WanPort 进行 UDP 打洞
-                                _ = StartPunchingAsync(session, resp.DevId, resp.ServerPublicEp, resp.ServerWanPort, resp.LocalEps, ct);
+                                // 并行启动向 S 的公网地址和 WanPort 进行 UDP 打洞
+                                if (!rec.ForceRelay)
+                                {
+                                    _ = StartPunchingAsync(session, resp.DevId, resp.ServerPublicEp, resp.ServerWanPort, resp.LocalEps, ct);
+                                }
+                                else
+                                {
+                                    Log.Info($"[C] ForceRelay is enabled for session {sessionId}, skipping UDP punch.");
+                                }
 
                                 try
                                 {
@@ -607,7 +614,10 @@ namespace UDRoute
                                         else
                                         {
                                             session = new TunnelSession(_udp, pEndPoint, sessionId, rec.Mtu, isTcp: false, null, resp.Timeout);
-                                            _ = StartPunchingAsync(session, resp.DevId, resp.ServerPublicEp, resp.ServerWanPort, resp.LocalEps, ct);
+                                            if (!rec.ForceRelay)
+                                            {
+                                                _ = StartPunchingAsync(session, resp.DevId, resp.ServerPublicEp, resp.ServerWanPort, resp.LocalEps, ct);
+                                            }
                                         }
                                     }
 

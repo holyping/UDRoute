@@ -125,14 +125,16 @@ namespace UDRoute
                             case MsgType.Query:
                                 if (_proxy != null)
                                 {
-                                    _ = _proxy.ProcessQueryAsync(mem, remoteEp, ct);
+                                    byte[] qCopy = mem.ToArray();
+                                    _ = _proxy.ProcessQueryAsync(qCopy, remoteEp, ct);
                                 }
                                 break;
 
                             case MsgType.RelayStart:
                                 if (_server != null)
                                 {
-                                    _ = _server.ProcessRelayStartAsync(mem, remoteEp, ct);
+                                    byte[] rCopy = mem.ToArray();
+                                    _ = _server.ProcessRelayStartAsync(rCopy, remoteEp, ct);
                                 }
                                 break;
 

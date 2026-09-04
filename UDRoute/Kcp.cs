@@ -69,6 +69,7 @@ namespace UDRoute
 
         public int State => _state;
         public bool IsDeadLink => _state == -1;
+        public int WaitSnd { get { lock (_lock) { return _sndBuf.Count + _sndQueue.Count; } } }
 
         private uint _sndUna = 0;
         private uint _sndNxt = 0;

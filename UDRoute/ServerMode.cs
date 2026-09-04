@@ -353,7 +353,14 @@ namespace UDRoute
                     _sessions[sessionId] = session;
 
                     // 向 C 发起直接 UDP 打洞
-                    _ = StartPunchingAsync(session, cPublicEp, ct);
+                    if (!_config.ForceRelay)
+                    {
+                        _ = StartPunchingAsync(session, cPublicEp, ct);
+                    }
+                    else
+                    {
+                        Log.Info($"[S] ForceRelay is enabled, skipping UDP punch to client {cPublicEp}.");
+                    }
 
                     // 连接目标后端服务 (根据 TCP/UDP 分流)
                     _ = Task.Run(async () =>

@@ -268,12 +268,27 @@ namespace UDRoute
                     {
                         while (!token.IsCancellationRequested)
                         {
+                            // 背压控制：当 KCP 积压的未确认包数超过窗口 2 倍时，暂缓读取 TCP 流
+                            while (_kcp.WaitSnd > _kcpConfig.SndWnd * 2 && !token.IsCancellationRequested)
+                            {
+                                await Task.Delay(10, token);
+                            }
+
                             int bytesRead = await stream.ReadAsync(recvBuf.AsMemory(0, _mtu), token);
-                            if (bytesRead == 0) break;
+                            if (bytesRead == 0) break; // 本地发送端关闭 (EOF)
 
                             UpdateActivity();
                             _kcp.Send(recvBuf.AsSpan(0, bytesRead));
                             try { _signal.Release(); } catch { }
+                        }
+
+                        // 优雅关闭：本地写入完毕后，等待 KCP 发送队列与缓冲区完全清空并收到对端 ACK
+                        int waitCount = 0;
+                        while (_kcp.WaitSnd > 0 && waitCount < 50 && !_sessionCts.IsCancellationRequested)
+                        {
+                            try { _signal.Release(); } catch { }
+                            await Task.Delay(100, CancellationToken.None);
+                            waitCount++;
                         }
                     }
                     catch (OperationCanceledException) when (token.IsCancellationRequested) { }
@@ -333,6 +348,17 @@ namespace UDRoute
                     }
                     finally
                     {
+                        try
+                        {
+                            // 退出前最后尝试冲刷一次接收队列中已排序的数据
+                            while (true)
+                            {
+                                int len = _kcp.Recv(kcpRecvBuf);
+                                if (len <= 0) break;
+                                stream.Write(kcpRecvBuf, 0, len);
+                            }
+                        }
+                        catch { }
                         ArrayPool<byte>.Shared.Return(kcpRecvBuf);
                         _ = SendDisconnectAsync();
                         _sessionCts.Cancel();

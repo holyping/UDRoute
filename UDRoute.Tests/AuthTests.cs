@@ -33,7 +33,7 @@ public class AuthTests : IDisposable
         using var auth = new AuthManager(iniPath);
         // Default should be udroute.pwd
         auth.Start();
-        Assert.False(auth.Authenticate("any", "any"));
+        Assert.False(auth.Authenticate("any", "any").success);
     }
 
     [Fact]
@@ -53,16 +53,16 @@ public class AuthTests : IDisposable
             auth.Start();
 
             // Correct auth
-            Assert.True(auth.Authenticate("alice", "mySecretPass123"));
-            Assert.True(auth.Authenticate("bob", "hunter2"));
+            Assert.True(auth.Authenticate("alice", "mySecretPass123").success);
+            Assert.True(auth.Authenticate("bob", "hunter2").success);
 
             // Case-insensitive username check
-            Assert.True(auth.Authenticate("ALICE", "mySecretPass123"));
+            Assert.True(auth.Authenticate("ALICE", "mySecretPass123").success);
 
             // Wrong credentials
-            Assert.False(auth.Authenticate("alice", "wrongpwd"));
-            Assert.False(auth.Authenticate("bob", "wrongpwd"));
-            Assert.False(auth.Authenticate("charlie", "hunter2"));
+            Assert.False(auth.Authenticate("alice", "wrongpwd").success);
+            Assert.False(auth.Authenticate("bob", "wrongpwd").success);
+            Assert.False(auth.Authenticate("charlie", "hunter2").success);
         }
 
         // Verify that the file was automatically converted to $SHA256$ on disk
@@ -83,8 +83,8 @@ public class AuthTests : IDisposable
         using (var auth = new AuthManager(Path.Combine(_testDir, "dummy.ini"), pwdFile))
         {
             auth.Start();
-            Assert.True(auth.Authenticate("admin", "test1234"));
-            Assert.False(auth.Authenticate("admin", "wrong"));
+            Assert.True(auth.Authenticate("admin", "test1234").success);
+            Assert.False(auth.Authenticate("admin", "wrong").success);
         }
 
         string text = File.ReadAllText(pwdFile);
@@ -100,8 +100,8 @@ public class AuthTests : IDisposable
         using var auth = new AuthManager(Path.Combine(_testDir, "dummy.ini"), pwdFile);
         auth.Start();
 
-        Assert.True(auth.Authenticate("user1", "pass1"));
-        Assert.False(auth.Authenticate("user2", "pass2"));
+        Assert.True(auth.Authenticate("user1", "pass1").success);
+        Assert.False(auth.Authenticate("user2", "pass2").success);
 
         // Dynamically add user2 to file while running
         await Task.Delay(200);
@@ -110,7 +110,7 @@ public class AuthTests : IDisposable
         // Wait for FileSystemWatcher debounce (500ms in AuthManager + small buffer)
         await Task.Delay(1000);
 
-        Assert.True(auth.Authenticate("user2", "pass2"), "Dynamic user2 should be authenticated after file change");
+        Assert.True(auth.Authenticate("user2", "pass2").success, "Dynamic user2 should be authenticated after file change");
     }
 
     [Fact]
@@ -127,7 +127,7 @@ public class AuthTests : IDisposable
             auth.Start();
 
             // Authentication in memory should still succeed
-            Assert.True(auth.Authenticate("alice", "secret_plaintext"));
+            Assert.True(auth.Authenticate("alice", "secret_plaintext").success);
         }
         finally
         {
