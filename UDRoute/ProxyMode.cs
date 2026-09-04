@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Net;
+using System.Text;
 using UDRoute.Logging;
 
 namespace UDRoute
@@ -132,9 +133,15 @@ namespace UDRoute
             
             if (_config.AuthMode == AuthMode.Strict)
             {
-                if (!providedAuth || !_authManager.Authenticate(username, password))
+                if (!providedAuth)
                 {
-                    RejectAuth(remoteEp);
+                    RejectAuth(remoteEp, "No credentials provided in Strict mode");
+                    return;
+                }
+                var (success, reason) = _authManager.Authenticate(username, password);
+                if (!success)
+                {
+                    RejectAuth(remoteEp, reason);
                     return;
                 }
                 isAuthenticated = true;
@@ -143,20 +150,21 @@ namespace UDRoute
             {
                 if (providedAuth)
                 {
-                    if (!_authManager.Authenticate(username, password))
+                    var (success, reason) = _authManager.Authenticate(username, password);
+                    if (!success)
                     {
-                        RejectAuth(remoteEp); // 密码错误，直接丢弃
+                        RejectAuth(remoteEp, reason); // 鉴权失败直接拒绝
                         return;
                     }
                     isAuthenticated = true;
                 }
                 else
                 {
-                    isAuthenticated = false; // 没带密码，允许进入，标记未认证
+                    isAuthenticated = false; // 没提供，退级为未认证
                     username = "anonymous";
                 }
             }
-            else 
+            else
             {
                 // none 模式
                 isAuthenticated = false;
@@ -260,11 +268,13 @@ namespace UDRoute
             return true;
         }
 
-        private void RejectAuth(EndPoint remoteEp)
+        private void RejectAuth(EndPoint remoteEp, string reason)
         {
-            Log.Warn($"[P] 鉴权失败：拒绝来自 {remoteEp} 的注册请求。");
-            byte[] rejectBuf = new byte[1];
+            Log.Warn($"[P] 鉴权失败，拒绝 {remoteEp} 的注册: {reason}");
+            byte[] reasonBytes = Encoding.UTF8.GetBytes(reason);
+            byte[] rejectBuf = new byte[1 + reasonBytes.Length];
             rejectBuf[0] = (byte)MsgType.AuthFail;
+            Buffer.BlockCopy(reasonBytes, 0, rejectBuf, 1, reasonBytes.Length);
             _ = _udp.SendAsync(rejectBuf, remoteEp, default);
         }
 

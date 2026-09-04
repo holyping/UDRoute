@@ -204,13 +204,14 @@ namespace UDRoute
         /// <summary>
         /// 提供给外部的鉴权接口
         /// </summary>
-        public bool Authenticate(string username, string inputPassword)
+        public (bool success, string reason) Authenticate(string username, string inputPassword)
         {
-            if (string.IsNullOrEmpty(username) || string.IsNullOrEmpty(inputPassword)) return false;
+            if (string.IsNullOrEmpty(username) || string.IsNullOrEmpty(inputPassword)) return (false, "Username or password empty");
 
             if (_users.TryGetValue(username, out string? storedHash))
             {
-                if (storedHash == null) return false;
+                if (storedHash == null) return (false, "User hash is null");
+
                 if (inputPassword.StartsWith("$HW$"))
                 {
                     var parts = inputPassword.Substring(4).Split('|');
@@ -221,7 +222,7 @@ namespace UDRoute
                         if (Math.Abs(now - ts) > 30)
                         {
                             Log.Warn($"[Auth] 检测到重放攻击或时间偏移过大: 用户 {username}");
-                            return false;
+                            return (false, "Time drift > 30s or replay attack");
                         }
 
                         string t1 = parts[1];
@@ -238,16 +239,22 @@ namespace UDRoute
                         byte[] expectedHash4Bytes = ManagedSHA256.ComputeHashBytes(bufferToHash);
                         string expectedHash3Base64 = Convert.ToBase64String(expectedHash4Bytes);
 
-                        return string.Equals(hash3, expectedHash3Base64, StringComparison.OrdinalIgnoreCase);
+                        if (string.Equals(hash3, expectedHash3Base64, StringComparison.OrdinalIgnoreCase))
+                            return (true, "OK");
+                        else
+                            return (false, "Hash mismatch");
                     }
-                    return false;
+                    return (false, "Invalid $HW$ payload format");
                 }
 
                 // 将用户传入的明文密码也计算成 Hash，进行比对（向下兼容）
                 string inputHash = HashPrefix + ComputeSha256(inputPassword);
-                return string.Equals(storedHash, inputHash, StringComparison.OrdinalIgnoreCase);
+                if (string.Equals(storedHash, inputHash, StringComparison.OrdinalIgnoreCase))
+                    return (true, "OK");
+                else
+                    return (false, "Plaintext hash mismatch");
             }
-            return false;
+            return (false, "User not found");
         }
 
         private string ComputeSha256(string input)

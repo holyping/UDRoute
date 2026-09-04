@@ -1,5 +1,8 @@
 using System.Buffers;
 using System.Net;
+using System.Net.Sockets;
+using System.Threading.Channels;
+using System.Text;
 using UDRoute.Logging;
 
 namespace UDRoute
@@ -154,8 +157,12 @@ namespace UDRoute
                                 break;
 
                             case MsgType.AuthFail:
-                                Log.Error($"[S] 鉴权失败：收到来自代理服务器({remoteEp})的拒绝连接响应！请检查配置中的 Username 和 Password。");
+                            {
+                                string reason = "Unknown reason";
+                                if (span.Length > 1) reason = Encoding.UTF8.GetString(span.Slice(1).ToArray());
+                                Log.Error($"[S] 鉴权失败：收到来自代理服务器({remoteEp})的拒绝连接响应！原因: {reason}。请检查配置。");
                                 break;
+                            }
 
                             case MsgType.RegFail:
                                 if (span.Length >= 5)
@@ -166,11 +173,13 @@ namespace UDRoute
                                 break;
 
                             case MsgType.AuthReq:
-                                _server?.TryHandleAuthReq(span, remoteEp);
+                                if (_server != null) _server.TryHandleAuthReq(span, remoteEp);
+                                if (_proxy != null && span.Length >= 17) await _proxy.TryRelayDataAsync(new Guid(span.Slice(1, 16)), mem, remoteEp, ct);
                                 break;
 
                             case MsgType.AuthRes:
-                                _client?.TryHandleAuthRes(span, remoteEp);
+                                if (_client != null) _client.TryHandleAuthRes(span, remoteEp);
+                                if (_proxy != null && span.Length >= 17) await _proxy.TryRelayDataAsync(new Guid(span.Slice(1, 16)), mem, remoteEp, ct);
                                 break;
 
                             default:
