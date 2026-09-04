@@ -90,8 +90,7 @@ namespace UDRoute
             string proto = isTcp ? "tcp" : "udp";
             int timeout = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(22, 4));
             long sTimestamp = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(26, 8));
-            bool reqPass = (data[34] & 1) != 0;
-            bool sForceRelay = (data[34] & 2) != 0;
+            bool reqPass = data[34] != 0;
 
             var (kcpConfig, kLen) = ProtocolHelper.ReadKcpConfig(data.Slice(35));
             int offset = 35 + kLen;
@@ -192,8 +191,7 @@ namespace UDRoute
                 OwnerUser = username,
                 STimestamp = sTimestamp,
                 PRecvTimeTicks = DateTime.UtcNow.Ticks,
-                RequiresPassword = reqPass,
-                ForceRelay = sForceRelay
+                RequiresPassword = reqPass
             };
 
             if (isAuthenticated)
@@ -307,8 +305,7 @@ namespace UDRoute
                 OwnerUser = "localhost",
                 STimestamp = DateTime.UtcNow.Ticks,
                 PRecvTimeTicks = DateTime.UtcNow.Ticks,
-                RequiresPassword = rec.Password != null && rec.Password.Length > 0,
-                ForceRelay = _config.ForceRelay
+                RequiresPassword = rec.Password != null && rec.Password.Length > 0
             };
 
             string key1 = $"{rec.Name}/{proto}";
@@ -411,7 +408,7 @@ namespace UDRoute
                         if (epCount >= 10) break;
                     }
                     punchRespBuf[countPos] = epCount;
-                    punchRespBuf[offset++] = (byte)((allowRelay ? 1 : 0) | (sInfo.ForceRelay ? 2 : 0));
+                    punchRespBuf[offset++] = (byte)(allowRelay ? 1 : 0);
 
                     await _udp.SendAsync(punchRespBuf.AsMemory(0, offset), remoteEp, ct);
                 }

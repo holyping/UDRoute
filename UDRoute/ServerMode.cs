@@ -182,7 +182,7 @@ namespace UDRoute
                         buffer[21] = (byte)(rec.IsTcp ? 1 : 0);
                         BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(22, 4), rec.Timeout);
                         bool reqPass = rec.Password != null && rec.Password.Length > 0;
-                        buffer[34] = (byte)((reqPass ? 1 : 0) | (_config.ForceRelay ? 2 : 0));
+                        buffer[34] = (byte)(reqPass ? 1 : 0);
                         int offset = 35;
                         offset += ProtocolHelper.WriteKcpConfig(buffer.AsSpan(offset), rec.KcpConfig);
                         offset += ProtocolHelper.WriteString(buffer.AsSpan(offset), rec.Name);
@@ -355,15 +355,14 @@ namespace UDRoute
                     _sessions[sessionId] = session;
 
                     // 向 C 发起直接 UDP 打洞
-                    bool forceRelay = _config.ForceRelay || clientForceRelay;
-                    session.ForceRelay = forceRelay;
-                    if (!forceRelay)
+                    session.ForceRelay = clientForceRelay;
+                    if (!clientForceRelay)
                     {
                         _ = StartPunchingAsync(session, cPublicEp, ct);
                     }
                     else
                     {
-                        Log.Info($"[S] ForceRelay is enabled (Local: {_config.ForceRelay}, Client: {clientForceRelay}), skipping UDP punch to client {cPublicEp}.");
+                        Log.Info($"[S] ForceRelay requested by client, skipping UDP punch to client {cPublicEp}.");
                     }
 
                     // 连接目标后端服务 (根据 TCP/UDP 分流)
@@ -414,9 +413,9 @@ namespace UDRoute
         {
             if (_sessions.TryGetValue(sessionId, out var session))
             {
-                if (_config.ForceRelay || session.ForceRelay)
+                if (session.ForceRelay)
                 {
-                    Log.Debug($"[S] Ignoring punch for session {sessionId} because ForceRelay is enabled.");
+                    Log.Debug($"[S] Ignoring punch for session {sessionId} because client requested ForceRelay.");
                     return true;
                 }
 
