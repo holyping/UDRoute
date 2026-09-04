@@ -26,7 +26,7 @@ namespace UDRoute
                 NoDelay = false;
                 Interval = 40;
                 Resend = 2;
-                Nc = 0;
+                Nc = 0; // 开启拥塞控制，适合普通应用和高吞吐
                 SndWnd = 512;
                 RcvWnd = 512;
             }
@@ -35,16 +35,16 @@ namespace UDRoute
                 NoDelay = true;
                 Interval = 20;
                 Resend = 2;
-                Nc = 1;
-                SndWnd = 256;
-                RcvWnd = 256;
+                Nc = 0; // 【修正】大流量传输必须开启拥塞控制，否则会打死路由器
+                SndWnd = 512;
+                RcvWnd = 512;
             }
-            else if (profile.Equals("api", StringComparison.OrdinalIgnoreCase))
+            else if (profile.Equals("game", StringComparison.OrdinalIgnoreCase) || profile.Equals("realtime", StringComparison.OrdinalIgnoreCase))
             {
                 NoDelay = true;
                 Interval = 10;
                 Resend = 0;
-                Nc = 1;
+                Nc = 1; // 关闭拥塞控制：仅限游戏、SSH等【小包低延迟】场景，绝不能用于大数据传输
                 SndWnd = 128;
                 RcvWnd = 128;
             }
