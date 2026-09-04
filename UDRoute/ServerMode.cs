@@ -181,8 +181,8 @@ namespace UDRoute
                         BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(17, 4), _config.WanPort);
                         buffer[21] = (byte)(rec.IsTcp ? 1 : 0);
                         BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(22, 4), rec.Timeout);
-                        BinaryPrimitives.WriteInt64LittleEndian(buffer.AsSpan(26, 8), DateTime.UtcNow.Ticks);
-                        buffer[34] = (byte)(rec.Password != null && rec.Password.Length > 0 ? 1 : 0);
+                        bool reqPass = rec.Password != null && rec.Password.Length > 0;
+                        buffer[34] = (byte)((reqPass ? 1 : 0) | (_config.ForceRelay ? 2 : 0));
                         int offset = 35;
                         offset += ProtocolHelper.WriteKcpConfig(buffer.AsSpan(offset), rec.KcpConfig);
                         offset += ProtocolHelper.WriteString(buffer.AsSpan(offset), rec.Name);
@@ -410,6 +410,12 @@ namespace UDRoute
         {
             if (_sessions.TryGetValue(sessionId, out var session))
             {
+                if (_config.ForceRelay)
+                {
+                    Log.Debug($"[S] Ignoring punch for session {sessionId} because ForceRelay is enabled.");
+                    return true;
+                }
+
                 session.SwitchToDirect(remoteEp);
 
                 if (status == 2)

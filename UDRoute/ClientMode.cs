@@ -106,11 +106,13 @@ namespace UDRoute
                     }
                 }
 
-                bool allowRelay = data[offset++] != 0;
+                bool allowRelay = (data[offset] & 1) != 0;
+                bool sForceRelay = (data[offset] & 2) != 0;
+                offset++;
 
                 if (_pendingQueries.TryRemove(sessionId, out var tcs))
                 {
-                    tcs.TrySetResult(new QueryResponse(true, devId, sPublicEp, sWanPort, timeout, sTimestamp, reqPass, kcpConfig, localEps, allowRelay));
+                    tcs.TrySetResult(new QueryResponse(true, devId, sPublicEp, sWanPort, timeout, sTimestamp, reqPass, kcpConfig, localEps, allowRelay, sForceRelay));
                     return true;
                 }
             }
@@ -130,6 +132,12 @@ namespace UDRoute
         {
             if (_sessions.TryGetValue(sessionId, out var session))
             {
+                if (_config.ForceRelay)
+                {
+                    Log.Debug($"[C] Ignoring punch for session {sessionId} because ForceRelay is enabled.");
+                    return true;
+                }
+
                 session.SwitchToDirect(remoteEp);
 
                 if (status == 2)
@@ -387,13 +395,14 @@ namespace UDRoute
                                 _sessions[sessionId] = session;
 
                                 // 并行启动向 S 的公网地址和 WanPort 进行 UDP 打洞
-                                if (!rec.ForceRelay)
+                                bool forceRelay = rec.ForceRelay || resp.ServerForceRelay;
+                                if (!forceRelay)
                                 {
                                     _ = StartPunchingAsync(session, resp.DevId, resp.ServerPublicEp, resp.ServerWanPort, resp.LocalEps, ct);
                                 }
                                 else
                                 {
-                                    Log.Info($"[C] ForceRelay is enabled for session {sessionId}, skipping UDP punch.");
+                                    Log.Info($"[C] ForceRelay is enabled (Local: {rec.ForceRelay}, Remote: {resp.ServerForceRelay}) for session {sessionId}, skipping UDP punch.");
                                 }
 
                                 try
@@ -614,9 +623,14 @@ namespace UDRoute
                                         else
                                         {
                                             session = new TunnelSession(_udp, pEndPoint, sessionId, rec.Mtu, isTcp: false, null, resp.Timeout);
-                                            if (!rec.ForceRelay)
+                                            bool forceRelay = rec.ForceRelay || resp.ServerForceRelay;
+                                            if (!forceRelay)
                                             {
                                                 _ = StartPunchingAsync(session, resp.DevId, resp.ServerPublicEp, resp.ServerWanPort, resp.LocalEps, ct);
+                                            }
+                                            else
+                                            {
+                                                Log.Info($"[C] ForceRelay is enabled (Local: {rec.ForceRelay}, Remote: {resp.ServerForceRelay}) for UDP session {sessionId}, skipping UDP punch.");
                                             }
                                         }
                                     }
@@ -749,6 +763,6 @@ namespace UDRoute
             return pass;
         }
 
-        private record QueryResponse(bool Success, Guid DevId, IPEndPoint ServerPublicEp, int ServerWanPort, int Timeout, long STimestamp, bool RequiresPassword, KcpConfig? KcpConfig, List<IPEndPoint> LocalEps, bool AllowRelay = true);
+        private record QueryResponse(bool Success, Guid DevId, IPEndPoint ServerPublicEp, int ServerWanPort, int Timeout, long STimestamp, bool RequiresPassword, KcpConfig? KcpConfig, List<IPEndPoint> LocalEps, bool AllowRelay = true, bool ServerForceRelay = false);
     }
 }

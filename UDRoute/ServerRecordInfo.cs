@@ -21,5 +21,6 @@ namespace UDRoute
         public long STimestamp { get; set; }
         public long PRecvTimeTicks { get; set; }
         public bool RequiresPassword { get; set; }
+        public bool ForceRelay { get; set; }
     }
 }

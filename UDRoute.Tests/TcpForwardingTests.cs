@@ -289,5 +289,108 @@ public class TcpForwardingTests : IDisposable
             cluster.echoListener.Stop();
         }
     }
+
+    [Fact]
+    public async Task ServerConfiguresForceRelay_ClientRespectsAndSkipsPunch()
+    {
+        // S 端配置 ForceRelay = true，而 C 端没有配置 ForceRelay (false)
+        using var testCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, testCts.Token);
+        var ct = linkedCts.Token;
+
+        var echoListener = new TcpListener(IPAddress.Loopback, 0);
+        echoListener.Start();
+        int echoPort = ((IPEndPoint)echoListener.LocalEndpoint).Port;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                while (!_cts.Token.IsCancellationRequested)
+                {
+                    var client = await echoListener.AcceptTcpClientAsync(_cts.Token);
+                    _ = Task.Run(async () =>
+                    {
+                        using (client)
+                        using (var stream = client.GetStream())
+                        {
+                            byte[] buf = new byte[8192];
+                            int read;
+                            while ((read = await stream.ReadAsync(buf, 0, buf.Length, _cts.Token)) > 0)
+                            {
+                                await stream.WriteAsync(buf, 0, read, _cts.Token);
+                            }
+                        }
+                    }, _cts.Token);
+                }
+            }
+            catch { }
+        });
+
+        int pPort = GetFreePort();
+        int cPort = GetFreePort();
+
+        // 1. P 节点
+        var pCfg = new AppConfig { Port = pPort, EnableProxy = true, ConfigPath = "dummy.ini" };
+        var pEngine = new RouteEngine(pCfg);
+        _ = pEngine.StartAsync(_cts.Token);
+
+        await Task.Delay(100);
+
+        // 2. S 节点配置 ForceRelay = true
+        var sCfg = new AppConfig { DevId = Guid.NewGuid(), Port = 0, ConfigPath = "dummy.ini", ForceRelay = true };
+        sCfg.ServerRecords.Add(new ServerRecord
+        {
+            Name = "echo_service",
+            TargetServer = $"127.0.0.1:{pPort}",
+            TargetIp = "127.0.0.1",
+            TargetPort = echoPort,
+            IsTcp = true
+        });
+        var sEngine = new RouteEngine(sCfg);
+        _ = sEngine.StartAsync(_cts.Token);
+
+        // 3. C 节点配置 ForceRelay = false
+        var cCfg = new AppConfig { DevId = Guid.NewGuid(), ForceRelay = false, Port = 0, ConfigPath = "dummy.ini" };
+        cCfg.ClientRecords.Add(new ClientRecord
+        {
+            Port = cPort,
+            TargetName = "echo_service",
+            TargetServer = $"127.0.0.1:{pPort}",
+            IsTcp = true,
+            ForceRelay = false // C 端没有强制，期望从 S 端协商读取
+        });
+        var cEngine = new RouteEngine(cCfg);
+        _ = cEngine.StartAsync(_cts.Token);
+
+        await Task.Delay(1500, _cts.Token);
+
+        try
+        {
+            using var client = new TcpClient();
+            await client.ConnectAsync(IPAddress.Loopback, cPort, ct);
+            using var stream = client.GetStream();
+
+            byte[] sendData = new byte[1024];
+            RandomNumberGenerator.Fill(sendData);
+            await stream.WriteAsync(sendData, 0, sendData.Length, ct);
+
+            byte[] recvData = new byte[sendData.Length];
+            int total = 0;
+            while (total < recvData.Length)
+            {
+                int r = await stream.ReadAsync(recvData, total, recvData.Length - total, ct);
+                if (r == 0) break;
+                total += r;
+            }
+
+            Assert.Equal(sendData.Length, total);
+            Assert.True(sendData.SequenceEqual(recvData));
+        }
+        finally
+        {
+            echoListener.Stop();
+        }
+    }
 }
 
