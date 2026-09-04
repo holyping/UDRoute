@@ -1,4 +1,4 @@
-﻿using System.Net;
+using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 
@@ -23,6 +23,11 @@ namespace UDRoute
                 const int SIO_UDP_CONNRESET = -1744830452;
                 _socket.IOControl(SIO_UDP_CONNRESET, new byte[] { 0 }, null); // 忽略UDP Connection Reset
             }
+            
+            // 增大系统收发缓冲区，应对大窗口的高吞吐量 (避免Burst导致丢包)
+            _socket.ReceiveBufferSize = 2 * 1024 * 1024;
+            _socket.SendBufferSize = 2 * 1024 * 1024;
+
             _socket.Bind(new IPEndPoint(IPAddress.IPv6Any, port));
         }
 

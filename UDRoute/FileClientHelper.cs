@@ -163,7 +163,7 @@ namespace UDRoute
                     }
                     else
                     {
-                        string dir = Path.GetDirectoryName(localFilePath);
+                        string? dir = Path.GetDirectoryName(localFilePath);
                         if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
                         dstStream = new FileStream(localFilePath, FileMode.Create, FileAccess.Write, FileShare.None);
                     }

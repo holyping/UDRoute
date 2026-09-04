@@ -39,6 +39,7 @@ namespace UDRoute
         public int MaxUnauthNamesTotal { get; set; } = Constants.DefaultMaxUnauthNamesTotal;
         public string Username { get; set; } = "";
         public byte[]? Password { get; set; }
+        public bool ForceRelay { get; set; }
 
         public List<ClientRecord> ClientRecords { get; set; } = new();
         public List<ServerRecord> ServerRecords { get; set; } = new();

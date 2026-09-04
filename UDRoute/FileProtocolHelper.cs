@@ -78,7 +78,7 @@ namespace UDRoute
                         if (!await ReadExactAsync(stream, sizeBuf, ct)) return;
                         long fileSize = BitConverter.ToInt64(sizeBuf, 0);
 
-                        string dir = Path.GetDirectoryName(fullPath);
+                        string? dir = Path.GetDirectoryName(fullPath);
                         if (dir != null && !Directory.Exists(dir))
                         {
                             Directory.CreateDirectory(dir);

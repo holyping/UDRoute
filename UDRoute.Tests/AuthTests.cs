@@ -147,7 +147,9 @@ public class AuthTests : IDisposable
         BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(17, 4), 0); // WanPort
         buffer[21] = (byte)(isTcp ? 1 : 0);
         BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(22, 4), 300); // Timeout
-        int offset = 26;
+        BinaryPrimitives.WriteInt64LittleEndian(buffer.AsSpan(26, 8), DateTime.UtcNow.Ticks); // Timestamp
+        buffer[34] = 0; // ReqPass
+        int offset = 35;
         offset += ProtocolHelper.WriteKcpConfig(buffer.AsSpan(offset), new KcpConfig());
         offset += ProtocolHelper.WriteString(buffer.AsSpan(offset), serviceName);
         offset += ProtocolHelper.WriteString(buffer.AsSpan(offset), devName);
@@ -173,7 +175,7 @@ public class AuthTests : IDisposable
         {
             ConfigPath = Path.Combine(_testDir, "test.ini"),
             AuthFile = pwdFile,
-            AuthMode = "strict",
+            AuthMode = AuthMode.Strict,
             Port = 0
         };
 
@@ -199,7 +201,7 @@ public class AuthTests : IDisposable
         {
             ConfigPath = Path.Combine(_testDir, "test.ini"),
             AuthFile = pwdFile,
-            AuthMode = "strict",
+            AuthMode = AuthMode.Strict,
             Port = 0
         };
 
@@ -225,7 +227,7 @@ public class AuthTests : IDisposable
         {
             ConfigPath = Path.Combine(_testDir, "test.ini"),
             AuthFile = pwdFile,
-            AuthMode = "strict",
+            AuthMode = AuthMode.Strict,
             Port = 0
         };
 
@@ -254,7 +256,7 @@ public class AuthTests : IDisposable
         {
             ConfigPath = Path.Combine(_testDir, "test.ini"),
             AuthFile = pwdFile,
-            AuthMode = "optional",
+            AuthMode = AuthMode.Optional,
             Port = 0
         };
 
@@ -283,7 +285,7 @@ public class AuthTests : IDisposable
         {
             ConfigPath = Path.Combine(_testDir, "test.ini"),
             AuthFile = pwdFile,
-            AuthMode = "optional",
+            AuthMode = AuthMode.Optional,
             Port = 0
         };
 
@@ -313,7 +315,7 @@ public class AuthTests : IDisposable
         {
             ConfigPath = Path.Combine(_testDir, "test.ini"),
             AuthFile = pwdFile,
-            AuthMode = "optional",
+            AuthMode = AuthMode.Optional,
             Port = 0
         };
 
@@ -373,7 +375,7 @@ public class AuthTests : IDisposable
         {
             ConfigPath = Path.Combine(_testDir, "test.ini"),
             AuthFile = pwdFile,
-            AuthMode = "optional",
+            AuthMode = AuthMode.Optional,
             Port = 0
         };
 

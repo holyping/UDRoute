@@ -10,5 +10,6 @@ namespace UDRoute
         public string? Username { get; set; }
         public byte[]? Password { get; set; }
         public int Mtu { get; set; } = Constants.DefaultMtu;
+        public bool ForceRelay { get; set; }
     }
 }

@@ -7,6 +7,7 @@ Options:
   -c [file]             Specify configuration file path (defaults to udroute.ini if no file provided)
   -log <level>          Set log level: trace, debug, info, warn, error, none
   -d, -daemon, -service Run in background as a system service or daemon (headless mode)
+  -forcerelay           Force relay mode (disable direct UDP hole-punching and route all data through P proxy)
 
 Commands:
   -h, -?, -help, --help Show this help message
