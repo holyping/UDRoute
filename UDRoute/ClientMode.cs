@@ -132,7 +132,7 @@ namespace UDRoute
         {
             if (_sessions.TryGetValue(sessionId, out var session))
             {
-                if (_config.ForceRelay)
+                if (_config.ForceRelay || session.ForceRelay)
                 {
                     Log.Debug($"[C] Ignoring punch for session {sessionId} because ForceRelay is enabled.");
                     return true;
@@ -256,7 +256,7 @@ namespace UDRoute
                                 int offset = 17;
                                 offset += ProtocolHelper.WriteString(relayStartBuf.AsSpan(offset), queryName);
                                 offset += ProtocolHelper.WriteIPEndPoint(relayStartBuf.AsSpan(offset), _udp.LocalEndPoint);
-                                relayStartBuf[offset++] = (byte)((_localProxy?.IsRelayAllowed(sInfo) ?? true) ? 1 : 0);
+                                relayStartBuf[offset++] = (byte)(((_localProxy?.IsRelayAllowed(sInfo) ?? true) ? 1 : 0) | (rec.ForceRelay ? 2 : 0));
                                 await _udp.SendAsync(relayStartBuf.AsMemory(0, offset), sInfo.PublicEp, ct);
                             }
                             finally
@@ -266,6 +266,7 @@ namespace UDRoute
 
                             var session = new TunnelSession(_udp, sInfo.PublicEp, sessionId, rec.Mtu, rec.IsTcp, sInfo.KcpConfig, sInfo.Timeout);
                             session.ChannelDesc = rec.Port.ToString();
+                            session.ForceRelay = rec.ForceRelay || sInfo.ForceRelay;
                             _sessions[sessionId] = session;
                             _ = Task.Run(async () =>
                             {
@@ -312,6 +313,7 @@ namespace UDRoute
                                 qBuf[0] = (byte)MsgType.Query;
                                 sessionId.TryWriteBytes(qBuf.AsSpan(1, 16));
                                 int qLen = 17 + ProtocolHelper.WriteString(qBuf.AsSpan(17), queryName);
+                                qBuf[qLen++] = (byte)(rec.ForceRelay ? 1 : 0);
                                 await _udp.SendAsync(qBuf.AsMemory(0, qLen), pEndPoint, ct);
                             }
                             finally
@@ -392,10 +394,11 @@ namespace UDRoute
                                 // 初始通过 P 中继通信，应用协商好的 KCP 参数
                                 var session = new TunnelSession(_udp, pEndPoint, sessionId, rec.Mtu, rec.IsTcp, resp.KcpConfig, resp.Timeout);
                                 session.ChannelDesc = rec.Port.ToString();
+                                bool forceRelay = rec.ForceRelay || resp.ServerForceRelay;
+                                session.ForceRelay = forceRelay;
                                 _sessions[sessionId] = session;
 
                                 // 并行启动向 S 的公网地址和 WanPort 进行 UDP 打洞
-                                bool forceRelay = rec.ForceRelay || resp.ServerForceRelay;
                                 if (!forceRelay)
                                 {
                                     _ = StartPunchingAsync(session, resp.DevId, resp.ServerPublicEp, resp.ServerWanPort, resp.LocalEps, ct);
@@ -538,7 +541,7 @@ namespace UDRoute
                                                 int offset = 17;
                                                 offset += ProtocolHelper.WriteString(relayStartBuf.AsSpan(offset), queryName);
                                                 offset += ProtocolHelper.WriteIPEndPoint(relayStartBuf.AsSpan(offset), _udp.LocalEndPoint);
-                                                relayStartBuf[offset++] = (byte)((_localProxy?.IsRelayAllowed(sInfo) ?? true) ? 1 : 0);
+                                                relayStartBuf[offset++] = (byte)(((_localProxy?.IsRelayAllowed(sInfo) ?? true) ? 1 : 0) | (rec.ForceRelay ? 2 : 0));
                                                 await _udp.SendAsync(relayStartBuf.AsMemory(0, offset), sInfo.PublicEp, ct);
                                             }
                                             finally
@@ -547,6 +550,7 @@ namespace UDRoute
                                             }
 
                                             session = new TunnelSession(_udp, sInfo.PublicEp, sessionId, rec.Mtu, isTcp: false, null, sInfo.Timeout);
+                                            session.ForceRelay = rec.ForceRelay || sInfo.ForceRelay;
                                         }
                                         else
                                         {
@@ -572,6 +576,7 @@ namespace UDRoute
                                             qBuf[0] = (byte)MsgType.Query;
                                             sessionId.TryWriteBytes(qBuf.AsSpan(1, 16));
                                             int qLen = 17 + ProtocolHelper.WriteString(qBuf.AsSpan(17), queryName);
+                                            qBuf[qLen++] = (byte)(rec.ForceRelay ? 1 : 0);
                                             await _udp.SendAsync(qBuf.AsMemory(0, qLen), pEndPoint, ct);
                                         }
                                         finally

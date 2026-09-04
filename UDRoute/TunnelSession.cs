@@ -39,6 +39,7 @@ namespace UDRoute
         public CancellationToken SessionToken => _sessionCts.Token;
         public string ChannelDesc { get; set; } = string.Empty;
         public byte[]? PasswordHash { get; set; }
+        public bool ForceRelay { get; set; }
 
         public TunnelSession(ZeroCopyUdpSocket udpCore, EndPoint initialEp, Guid sessionId, int mtu, bool isTcp = true, KcpConfig? kcpConfig = null, int timeoutSeconds = 0)
         {

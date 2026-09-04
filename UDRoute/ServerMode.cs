@@ -268,9 +268,11 @@ namespace UDRoute
             var (cPublicEp, epLen) = ProtocolHelper.ReadIPEndPoint(data.Slice(offset));
             offset += epLen;
 
-            bool allowRelay = data[offset++] != 0;
+            bool allowRelay = (data[offset] & 1) != 0;
+            bool clientForceRelay = (data[offset] & 2) != 0;
+            offset++;
 
-            Log.Info($"[S] RelayStart: Session {sessionId} for '{targetName}', Client: {cPublicEp}, AllowRelay: {allowRelay}");
+            Log.Info($"[S] RelayStart: Session {sessionId} for '{targetName}', Client: {cPublicEp}, AllowRelay: {allowRelay}, ClientForceRelay: {clientForceRelay}");
 
             var rec = _config.ServerRecords.FirstOrDefault(r =>
             {
@@ -353,13 +355,15 @@ namespace UDRoute
                     _sessions[sessionId] = session;
 
                     // 向 C 发起直接 UDP 打洞
-                    if (!_config.ForceRelay)
+                    bool forceRelay = _config.ForceRelay || clientForceRelay;
+                    session.ForceRelay = forceRelay;
+                    if (!forceRelay)
                     {
                         _ = StartPunchingAsync(session, cPublicEp, ct);
                     }
                     else
                     {
-                        Log.Info($"[S] ForceRelay is enabled, skipping UDP punch to client {cPublicEp}.");
+                        Log.Info($"[S] ForceRelay is enabled (Local: {_config.ForceRelay}, Client: {clientForceRelay}), skipping UDP punch to client {cPublicEp}.");
                     }
 
                     // 连接目标后端服务 (根据 TCP/UDP 分流)
@@ -410,7 +414,7 @@ namespace UDRoute
         {
             if (_sessions.TryGetValue(sessionId, out var session))
             {
-                if (_config.ForceRelay)
+                if (_config.ForceRelay || session.ForceRelay)
                 {
                     Log.Debug($"[S] Ignoring punch for session {sessionId} because ForceRelay is enabled.");
                     return true;

@@ -332,9 +332,15 @@ namespace UDRoute
             if (data.Length < 21) return;
 
             Guid sessionId = new Guid(data.Slice(1, 16));
-            var (targetName, _) = ProtocolHelper.ReadString(data.Slice(17));
+            var (targetName, nLen) = ProtocolHelper.ReadString(data.Slice(17));
+            int qOffset = 17 + nLen;
+            bool clientForceRelay = false;
+            if (qOffset < data.Length)
+            {
+                clientForceRelay = data[qOffset++] != 0;
+            }
 
-            Log.Debug($"[P] Query received for '{targetName}', Session: {sessionId} from {remoteEp}");
+            Log.Debug($"[P] Query received for '{targetName}', Session: {sessionId} from {remoteEp}, ClientForceRelay: {clientForceRelay}");
 
             var sInfo = DirectQuery(targetName);
             if (sInfo != null)
@@ -353,7 +359,7 @@ namespace UDRoute
                 }
 
                 // 1. 通知 S 端发起准备与打洞 (RelayStart)
-                // [MsgType 1][SessionId 16][TargetName string][ClientPublicEp][AllowRelay 1]
+                // [MsgType 1][SessionId 16][TargetName string][ClientPublicEp][AllowRelay 1 (bit 0=AllowRelay, bit 1=ClientForceRelay)]
                 byte[] relayStartBuf = ArrayPool<byte>.Shared.Rent(512);
                 try
                 {
@@ -362,7 +368,7 @@ namespace UDRoute
                     int offset = 17;
                     offset += ProtocolHelper.WriteString(relayStartBuf.AsSpan(offset), targetName);
                     offset += ProtocolHelper.WriteIPEndPoint(relayStartBuf.AsSpan(offset), remoteEp);
-                    relayStartBuf[offset++] = (byte)(allowRelay ? 1 : 0);
+                    relayStartBuf[offset++] = (byte)((allowRelay ? 1 : 0) | (clientForceRelay ? 2 : 0));
 
                     await _udp.SendAsync(relayStartBuf.AsMemory(0, offset), sInfo.PublicEp, ct);
                 }
