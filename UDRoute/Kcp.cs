@@ -30,8 +30,8 @@ namespace UDRoute
         public const int IKCP_DEADLINK = 20;
         public const int IKCP_THRESH_INIT = 2;
         public const int IKCP_THRESH_MIN = 2;
-        public const int IKCP_PROBE_INIT = 7000;   // 7 secs to probe window size
-        public const int IKCP_PROBE_LIMIT = 120000; // up to 120 secs to probe window
+        public const int IKCP_PROBE_INIT = 200;    // 200 ms to probe window size (reduced from 7000ms to fix TCP stalls)
+        public const int IKCP_PROBE_LIMIT = 10000; // up to 10 secs to probe window
 
         public class Segment
         {
