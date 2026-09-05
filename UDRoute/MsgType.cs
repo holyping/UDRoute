@@ -16,6 +16,7 @@ namespace UDRoute
         AuthFail = 9,
         RegFail = 10,
         AuthReq = 11,
-        AuthRes = 12
+        AuthRes = 12,
+        RelayEnd = 13
     }
 }

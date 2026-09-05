@@ -22,6 +22,8 @@ namespace UDRoute.Logging
     {
         public LogLevel Level { get; set; } = LogLevel.Warn;
 
+        public bool IsEnabled(LogLevel level) => Level != LogLevel.None && level >= Level;
+
         public virtual void Trace(string message) => Write(LogLevel.Trace, message);
         public virtual void Debug(string message) => Write(LogLevel.Debug, message);
         public virtual void Info(string message) => Write(LogLevel.Info, message);
@@ -31,7 +33,7 @@ namespace UDRoute.Logging
 
         public void Write(LogLevel level, string message)
         {
-            if (level < Level || Level == LogLevel.None) return;
+            if (!IsEnabled(level)) return;
             WriteCore(level, message);
         }
 

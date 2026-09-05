@@ -34,7 +34,12 @@ namespace UDRoute
         public async ValueTask<(int length, EndPoint remoteEP)> ReceiveAsync(Memory<byte> buffer, CancellationToken ct)
         {
             var result = await _socket.ReceiveFromAsync(buffer, SocketFlags.None, new IPEndPoint(IPAddress.IPv6Any, 0), ct);
-            return (result.ReceivedBytes, result.RemoteEndPoint);
+            var ep = result.RemoteEndPoint;
+            if (ep is IPEndPoint ipEp && ipEp.Address.IsIPv4MappedToIPv6)
+            {
+                ep = new IPEndPoint(ipEp.Address.MapToIPv4(), ipEp.Port);
+            }
+            return (result.ReceivedBytes, ep);
         }
 
         public async ValueTask SendAsync(ReadOnlyMemory<byte> buffer, EndPoint remoteEP, CancellationToken ct)

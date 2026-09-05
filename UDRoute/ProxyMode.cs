@@ -25,7 +25,10 @@ namespace UDRoute
         private readonly object _unauthLock = new();
 
         // SessionId -> Relay Session (ClientEp <-> ServerEp)
-        private readonly ConcurrentDictionary<Guid, RelaySession> _relaySessions = new();
+        private readonly Dictionary<Guid, RelaySession> _relaySessions = new();
+        // SessionId -> Inactive/Closed Relay Session metadata (用于 C 端重用时 0-RTT 极速重新激活中继)
+        private readonly Dictionary<Guid, ClosedRelayInfo> _closedRelaySessions = new();
+        private readonly object _relayLock = new();
         private readonly AuthManager _authManager;
 
         public int Port => (_udp.LocalEndPoint is IPEndPoint ip) ? ip.Port : (_config.Port > 0 ? _config.Port : Constants.DefaultProxyPort);
@@ -40,6 +43,7 @@ namespace UDRoute
 
         public bool IsRelayAllowed(ServerRecordInfo sInfo)
         {
+            if (!sInfo.AllowRelay) return false;
             if (sInfo.IsAuthenticated) return true;
             return _config.AllowUnauthRelay switch
             {
@@ -128,6 +132,19 @@ namespace UDRoute
                 offset += pLen;
             }
 
+            int tunnelReuseInterval = Constants.DefaultTunnelReuseInterval;
+            if (offset + 4 <= data.Length)
+            {
+                tunnelReuseInterval = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(offset, 4));
+                offset += 4;
+            }
+
+            bool sAllowRelay = true;
+            if (offset < data.Length)
+            {
+                sAllowRelay = data[offset++] != 0;
+            }
+
             bool isAuthenticated = false;
             bool providedAuth = !string.IsNullOrEmpty(username) || !string.IsNullOrEmpty(password);
             
@@ -191,7 +208,9 @@ namespace UDRoute
                 OwnerUser = username,
                 STimestamp = sTimestamp,
                 PRecvTimeTicks = DateTime.UtcNow.Ticks,
-                RequiresPassword = reqPass
+                RequiresPassword = reqPass,
+                TunnelReuseInterval = tunnelReuseInterval,
+                AllowRelay = sAllowRelay
             };
 
             if (isAuthenticated)
@@ -305,7 +324,8 @@ namespace UDRoute
                 OwnerUser = "localhost",
                 STimestamp = DateTime.UtcNow.Ticks,
                 PRecvTimeTicks = DateTime.UtcNow.Ticks,
-                RequiresPassword = rec.Password != null && rec.Password.Length > 0
+                RequiresPassword = rec.Password != null && rec.Password.Length > 0,
+                TunnelReuseInterval = rec.TunnelReuseInterval
             };
 
             string key1 = $"{rec.Name}/{proto}";
@@ -332,31 +352,88 @@ namespace UDRoute
             var (targetName, nLen) = ProtocolHelper.ReadString(data.Slice(17));
             int qOffset = 17 + nLen;
             bool clientForceRelay = false;
+            bool isReuse = false;
             if (qOffset < data.Length)
             {
-                clientForceRelay = data[qOffset++] != 0;
+                byte qFlags = data[qOffset++];
+                clientForceRelay = (qFlags & 1) != 0;
+                isReuse = (qFlags & 2) != 0;
             }
 
-            Log.Debug($"[P] Query received for '{targetName}', Session: {sessionId} from {remoteEp}, ClientForceRelay: {clientForceRelay}");
+            Log.Debug($"[P] Query received for '{targetName}', Session: {sessionId} from {remoteEp}, ClientForceRelay: {clientForceRelay}, IsReuse: {isReuse}");
 
             var sInfo = DirectQuery(targetName);
             if (sInfo != null)
             {
+                if (isReuse)
+                {
+                    long recordedTimestamp = 0;
+                    lock (_relayLock)
+                    {
+                        if (_relaySessions.TryGetValue(sessionId, out var activeRelay))
+                        {
+                            recordedTimestamp = activeRelay.ServerTimestamp;
+                        }
+                        else if (_closedRelaySessions.TryGetValue(sessionId, out var closedRelay))
+                        {
+                            recordedTimestamp = closedRelay.ServerTimestamp;
+                        }
+                    }
+
+                    if (recordedTimestamp != 0 && recordedTimestamp != sInfo.STimestamp)
+                    {
+                        Log.Warn($"[P] S for '{targetName}' restarted since session {sessionId} was created (ts {recordedTimestamp} != {sInfo.STimestamp}). Rejecting reuse.");
+                        lock (_relayLock)
+                        {
+                            _relaySessions.Remove(sessionId);
+                            _closedRelaySessions.Remove(sessionId);
+                        }
+
+                        byte[] failBuf = ArrayPool<byte>.Shared.Rent(64);
+                        try
+                        {
+                            failBuf[0] = (byte)MsgType.Punch;
+                            sessionId.TryWriteBytes(failBuf.AsSpan(1, 16));
+                            Guid.Empty.TryWriteBytes(failBuf.AsSpan(17, 16));
+                            failBuf[33] = 0; // NotFound / Stale
+
+                            await _udp.SendAsync(failBuf.AsMemory(0, 34), remoteEp, ct);
+                        }
+                        finally
+                        {
+                            ArrayPool<byte>.Shared.Return(failBuf);
+                        }
+                        return;
+                    }
+                }
+
                 bool allowRelay = IsRelayAllowed(sInfo);
+                bool effectiveForceRelay = clientForceRelay && allowRelay;
+                if (!allowRelay && clientForceRelay)
+                {
+                    Log.Info($"[P] AllowRelay is false for '{targetName}', ignoring client ForceRelay.");
+                }
 
                 if (allowRelay)
                 {
-                    // 仅在允许转发时记录中继映射，确保即使打洞未完成也能立刻中继数据
-                    _relaySessions[sessionId] = new RelaySession
+                    lock (_relayLock)
                     {
-                        ClientEp = remoteEp,
-                        ServerEp = sInfo.PublicEp,
-                        LastSeen = DateTime.UtcNow
-                    };
+                        _closedRelaySessions.Remove(sessionId);
+                        // 仅在允许转发时记录中继映射，确保即使打洞未完成也能立刻中继数据
+                        _relaySessions[sessionId] = new RelaySession
+                        {
+                            ClientEp = remoteEp,
+                            ServerEp = sInfo.PublicEp,
+                            LastSeen = DateTime.UtcNow,
+                            TimeoutSeconds = sInfo.Timeout > 0 ? sInfo.Timeout : Constants.DefaultTimeout,
+                            ServerTimestamp = sInfo.STimestamp,
+                            TargetName = targetName
+                        };
+                    }
                 }
 
                 // 1. 通知 S 端发起准备与打洞 (RelayStart)
-                // [MsgType 1][SessionId 16][TargetName string][ClientPublicEp][AllowRelay 1 (bit 0=AllowRelay, bit 1=ClientForceRelay)]
+                // [MsgType 1][SessionId 16][TargetName string][ClientPublicEp][AllowRelay 1 (bit 0=AllowRelay, bit 1=ClientForceRelay, bit 2=IsReuse)]
                 byte[] relayStartBuf = ArrayPool<byte>.Shared.Rent(512);
                 try
                 {
@@ -365,7 +442,7 @@ namespace UDRoute
                     int offset = 17;
                     offset += ProtocolHelper.WriteString(relayStartBuf.AsSpan(offset), targetName);
                     offset += ProtocolHelper.WriteIPEndPoint(relayStartBuf.AsSpan(offset), remoteEp);
-                    relayStartBuf[offset++] = (byte)((allowRelay ? 1 : 0) | (clientForceRelay ? 2 : 0));
+                    relayStartBuf[offset++] = (byte)((allowRelay ? 1 : 0) | (effectiveForceRelay ? 2 : 0) | (isReuse ? 4 : 0));
 
                     await _udp.SendAsync(relayStartBuf.AsMemory(0, offset), sInfo.PublicEp, ct);
                 }
@@ -409,6 +486,8 @@ namespace UDRoute
                     }
                     punchRespBuf[countPos] = epCount;
                     punchRespBuf[offset++] = (byte)(allowRelay ? 1 : 0);
+                    BinaryPrimitives.WriteInt32LittleEndian(punchRespBuf.AsSpan(offset, 4), sInfo.TunnelReuseInterval);
+                    offset += 4;
 
                     await _udp.SendAsync(punchRespBuf.AsMemory(0, offset), remoteEp, ct);
                 }
@@ -442,24 +521,130 @@ namespace UDRoute
             }
         }
 
-        public async ValueTask<bool> TryRelayDataAsync(Guid sessionId, ReadOnlyMemory<byte> packetMem, EndPoint remoteEp, CancellationToken ct)
+        public int RelaySessionCount
         {
-            if (_relaySessions.TryGetValue(sessionId, out var session))
+            get
             {
-                session.LastSeen = DateTime.UtcNow;
-
-                if (remoteEp.Equals(session.ClientEp))
+                lock (_relayLock)
                 {
-                    await _udp.SendAsync(packetMem, session.ServerEp, ct);
-                    return true;
-                }
-                else if (remoteEp.Equals(session.ServerEp))
-                {
-                    await _udp.SendAsync(packetMem, session.ClientEp, ct);
-                    return true;
+                    return _relaySessions.Count;
                 }
             }
+        }
+        public bool HasRelaySession(Guid sessionId)
+        {
+            lock (_relayLock)
+            {
+                return _relaySessions.ContainsKey(sessionId);
+            }
+        }
+
+        public async ValueTask<bool> TryRelayDataAsync(Guid sessionId, ReadOnlyMemory<byte> packetMem, EndPoint remoteEp, CancellationToken ct)
+        {
+            RelaySession? sessionToForward = null;
+            bool sendDisconnect = false;
+
+            lock (_relayLock)
+            {
+                if (_relaySessions.TryGetValue(sessionId, out var session))
+                {
+                    session.LastSeen = DateTime.UtcNow;
+                    sessionToForward = session;
+                }
+                else if (_closedRelaySessions.Remove(sessionId, out var closedInfo))
+                {
+                    var restoredSession = new RelaySession
+                    {
+                        ClientEp = ProtocolHelper.AreEndPointsEqual(remoteEp, closedInfo.ClientEp) ? remoteEp : closedInfo.ClientEp,
+                        ServerEp = ProtocolHelper.AreEndPointsEqual(remoteEp, closedInfo.ServerEp) ? remoteEp : closedInfo.ServerEp,
+                        LastSeen = DateTime.UtcNow,
+                        TimeoutSeconds = closedInfo.TimeoutSeconds,
+                        ServerTimestamp = closedInfo.ServerTimestamp,
+                        TargetName = closedInfo.TargetName
+                    };
+                    _relaySessions[sessionId] = restoredSession;
+                    sessionToForward = restoredSession;
+                    Log.Info($"[P] Closed/inactive relay session {sessionId} re-established upon receiving data packet from {remoteEp}.");
+                }
+                else
+                {
+                    sendDisconnect = true;
+                }
+            }
+
+            if (sessionToForward != null)
+            {
+                if (ProtocolHelper.AreEndPointsEqual(remoteEp, sessionToForward.ClientEp))
+                {
+                    await _udp.SendAsync(packetMem, sessionToForward.ServerEp, ct);
+                    return true;
+                }
+                else if (ProtocolHelper.AreEndPointsEqual(remoteEp, sessionToForward.ServerEp))
+                {
+                    await _udp.SendAsync(packetMem, sessionToForward.ClientEp, ct);
+                    return true;
+                }
+                return false;
+            }
+
+            if (sendDisconnect)
+            {
+                // P 端无此中继会话（从未建立或已彻底过期），向发送方回发 Disconnect，避免客户端死等
+                byte[] discBuf = new byte[17];
+                discBuf[0] = (byte)MsgType.Disconnect;
+                sessionId.TryWriteBytes(discBuf.AsSpan(1, 16));
+                try { await _udp.SendAsync(discBuf, remoteEp, CancellationToken.None); } catch { }
+            }
             return false;
+        }
+
+        public async ValueTask<bool> TryRelayDisconnectAsync(Guid sessionId, ReadOnlyMemory<byte> packetMem, EndPoint remoteEp, CancellationToken ct)
+        {
+            RelaySession? session = null;
+            lock (_relayLock)
+            {
+                _closedRelaySessions.Remove(sessionId);
+                _relaySessions.Remove(sessionId, out session);
+            }
+
+            if (session != null)
+            {
+                try
+                {
+                    if (ProtocolHelper.AreEndPointsEqual(remoteEp, session.ClientEp))
+                    {
+                        await _udp.SendAsync(packetMem, session.ServerEp, ct);
+                    }
+                    else if (ProtocolHelper.AreEndPointsEqual(remoteEp, session.ServerEp))
+                    {
+                        await _udp.SendAsync(packetMem, session.ClientEp, ct);
+                    }
+                    Log.Info($"[P] Session {sessionId} disconnected by peer, relayed notice and closed relay session on P.");
+                }
+                catch (Exception ex)
+                {
+                    Log.Warn($"[P] Session {sessionId} failed to relay disconnect notice: {ex.Message}");
+                }
+                return true;
+            }
+            return false;
+        }
+
+        public void HandleRelayEnd(Guid sessionId, EndPoint remoteEp)
+        {
+            lock (_relayLock)
+            {
+                _closedRelaySessions.Remove(sessionId);
+                if (_relaySessions.TryGetValue(sessionId, out var session))
+                {
+                    // 仅允许参与该会话的 Client 或 Server 结束中继
+                    if (ProtocolHelper.AreEndPointsEqual(remoteEp, session.ClientEp) || ProtocolHelper.AreEndPointsEqual(remoteEp, session.ServerEp))
+                    {
+                        _relaySessions.Remove(sessionId);
+                        Log.Info($"[P] Session {sessionId} direct punch confirmed between S and C. Relay session ended on P without notifying peers.");
+                    }
+                }
+            }
         }
 
         private async Task CleanupLoopAsync(CancellationToken ct)
@@ -468,7 +653,7 @@ namespace UDRoute
             {
                 try
                 {
-                    await Task.Delay(TimeSpan.FromSeconds(30), ct);
+                    await Task.Delay(TimeSpan.FromSeconds(5), ct);
 
                     // 1. 清理过期路由
                     var timeout = TimeSpan.FromSeconds(_config.RegTimeout);
@@ -512,13 +697,47 @@ namespace UDRoute
                         }
                     }
 
-                    // 2. 清理非活跃中继会话 (5分钟无数据)
-                    var sessionTimeout = TimeSpan.FromMinutes(5);
-                    foreach (var kvp in _relaySessions)
+                    // 2. 清理超时未通讯的中继会话 (P 端执行 TunnelReuseInterval=0 策略，超时即释放内部活跃映射)
+                    // 注意：不向对端发送 Disconnect，保留 S 和 C 端的 300 秒复用窗口，并将轻量路由信息转入 _closedRelaySessions 供重用时恢复
+                    lock (_relayLock)
                     {
-                        if (now - kvp.Value.LastSeen > sessionTimeout)
+                        var expiredSessions = new List<KeyValuePair<Guid, RelaySession>>();
+                        foreach (var kvp in _relaySessions)
                         {
-                            _relaySessions.TryRemove(kvp.Key, out _);
+                            int toSec = kvp.Value.TimeoutSeconds > 0 ? kvp.Value.TimeoutSeconds : Constants.DefaultTimeout;
+                            if (now - kvp.Value.LastSeen > TimeSpan.FromSeconds(toSec))
+                            {
+                                expiredSessions.Add(kvp);
+                            }
+                        }
+
+                        foreach (var kvp in expiredSessions)
+                        {
+                            _relaySessions.Remove(kvp.Key);
+                            Log.Info($"[P] Relay session {kvp.Key} idle for {kvp.Value.TimeoutSeconds}s exceeding timeout, released from P active sessions.");
+                            _closedRelaySessions[kvp.Key] = new ClosedRelayInfo
+                            {
+                                ClientEp = kvp.Value.ClientEp,
+                                ServerEp = kvp.Value.ServerEp,
+                                TimeoutSeconds = kvp.Value.TimeoutSeconds,
+                                ClosedAt = now,
+                                ServerTimestamp = kvp.Value.ServerTimestamp,
+                                TargetName = kvp.Value.TargetName
+                            };
+                        }
+
+                        // 3. 清理长期未被重用的已释放会话元数据 (10分钟超时彻底清除，避免内存膨胀)
+                        var expiredClosedKeys = new List<Guid>();
+                        foreach (var kvp in _closedRelaySessions)
+                        {
+                            if (now - kvp.Value.ClosedAt > TimeSpan.FromMinutes(10))
+                            {
+                                expiredClosedKeys.Add(kvp.Key);
+                            }
+                        }
+                        foreach (var key in expiredClosedKeys)
+                        {
+                            _closedRelaySessions.Remove(key);
                         }
                     }
                 }
@@ -538,6 +757,19 @@ namespace UDRoute
             public EndPoint ClientEp { get; set; } = null!;
             public EndPoint ServerEp { get; set; } = null!;
             public DateTime LastSeen { get; set; }
+            public int TimeoutSeconds { get; set; }
+            public long ServerTimestamp { get; set; }
+            public string TargetName { get; set; } = "";
+        }
+
+        private class ClosedRelayInfo
+        {
+            public EndPoint ClientEp { get; set; } = null!;
+            public EndPoint ServerEp { get; set; } = null!;
+            public int TimeoutSeconds { get; set; }
+            public DateTime ClosedAt { get; set; }
+            public long ServerTimestamp { get; set; }
+            public string TargetName { get; set; } = "";
         }
     }
 }

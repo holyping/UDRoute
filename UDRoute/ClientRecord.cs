@@ -11,5 +11,6 @@ namespace UDRoute
         public byte[]? Password { get; set; }
         public int Mtu { get; set; } = Constants.DefaultMtu;
         public bool ForceRelay { get; set; }
+        public int Timeout { get; set; } = 0;
     }
 }

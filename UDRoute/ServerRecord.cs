@@ -14,6 +14,8 @@ namespace UDRoute
         public int RegInterval { get; set; } = Constants.DefaultRegInterval;
         public int Mtu { get; set; } = Constants.DefaultMtu;
         public int Timeout { get; set; } = 0;
+        public int TunnelReuseInterval { get; set; } = Constants.DefaultTunnelReuseInterval;
+        public bool AllowRelay { get; set; } = true;
         public string? Username { get; set; }
         public byte[]? Password { get; set; }
         public KcpConfig KcpConfig { get; set; } = new();

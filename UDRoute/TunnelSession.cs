@@ -3,14 +3,30 @@ using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading.Channels;
+using System.Collections.Concurrent;
 using System.Linq;
 using System.Text;
 using UDRoute.Logging;
 
 namespace UDRoute
 {
+    public enum ChannelCmd : byte
+    {
+        Open = 1,
+        Data = 2,
+        Close = 3,
+        KeepAlive = 4
+    }
+
+    public enum MuxType : byte
+    {
+        Udp = 1,       // 分支 1: 传送的 UDP 数据
+        Kcp = 2,       // 分支 2: KCP 协议包 (承载 TCP 数据)
+        KeepAlive = 3  // 隧道级心跳保活
+    }
+
     // ==========================================
-    // 8. 数据链路层 (NAT切换 & KCP可靠流转)
+    // 8. 数据链路层 (NAT切换 & KCP可靠流转 & 信道复用)
     // ==========================================
     public class TunnelSession : IDisposable
     {
@@ -29,6 +45,14 @@ namespace UDRoute
         private long _lastUdpOutTick = 0;
         private int _udpSrtt = 0;
 
+        private readonly ConcurrentDictionary<uint, Channel<byte[]>> _tcpChannels = new();
+        private int _activeChannelCount = 0;
+        private uint _nextChannelId = 0;
+        private int _kcpDriverStarted = 0;
+        private readonly TaskCompletionSource _sessionClosedTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly object _stateLock = new();
+        private int _disposed = 0;
+
         public readonly TaskCompletionSource<bool> AuthTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public Guid SessionId => _sessionId;
@@ -40,8 +64,52 @@ namespace UDRoute
         public string ChannelDesc { get; set; } = string.Empty;
         public byte[]? PasswordHash { get; set; }
         public bool ForceRelay { get; set; }
+        public int ReuseInterval { get; set; }
+        public EndPoint? ProxyEp { get; set; }
+        public int ActiveChannelCount => Volatile.Read(ref _activeChannelCount);
+        public uint AllocateChannelId() => Interlocked.Increment(ref _nextChannelId);
+        public Task SessionClosedTask => _sessionClosedTcs.Task;
+        public bool IsClosed => _sessionCts.IsCancellationRequested;
+        public Func<uint, Task>? OnIncomingChannel { get; set; }
+        public Func<uint, byte[], Task>? OnIncomingUdpPacket { get; set; }
+        public Action<uint, byte[]>? OnClientUdpDataReceived { get; set; }
+        public Action<uint>? OnUdpChannelClosed { get; set; }
+        public int IncrementActiveChannel()
+        {
+            lock (_stateLock)
+            {
+                int count = Interlocked.Increment(ref _activeChannelCount);
+                UpdateActivity();
+                return count;
+            }
+        }
+        public int DecrementActiveChannel()
+        {
+            int count;
+            bool shouldClose = false;
+            lock (_stateLock)
+            {
+                count = Interlocked.Decrement(ref _activeChannelCount);
+                if (count < 0)
+                {
+                    Interlocked.CompareExchange(ref _activeChannelCount, 0, count);
+                    count = 0;
+                }
+                UpdateActivity();
+                if (ReuseInterval <= 0 && count == 0 && !IsClosed)
+                {
+                    shouldClose = true;
+                }
+            }
+            if (shouldClose)
+            {
+                _ = SendDisconnectAsync();
+                Dispose();
+            }
+            return count;
+        }
 
-        public TunnelSession(ZeroCopyUdpSocket udpCore, EndPoint initialEp, Guid sessionId, int mtu, bool isTcp = true, KcpConfig? kcpConfig = null, int timeoutSeconds = 0)
+        public TunnelSession(ZeroCopyUdpSocket udpCore, EndPoint initialEp, Guid sessionId, int mtu, bool isTcp = true, KcpConfig? kcpConfig = null, int timeoutSeconds = 0, int reuseInterval = 0)
         {
             _udpCore = udpCore;
             _activeRemoteEp = initialEp;
@@ -49,24 +117,68 @@ namespace UDRoute
             _mtu = mtu;
             _isTcp = isTcp;
             _kcpConfig = kcpConfig ?? new KcpConfig();
+            ReuseInterval = reuseInterval;
 
-            if (timeoutSeconds > 0)
+            if (reuseInterval > 0)
             {
                 _ = Task.Run(async () =>
                 {
-                    int delay = timeoutSeconds * 1000 / 2;
-                    if (delay < 1000) delay = 1000;
-                    
+                    try
+                    {
+                        while (!_sessionCts.IsCancellationRequested)
+                        {
+                            await Task.Delay(1000, _sessionCts.Token).ConfigureAwait(false);
+                            bool shouldClose = false;
+                            lock (_stateLock)
+                            {
+                                if (Volatile.Read(ref _activeChannelCount) == 0 && !IsClosed)
+                                {
+                                    long elapsed = Environment.TickCount64 - Interlocked.Read(ref _lastActiveTime);
+                                    if (elapsed > (long)reuseInterval * 1000)
+                                    {
+                                        shouldClose = true;
+                                    }
+                                }
+                            }
+                            if (shouldClose)
+                            {
+                                Log.Info($"[Tunnel] Session {_sessionId} idle for {reuseInterval}s without active channels. Closing.");
+                                _ = SendDisconnectAsync();
+                                Dispose();
+                                break;
+                            }
+                        }
+                    }
+                    catch { }
+                });
+            }
+            else if (timeoutSeconds > 0)
+            {
+                _ = Task.Run(async () =>
+                {
+                    int delay = Math.Min(5000, Math.Max(1000, timeoutSeconds * 1000 / 4));
                     try
                     {
                         while (!_sessionCts.IsCancellationRequested)
                         {
                             await Task.Delay(delay, _sessionCts.Token).ConfigureAwait(false);
-                            long elapsed = Environment.TickCount64 - Interlocked.Read(ref _lastActiveTime);
-                            if (elapsed > timeoutSeconds * 1000)
+                            bool shouldClose = false;
+                            lock (_stateLock)
+                            {
+                                if (Volatile.Read(ref _activeChannelCount) == 0 && !IsClosed)
+                                {
+                                    long elapsed = Environment.TickCount64 - Interlocked.Read(ref _lastActiveTime);
+                                    if (elapsed > (long)timeoutSeconds * 1000)
+                                    {
+                                        shouldClose = true;
+                                    }
+                                }
+                            }
+                            if (shouldClose)
                             {
                                 Log.Info($"[Tunnel] Session {_sessionId} timeout after {timeoutSeconds}s of inactivity.");
-                                _sessionCts.Cancel();
+                                _ = SendDisconnectAsync();
+                                Dispose();
                                 break;
                             }
                         }
@@ -86,14 +198,15 @@ namespace UDRoute
                 uint conv = BinaryPrimitives.ReadUInt32LittleEndian(sessionId.ToByteArray().AsSpan(0, 4));
                 _kcp = new Kcp(conv, async (kcpPacket) =>
                 {
-                    byte[] sendBuf = ArrayPool<byte>.Shared.Rent(kcpPacket.Length + 17);
+                    byte[] sendBuf = ArrayPool<byte>.Shared.Rent(kcpPacket.Length + 18);
                     try
                     {
                         sendBuf[0] = (byte)MsgType.Data;
                         _sessionId.TryWriteBytes(sendBuf.AsSpan(1, 16));
-                        kcpPacket.Span.CopyTo(sendBuf.AsSpan(17));
+                        sendBuf[17] = (byte)MuxType.Kcp;
+                        kcpPacket.Span.CopyTo(sendBuf.AsSpan(18));
                         var targetEp = _activeRemoteEp;
-                        await _udpCore.SendAsync(sendBuf.AsMemory(0, kcpPacket.Length + 17), targetEp, _sessionCts.Token);
+                        await _udpCore.SendAsync(sendBuf.AsMemory(0, kcpPacket.Length + 18), targetEp, _sessionCts.Token);
                     }
                     catch (OperationCanceledException) { }
                     catch (Exception ex)
@@ -201,25 +314,191 @@ namespace UDRoute
             }
         }
 
+        // 当收到来自非P端的对端直连通讯时，确保本端自动同步切为直连模式
+        public void EnsureDirectRouteFromPeer(EndPoint remoteEp)
+        {
+            if (ForceRelay) return;
+            if (ProxyEp != null && remoteEp.Equals(ProxyEp)) return;
+
+            if (!_isDirect || !_activeRemoteEp.Equals(remoteEp))
+            {
+                Log.Info($"[Tunnel] Session {_sessionId} received direct signal from peer {remoteEp} (was {(_isDirect ? _activeRemoteEp : "Relay")}). Switched route to direct.");
+                SwitchToDirect(remoteEp);
+                NotifyDirectCommunicationEstablished();
+            }
+        }
+
         public void UpdateActivity()
         {
             Interlocked.Exchange(ref _lastActiveTime, Environment.TickCount64);
         }
 
-        // 接收来自 UDP 的数据包（载荷）
+        private int _relayEndNotified = 0;
+
+        public void NotifyDirectCommunicationEstablished()
+        {
+            if (!_isDirect || ProxyEp == null) return;
+            if (Interlocked.CompareExchange(ref _relayEndNotified, 1, 0) != 0) return;
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    // 稍作等待（100ms），确保双方首批直连包稳定到达接管链路
+                    await Task.Delay(100, _sessionCts.Token).ConfigureAwait(false);
+                    byte[] endBuf = new byte[17];
+                    endBuf[0] = (byte)MsgType.RelayEnd;
+                    _sessionId.TryWriteBytes(endBuf.AsSpan(1, 16));
+
+                    // 发送 RelayEnd 通知 P 端释放临时中继 session
+                    for (int i = 0; i < 2; i++)
+                    {
+                        await _udpCore.SendAsync(endBuf, ProxyEp, CancellationToken.None).ConfigureAwait(false);
+                        await Task.Delay(30).ConfigureAwait(false);
+                    }
+                    Log.Info($"[Tunnel] Session {_sessionId} direct punch communication confirmed. Notified Proxy {ProxyEp} to end relay session.");
+                }
+                catch { }
+            });
+        }
+
+        // 接收来自 UDP 的数据包（载荷，进入复用协议层）
         public void OnUdpDataReceived(ReadOnlySpan<byte> payload)
         {
             UpdateActivity();
-            if (_isTcp && _kcp != null)
+            if (_isDirect)
             {
-                _kcp.Input(payload);
-                _signal.Release();
+                NotifyDirectCommunicationEstablished();
+            }
+            if (payload.Length == 0) return;
+
+            byte muxType = payload[0];
+            if (muxType == (byte)MuxType.Kcp)
+            {
+                // 分支 2: KCP 协议包 -> 传送的 TCP 数据
+                if (_kcp != null)
+                {
+                    _kcp.Input(payload.Slice(1));
+                    _signal.Release();
+                }
+            }
+            else if (muxType == (byte)MuxType.Udp)
+            {
+                // 分支 1: 传送的 UDP 数据
+                if (payload.Length >= 6)
+                {
+                    uint channelId = BinaryPrimitives.ReadUInt32LittleEndian(payload.Slice(1, 4));
+                    byte cmd = payload[5];
+                    var data = payload.Slice(6);
+                    DispatchUdpFrame(channelId, (ChannelCmd)cmd, data);
+                }
+            }
+            else if (muxType == (byte)MuxType.KeepAlive)
+            {
+                // 已调用 UpdateActivity()
             }
             else
             {
-                byte[] copy = payload.ToArray();
-                _inboundChannel.Writer.TryWrite(copy);
+                // 兼容处理：若未带 MuxType
+                if (_isTcp && _kcp != null)
+                {
+                    _kcp.Input(payload);
+                    _signal.Release();
+                }
+                else
+                {
+                    byte[] copy = payload.ToArray();
+                    _inboundChannel.Writer.TryWrite(copy);
+                }
             }
+        }
+
+        private void DispatchUdpFrame(uint channelId, ChannelCmd cmd, ReadOnlySpan<byte> data)
+        {
+            UpdateActivity();
+            switch (cmd)
+            {
+                case ChannelCmd.Data:
+                    byte[] copy = data.ToArray();
+                    if (OnIncomingUdpPacket != null)
+                    {
+                        _ = Task.Run(() => OnIncomingUdpPacket(channelId, copy));
+                    }
+                    else if (OnClientUdpDataReceived != null)
+                    {
+                        OnClientUdpDataReceived(channelId, copy);
+                    }
+                    else
+                    {
+                        _inboundChannel.Writer.TryWrite(copy);
+                    }
+                    break;
+                case ChannelCmd.Close:
+                    OnUdpChannelClosed?.Invoke(channelId);
+                    break;
+            }
+        }
+
+        public async ValueTask SendUdpDataAsync(uint channelId, ReadOnlyMemory<byte> payload, CancellationToken ct = default)
+        {
+            UpdateActivity();
+            int total = 17 + 1 + 4 + 1 + payload.Length;
+            byte[] sendBuf = ArrayPool<byte>.Shared.Rent(total);
+            try
+            {
+                sendBuf[0] = (byte)MsgType.Data;
+                _sessionId.TryWriteBytes(sendBuf.AsSpan(1, 16));
+                sendBuf[17] = (byte)MuxType.Udp;
+                BinaryPrimitives.WriteUInt32LittleEndian(sendBuf.AsSpan(18, 4), channelId);
+                sendBuf[22] = (byte)ChannelCmd.Data;
+                payload.Span.CopyTo(sendBuf.AsSpan(23));
+
+                var targetEp = _activeRemoteEp;
+                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, _sessionCts.Token);
+                await _udpCore.SendAsync(sendBuf.AsMemory(0, total), targetEp, linkedCts.Token);
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(sendBuf);
+            }
+        }
+
+        public async ValueTask SendUdpCloseAsync(uint channelId, CancellationToken ct = default)
+        {
+            UpdateActivity();
+            byte[] sendBuf = new byte[23];
+            sendBuf[0] = (byte)MsgType.Data;
+            _sessionId.TryWriteBytes(sendBuf.AsSpan(1, 16));
+            sendBuf[17] = (byte)MuxType.Udp;
+            BinaryPrimitives.WriteUInt32LittleEndian(sendBuf.AsSpan(18, 4), channelId);
+            sendBuf[22] = (byte)ChannelCmd.Close;
+
+            try
+            {
+                await _udpCore.SendAsync(sendBuf.AsMemory(), _activeRemoteEp, CancellationToken.None);
+            }
+            catch { }
+        }
+
+        public bool TryHandleDisconnect(EndPoint remoteEp)
+        {
+            // 防御性代码：如果当前 session 已经是直连模式，而断开信号来自 P 端或非直连对端，则忽略该信号
+            if (_isDirect)
+            {
+                if (ProxyEp != null && remoteEp.Equals(ProxyEp))
+                {
+                    Log.Info($"[Tunnel] Session {_sessionId} is in direct mode. Ignored disconnect signal from Proxy {remoteEp}.");
+                    return true;
+                }
+                if (!remoteEp.Equals(_activeRemoteEp))
+                {
+                    Log.Info($"[Tunnel] Session {_sessionId} is in direct mode. Ignored disconnect signal from non-direct endpoint {remoteEp}.");
+                    return true;
+                }
+            }
+
+            DisconnectReceived();
+            return true;
         }
 
         public void DisconnectReceived()
@@ -228,6 +507,7 @@ namespace UDRoute
             {
                 Log.Info($"[Tunnel] Session {_sessionId} disconnect received from peer.");
                 _sessionCts.Cancel();
+                _sessionClosedTcs.TrySetResult();
                 _signal.Release();
             }
         }
@@ -249,150 +529,322 @@ namespace UDRoute
             }
         }
 
-        public Task RunTcpKcpBridgeAsync(TcpClient tcp, CancellationToken ct) => RunTcpBridgeAsync(tcp, ct);
-
-        // 双向桥接 TCP 客户端与目标端的数据链路
-        public async Task RunTcpBridgeAsync(TcpClient tcp, CancellationToken ct)
+        public void StartKcpDriver(CancellationToken ct = default)
         {
+            if (_kcp == null || Interlocked.CompareExchange(ref _kcpDriverStarted, 1, 0) != 0) return;
+
+            _ = Task.Run(async () =>
+            {
+                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, _sessionCts.Token);
+                var token = linkedCts.Token;
+
+                byte[] kcpRecvBuf = ArrayPool<byte>.Shared.Rent(65536);
+                byte[] frameBuf = new byte[65536 * 2];
+                int frameBufLen = 0;
+                try
+                {
+                    int interval = _kcpConfig.Interval > 0 ? _kcpConfig.Interval : 10;
+                    while (!token.IsCancellationRequested)
+                    {
+                        uint current = Kcp.CurrentTimeMs();
+                        await _kcp.UpdateAsync(current);
+
+                        if (_kcp.IsDeadLink)
+                        {
+                            Log.Warn($"[Tunnel] Session {_sessionId} KCP link dead (max retransmissions reached). Closing session.");
+                            break;
+                        }
+
+                        while (true)
+                        {
+                            int len = _kcp.Recv(kcpRecvBuf);
+                            if (len <= 0) break;
+
+                            UpdateActivity();
+                            if (frameBufLen + len > frameBuf.Length)
+                            {
+                                Array.Resize(ref frameBuf, Math.Max(frameBuf.Length * 2, frameBufLen + len));
+                            }
+                            Buffer.BlockCopy(kcpRecvBuf, 0, frameBuf, frameBufLen, len);
+                            frameBufLen += len;
+
+                            int offset = 0;
+                            while (frameBufLen - offset >= 7)
+                            {
+                                uint chId = BinaryPrimitives.ReadUInt32LittleEndian(frameBuf.AsSpan(offset, 4));
+                                byte cmdByte = frameBuf[offset + 4];
+                                ushort pLen = BinaryPrimitives.ReadUInt16LittleEndian(frameBuf.AsSpan(offset + 5, 2));
+
+                                if (frameBufLen - offset < 7 + pLen)
+                                {
+                                    break; // Wait for complete payload
+                                }
+
+                                byte[] payload = pLen > 0 ? frameBuf.AsSpan(offset + 7, pLen).ToArray() : Array.Empty<byte>();
+                                offset += 7 + pLen;
+
+                                DispatchFrame(chId, (ChannelCmd)cmdByte, payload);
+                            }
+
+                            if (offset > 0)
+                            {
+                                if (frameBufLen > offset)
+                                {
+                                    Buffer.BlockCopy(frameBuf, offset, frameBuf, 0, frameBufLen - offset);
+                                }
+                                frameBufLen -= offset;
+                            }
+                        }
+
+                        uint nextTime = _kcp.Check(current);
+                        int delay = (int)(nextTime - current);
+                        if (delay < 1) delay = 1;
+                        if (delay > interval) delay = interval;
+
+                        try
+                        {
+                            await _signal.WaitAsync(delay, token);
+                        }
+                        catch (TimeoutException) { }
+                        catch (OperationCanceledException) when (token.IsCancellationRequested) { break; }
+                        catch (ObjectDisposedException) { break; }
+                    }
+                }
+                catch (OperationCanceledException) when (token.IsCancellationRequested) { }
+                catch (Exception ex)
+                {
+                    Log.Debug($"[Tunnel] KCP Driver error: {ex.Message}");
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(kcpRecvBuf);
+                    _ = SendDisconnectAsync();
+                    _sessionCts.Cancel();
+                    _sessionClosedTcs.TrySetResult();
+                    foreach (var kvp in _tcpChannels)
+                    {
+                        kvp.Value.Writer.TryComplete();
+                    }
+                }
+            }, ct);
+        }
+
+        private void DispatchFrame(uint channelId, ChannelCmd cmd, byte[] payload)
+        {
+            UpdateActivity();
+            switch (cmd)
+            {
+                case ChannelCmd.Open:
+                    if (OnIncomingChannel != null)
+                    {
+                        bool newlyAdded = false;
+                        _tcpChannels.GetOrAdd(channelId, _ =>
+                        {
+                            newlyAdded = true;
+                            IncrementActiveChannel();
+                            return Channel.CreateUnbounded<byte[]>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
+                        });
+                        if (newlyAdded)
+                        {
+                            _ = Task.Run(() => OnIncomingChannel(channelId));
+                        }
+                    }
+                    break;
+                case ChannelCmd.Data:
+                    if (_tcpChannels.TryGetValue(channelId, out var dataCh))
+                    {
+                        dataCh.Writer.TryWrite(payload);
+                    }
+                    break;
+                case ChannelCmd.Close:
+                    if (_tcpChannels.TryGetValue(channelId, out var closeCh))
+                    {
+                        closeCh.Writer.TryComplete();
+                    }
+                    break;
+                case ChannelCmd.KeepAlive:
+                    break;
+            }
+        }
+
+        public async ValueTask SendFrameAsync(uint channelId, ChannelCmd cmd, ReadOnlyMemory<byte> payload, CancellationToken ct)
+        {
+            if (_kcp == null) return;
             using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, _sessionCts.Token);
             var token = linkedCts.Token;
 
+            int waitCount = 0;
+            while (_kcp.WaitSnd > _kcpConfig.SndWnd * 2 && !token.IsCancellationRequested && waitCount < 500)
+            {
+                await Task.Delay(10, token);
+                waitCount++;
+            }
+
+            int total = 7 + payload.Length;
+            byte[] buf = ArrayPool<byte>.Shared.Rent(total);
+            try
+            {
+                BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(0, 4), channelId);
+                buf[4] = (byte)cmd;
+                BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(5, 2), (ushort)payload.Length);
+                if (payload.Length > 0)
+                {
+                    payload.Span.CopyTo(buf.AsSpan(7));
+                }
+
+                UpdateActivity();
+                _kcp.Send(buf.AsSpan(0, total));
+                try { _signal.Release(); } catch { }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buf);
+            }
+        }
+
+        public async Task RunChannelBridgeAsync(uint channelId, TcpClient tcp, CancellationToken ct)
+        {
+            StartKcpDriver(ct);
+
+            var ch = _tcpChannels.GetOrAdd(channelId, _ =>
+            {
+                Interlocked.Increment(ref _activeChannelCount);
+                return Channel.CreateUnbounded<byte[]>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
+            });
+
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, _sessionCts.Token);
+            var token = linkedCts.Token;
             using var stream = tcp.GetStream();
 
-            if (_kcp != null)
+            var tcpToKcpTask = Task.Run(async () =>
             {
-                // 1. TCP 写入 KCP 发送队列
-                var tcpToKcpTask = Task.Run(async () =>
+                byte[] recvBuf = ArrayPool<byte>.Shared.Rent(_mtu);
+                try
                 {
-                    byte[] recvBuf = ArrayPool<byte>.Shared.Rent(_mtu);
+                    while (!token.IsCancellationRequested)
+                    {
+                        int bytesRead = await stream.ReadAsync(recvBuf.AsMemory(0, _mtu), token);
+                        if (bytesRead == 0) break; // Local TCP EOF
+
+                        await SendFrameAsync(channelId, ChannelCmd.Data, recvBuf.AsMemory(0, bytesRead), token);
+                    }
+                }
+                catch (OperationCanceledException) when (token.IsCancellationRequested) { }
+                catch (Exception ex)
+                {
+                    if (token.IsCancellationRequested || _sessionCts.IsCancellationRequested || !tcp.Connected)
+                    {
+                        // 正常断开
+                    }
+                    else if (ex is IOException ioEx && ioEx.InnerException is SocketException sex &&
+                             (sex.SocketErrorCode == SocketError.OperationAborted ||
+                              sex.SocketErrorCode == SocketError.ConnectionAborted ||
+                              sex.SocketErrorCode == SocketError.ConnectionReset))
+                    {
+                        // 连接已中止
+                    }
+                    else
+                    {
+                        Log.Debug($"[Tunnel] Channel {channelId} TCP->KCP error: {ex.Message}");
+                    }
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(recvBuf);
                     try
                     {
-                        while (!token.IsCancellationRequested)
-                        {
-                            // 背压控制：当 KCP 积压的未确认包数超过窗口 2 倍时，暂缓读取 TCP 流
-                            while (_kcp.WaitSnd > _kcpConfig.SndWnd * 2 && !token.IsCancellationRequested)
-                            {
-                                await Task.Delay(10, token);
-                            }
-
-                            int bytesRead = await stream.ReadAsync(recvBuf.AsMemory(0, _mtu), token);
-                            if (bytesRead == 0) break; // 本地发送端关闭 (EOF)
-
-                            UpdateActivity();
-                            _kcp.Send(recvBuf.AsSpan(0, bytesRead));
-                            try { _signal.Release(); } catch { }
-                        }
-
-                        // 优雅关闭：本地写入完毕后，等待 KCP 发送队列与缓冲区完全清空并收到对端 ACK
+                        using var closeCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(500));
+                        await SendFrameAsync(channelId, ChannelCmd.Close, ReadOnlyMemory<byte>.Empty, closeCts.Token);
                         int waitCount = 0;
-                        while (_kcp.WaitSnd > 0 && waitCount < 50 && !_sessionCts.IsCancellationRequested)
+                        while (_kcp?.WaitSnd > 0 && waitCount < 10 && !_sessionCts.IsCancellationRequested)
                         {
                             try { _signal.Release(); } catch { }
-                            await Task.Delay(100, CancellationToken.None);
+                            await Task.Delay(20, CancellationToken.None);
                             waitCount++;
                         }
                     }
-                    catch (OperationCanceledException) when (token.IsCancellationRequested) { }
-                    catch (Exception ex)
-                    {
-                        Log.Debug($"[Tunnel] TCP->KCP error: {ex.Message}");
-                    }
-                    finally
-                    {
-                        ArrayPool<byte>.Shared.Return(recvBuf);
-                        _ = SendDisconnectAsync();
-                        _sessionCts.Cancel();
-                        try { _signal.Release(); } catch { }
-                    }
-                }, token);
+                    catch { }
+                }
+            }, token);
 
-                // 2. KCP 驱动循环与输出至 TCP
-                var kcpDriverTask = Task.Run(async () =>
-                {
-                    byte[] kcpRecvBuf = ArrayPool<byte>.Shared.Rent(65535);
-                    try
-                    {
-                        int interval = _kcpConfig.Interval > 0 ? _kcpConfig.Interval : 10;
-                        while (!token.IsCancellationRequested)
-                        {
-                            uint current = Kcp.CurrentTimeMs();
-                            await _kcp.UpdateAsync(current);
-
-                            while (true)
-                            {
-                                int len = _kcp.Recv(kcpRecvBuf);
-                                if (len <= 0) break;
-                                await stream.WriteAsync(kcpRecvBuf.AsMemory(0, len), token);
-                            }
-
-                            uint nextTime = _kcp.Check(current);
-                            int delay = (int)(nextTime - current);
-                            if (delay < 1) delay = 1;
-                            if (delay > interval) delay = interval;
-
-                            try
-                            {
-                                await _signal.WaitAsync(delay, token);
-                            }
-                            catch (TimeoutException) { }
-                            catch (OperationCanceledException) when (token.IsCancellationRequested)
-                            {
-                                break;
-                            }
-                            catch (ObjectDisposedException) { break; }
-                        }
-                    }
-                    catch (OperationCanceledException) when (token.IsCancellationRequested) { }
-                    catch (Exception ex)
-                    {
-                        Log.Debug($"[Tunnel] KCP Driver error: {ex.Message}");
-                    }
-                    finally
-                    {
-                        try
-                        {
-                            // 退出前最后尝试冲刷一次接收队列中已排序的数据
-                            while (true)
-                            {
-                                int len = _kcp.Recv(kcpRecvBuf);
-                                if (len <= 0) break;
-                                stream.Write(kcpRecvBuf, 0, len);
-                            }
-                        }
-                        catch { }
-                        ArrayPool<byte>.Shared.Return(kcpRecvBuf);
-                        _ = SendDisconnectAsync();
-                        _sessionCts.Cancel();
-                    }
-                }, token);
-
-                await Task.WhenAny(tcpToKcpTask, kcpDriverTask);
-            }
-            else
+            var kcpToTcpTask = Task.Run(async () =>
             {
-                // 纯 TCP 模式原始桥接
-                var udpToTcpTask = Task.Run(async () =>
+                try
                 {
-                    try
+                    while (await ch.Reader.WaitToReadAsync(token))
                     {
-                        while (await _inboundChannel.Reader.WaitToReadAsync(token))
+                        while (ch.Reader.TryRead(out var packet))
                         {
-                            while (_inboundChannel.Reader.TryRead(out var packet))
-                            {
-                                await stream.WriteAsync(packet, token);
-                            }
+                            await stream.WriteAsync(packet, token);
                         }
                     }
-                    catch (OperationCanceledException) when (token.IsCancellationRequested) { }
-                    finally { 
-                        _ = SendDisconnectAsync();
-                        _sessionCts.Cancel(); 
+                }
+                catch (OperationCanceledException) when (token.IsCancellationRequested) { }
+                catch (Exception ex)
+                {
+                    if (token.IsCancellationRequested || _sessionCts.IsCancellationRequested || !tcp.Connected)
+                    {
+                        // 正常断开
                     }
-                }, token);
+                    else if (ex is IOException ioEx && ioEx.InnerException is SocketException sex &&
+                             (sex.SocketErrorCode == SocketError.OperationAborted ||
+                              sex.SocketErrorCode == SocketError.ConnectionAborted ||
+                              sex.SocketErrorCode == SocketError.ConnectionReset))
+                    {
+                        // 连接已中止
+                    }
+                    else
+                    {
+                        Log.Debug($"[Tunnel] Channel {channelId} KCP->TCP error: {ex.Message}");
+                    }
+                }
+                finally
+                {
+                    try { tcp.Close(); } catch { }
+                }
+            }, token);
 
-                await udpToTcpTask;
+            try
+            {
+                var completedTask = await Task.WhenAny(tcpToKcpTask, kcpToTcpTask);
+                if (completedTask == tcpToKcpTask)
+                {
+                    // 若客户端套接字仍处于连接状态（半关闭状态），给予短暂缓冲允许服务端将剩余响应写回客户端
+                    if (tcp.Connected)
+                    {
+                        await Task.WhenAny(kcpToTcpTask, Task.Delay(300, token));
+                    }
+                }
+            }
+            finally
+            {
+                try { tcp.Close(); } catch { }
+                CloseChannel(channelId);
             }
         }
+
+        public void CloseChannel(uint channelId)
+        {
+            if (_tcpChannels.TryRemove(channelId, out var ch))
+            {
+                ch.Writer.TryComplete();
+                DecrementActiveChannel();
+            }
+        }
+
+        public async Task OpenAndBridgeChannelAsync(TcpClient tcp, CancellationToken ct)
+        {
+            if (IsClosed)
+            {
+                throw new InvalidOperationException("TunnelSession is already closed.");
+            }
+            uint channelId = AllocateChannelId();
+            await SendFrameAsync(channelId, ChannelCmd.Open, ReadOnlyMemory<byte>.Empty, ct);
+            await RunChannelBridgeAsync(channelId, tcp, ct);
+        }
+
+        public Task RunTcpBridgeAsync(TcpClient tcp, CancellationToken ct) => OpenAndBridgeChannelAsync(tcp, ct);
+        public Task RunTcpKcpBridgeAsync(TcpClient tcp, CancellationToken ct) => OpenAndBridgeChannelAsync(tcp, ct);
 
         // 双向桥接目标 UDP 服务与 UDP 数据链路 (原始数据报零拷贝直传)
         public async Task RunUdpBridgeAsync(ZeroCopyUdpSocket targetSocket, IPEndPoint targetEp, CancellationToken ct)
@@ -479,7 +931,9 @@ namespace UDRoute
 
         public void Dispose()
         {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
             try { _sessionCts.Cancel(); } catch { }
+            _sessionClosedTcs.TrySetResult();
             // 出于高并发安全考虑，不显式 Dispose _signal 和 _sessionCts，交由 GC 回收以避免 ObjectDisposedException 竞争
         }
     }

@@ -18,6 +18,10 @@ namespace UDRoute
         private ServerMode? _server;
         private ClientMode? _client;
 
+        public ProxyMode? Proxy => _proxy;
+        public ServerMode? Server => _server;
+        public ClientMode? Client => _client;
+
         public RouteEngine(AppConfig config)
         {
             _config = config;
@@ -76,7 +80,7 @@ namespace UDRoute
                     using var pipeServer = new System.IO.Pipes.NamedPipeServerStream(
                         pipeName, 
                         System.IO.Pipes.PipeDirection.Out, 
-                        1, 
+                        System.IO.Pipes.NamedPipeServerStream.MaxAllowedServerInstances, 
                         System.IO.Pipes.PipeTransmissionMode.Byte, 
                         System.IO.Pipes.PipeOptions.Asynchronous);
                     
@@ -184,12 +188,23 @@ namespace UDRoute
                                 if (_proxy != null && span.Length >= 17) await _proxy.TryRelayDataAsync(new Guid(span.Slice(1, 16)), mem, remoteEp, ct);
                                 break;
 
+                            case MsgType.RelayEnd:
+                                if (_proxy != null && span.Length >= 17)
+                                {
+                                    _proxy.HandleRelayEnd(new Guid(span.Slice(1, 16)), remoteEp);
+                                }
+                                break;
+
                             default:
                                 Log.Debug($"[RouteEngine] Unknown MsgType {(byte)type} from {remoteEp}");
                                 break;
                         }
                     }
                     catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                    {
+                        break;
+                    }
+                    catch (ObjectDisposedException)
                     {
                         break;
                     }
@@ -266,9 +281,9 @@ namespace UDRoute
 
             Guid sessionId = new Guid(span.Slice(1, 16));
 
-            if (_client != null && _client.TryHandleDisconnect(sessionId)) return;
-            if (_server != null && _server.TryHandleDisconnect(sessionId)) return;
-            if (_proxy != null && await _proxy.TryRelayDataAsync(sessionId, mem, remoteEp, ct)) return;
+            if (_client != null && _client.TryHandleDisconnect(sessionId, remoteEp)) return;
+            if (_server != null && _server.TryHandleDisconnect(sessionId, remoteEp)) return;
+            if (_proxy != null && await _proxy.TryRelayDisconnectAsync(sessionId, mem, remoteEp, ct)) return;
         }
 
         private async ValueTask DispatchDataAsync(ReadOnlyMemory<byte> mem, EndPoint remoteEp, CancellationToken ct)
@@ -280,13 +295,13 @@ namespace UDRoute
             var payload = span.Slice(17);
 
             // 1. 尝试由 ClientMode 处理
-            if (_client != null && _client.TryHandleData(sessionId, payload))
+            if (_client != null && _client.TryHandleData(sessionId, payload, remoteEp))
             {
                 return;
             }
 
             // 2. 尝试由 ServerMode 处理
-            if (_server != null && _server.TryHandleData(sessionId, payload))
+            if (_server != null && _server.TryHandleData(sessionId, payload, remoteEp))
             {
                 return;
             }

@@ -22,6 +22,22 @@ namespace UDRoute
             return (Encoding.UTF8.GetString(buffer.Slice(4, len)), 4 + len);
         }
 
+        public static bool AreEndPointsEqual(EndPoint? ep1, EndPoint? ep2)
+        {
+            if (ep1 == null && ep2 == null) return true;
+            if (ep1 == null || ep2 == null) return false;
+            if (ep1.Equals(ep2)) return true;
+
+            if (ep1 is IPEndPoint ip1 && ep2 is IPEndPoint ip2)
+            {
+                if (ip1.Port != ip2.Port) return false;
+                var addr1 = ip1.Address.IsIPv4MappedToIPv6 ? ip1.Address.MapToIPv4() : ip1.Address;
+                var addr2 = ip2.Address.IsIPv4MappedToIPv6 ? ip2.Address.MapToIPv4() : ip2.Address;
+                return addr1.Equals(addr2);
+            }
+            return false;
+        }
+
         // 编码 EndPoint (IPv4 / IPv6)
         public static int WriteIPEndPoint(Span<byte> buffer, EndPoint endPoint)
         {

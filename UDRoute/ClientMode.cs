@@ -16,8 +16,30 @@ namespace UDRoute
         private readonly AppConfig _config;
         private readonly ProxyMode? _localProxy;
         private readonly ZeroCopyUdpSocket _udp; // 与P和S通讯
-        private readonly ConcurrentDictionary<Guid, TunnelSession> _sessions = new();
+        private readonly Dictionary<Guid, TunnelSession> _sessions = new();
+        private readonly object _sessionLock = new();
+        public IEnumerable<TunnelSession> Sessions
+        {
+            get
+            {
+                lock (_sessionLock)
+                {
+                    return _sessions.Values.ToList();
+                }
+            }
+        }
         private readonly ConcurrentDictionary<Guid, TaskCompletionSource<QueryResponse>> _pendingQueries = new();
+        private readonly Dictionary<string, TunnelSession> _reusableTunnels = new();
+        private readonly object _tunnelStateLock = new();
+        private readonly ConcurrentDictionary<string, SemaphoreSlim> _tunnelLocks = new();
+        private class UdpTunnelContext
+        {
+            public readonly object Lock = new();
+            public readonly Dictionary<EndPoint, uint> ClientToChannel = new();
+            public readonly Dictionary<uint, EndPoint> ChannelToClient = new();
+            public readonly Dictionary<EndPoint, long> ClientLastActive = new();
+        }
+        private readonly ConcurrentDictionary<Guid, UdpTunnelContext> _udpContexts = new();
 
         public ClientMode(AppConfig config, ZeroCopyUdpSocket udp, ProxyMode? localProxy)
         {
@@ -43,7 +65,12 @@ namespace UDRoute
         public List<DataChannelInfo> GetActiveChannels()
         {
             var list = new List<DataChannelInfo>();
-            foreach (var s in _sessions.Values)
+            List<TunnelSession> sessions;
+            lock (_sessionLock)
+            {
+                sessions = _sessions.Values.ToList();
+            }
+            foreach (var s in sessions)
             {
                 list.Add(new DataChannelInfo { Source = s.ChannelDesc, Target = s.ActiveRemoteEp.ToString() ?? "", IsRelayed = !s.IsDirect, Rtt = s.Rtt });
             }
@@ -107,10 +134,16 @@ namespace UDRoute
                 }
 
                 bool allowRelay = data[offset++] != 0;
+                int tunnelReuseInterval = Constants.DefaultTunnelReuseInterval;
+                if (offset + 4 <= data.Length)
+                {
+                    tunnelReuseInterval = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(offset, 4));
+                    offset += 4;
+                }
 
                 if (_pendingQueries.TryRemove(sessionId, out var tcs))
                 {
-                    tcs.TrySetResult(new QueryResponse(true, devId, sPublicEp, sWanPort, timeout, sTimestamp, reqPass, kcpConfig, localEps, allowRelay));
+                    tcs.TrySetResult(new QueryResponse(true, devId, sPublicEp, sWanPort, timeout, sTimestamp, reqPass, kcpConfig, localEps, allowRelay, tunnelReuseInterval));
                     return true;
                 }
             }
@@ -128,9 +161,14 @@ namespace UDRoute
 
         public async ValueTask<bool> TryHandlePunchAsync(Guid sessionId, Guid peerDevId, EndPoint remoteEp, byte status, CancellationToken ct)
         {
-            if (_sessions.TryGetValue(sessionId, out var session))
+            TunnelSession? session;
+            lock (_sessionLock)
             {
-                if (_config.ForceRelay || session.ForceRelay)
+                _sessions.TryGetValue(sessionId, out session);
+            }
+            if (session != null && !session.IsClosed)
+            {
+                if (session.ForceRelay)
                 {
                     Log.Debug($"[C] Ignoring punch for session {sessionId} because ForceRelay is enabled.");
                     return true;
@@ -148,6 +186,11 @@ namespace UDRoute
                     ackBuf[33] = 3; // Punch ACK
                     await _udp.SendAsync(ackBuf, remoteEp, ct);
                 }
+                else if (status == 3)
+                {
+                    // 收到对方打洞确认，双向直连打通，通知 P 端释放临时中继
+                    session.NotifyDirectCommunicationEstablished();
+                }
                 return true;
             }
             return false;
@@ -159,8 +202,14 @@ namespace UDRoute
             Guid sessionId = new Guid(span.Slice(1, 16));
             bool success = span[17] != 0;
 
-            if (_sessions.TryGetValue(sessionId, out var session))
+            TunnelSession? session;
+            lock (_sessionLock)
             {
+                _sessions.TryGetValue(sessionId, out session);
+            }
+            if (session != null && !session.IsClosed)
+            {
+                session.EnsureDirectRouteFromPeer(remoteEp);
                 if (success)
                 {
                     Log.Info($"[C] Auth succeeded for session {sessionId}");
@@ -182,22 +231,36 @@ namespace UDRoute
             }
         }
 
-        public bool TryHandleData(Guid sessionId, ReadOnlySpan<byte> payload)
+        public bool TryHandleData(Guid sessionId, ReadOnlySpan<byte> payload, EndPoint remoteEp)
         {
-            if (_sessions.TryGetValue(sessionId, out var session))
+            TunnelSession? session;
+            lock (_sessionLock)
             {
+                _sessions.TryGetValue(sessionId, out session);
+            }
+            if (session != null && !session.IsClosed)
+            {
+                session.EnsureDirectRouteFromPeer(remoteEp);
                 session.OnUdpDataReceived(payload);
                 return true;
             }
             return false;
         }
 
-        public bool TryHandleDisconnect(Guid sessionId)
+        public bool TryHandleDisconnect(Guid sessionId, EndPoint remoteEp)
         {
-            if (_sessions.TryGetValue(sessionId, out var session))
+            if (_pendingQueries.TryRemove(sessionId, out var tcs))
             {
-                session.DisconnectReceived();
-                return true;
+                tcs.TrySetResult(new QueryResponse(false, Guid.Empty, null!, 0, 0, 0, false, null, null!));
+            }
+            TunnelSession? session;
+            lock (_sessionLock)
+            {
+                _sessions.TryGetValue(sessionId, out session);
+            }
+            if (session != null)
+            {
+                return session.TryHandleDisconnect(remoteEp);
             }
             return false;
         }
@@ -216,217 +279,46 @@ namespace UDRoute
                 throw;
             }
 
-            Log.Info($"[C] TCP listening on port {rec.Port} -> {rec.TargetName}@{rec.TargetServer}");
+            string queryName = rec.TargetName.EndsWith("/tcp", StringComparison.OrdinalIgnoreCase) || rec.TargetName.EndsWith("/udp", StringComparison.OrdinalIgnoreCase)
+                ? rec.TargetName
+                : $"{rec.TargetName}/tcp";
+
+            Log.Info($"[C] TCP listening on port {rec.Port} -> {queryName}@{rec.TargetServer}");
 
             while (!ct.IsCancellationRequested)
             {
                 try
                 {
                     var client = await listener.AcceptTcpClientAsync(ct);
-                    Guid sessionId = Guid.NewGuid();
 
-                    Log.Debug($"[C] New TCP connection on port {rec.Port}, Session: {sessionId}");
-
-                    string queryName = rec.TargetName.EndsWith("/tcp", StringComparison.OrdinalIgnoreCase) || rec.TargetName.EndsWith("/udp", StringComparison.OrdinalIgnoreCase)
-                        ? rec.TargetName
-                        : $"{rec.TargetName}/tcp";
-
-                    // 1. 优化模式: 直接查本地 Proxy 内存
-                    if (rec.IsThis && _localProxy != null)
-                    {
-                        var sInfo = _localProxy.DirectQuery(queryName);
-                        if (sInfo != null)
-                        {
-                            if (sInfo.RequiresPassword && (rec.Password == null || rec.Password.Length == 0))
-                            {
-                                Log.Info($"[C] Password required for {queryName}.");
-                                Console.Write($"Password for {queryName}: ");
-                                string input = ReadPassword();
-                                rec.Password = ManagedSHA256.ComputeHashBytes(System.Text.Encoding.UTF8.GetBytes(input));
-                            }
-
-                            // 通知 S 端发起准备与打洞 (RelayStart)
-                            byte[] relayStartBuf = ArrayPool<byte>.Shared.Rent(512);
-                            try
-                            {
-                                relayStartBuf[0] = (byte)MsgType.RelayStart;
-                                sessionId.TryWriteBytes(relayStartBuf.AsSpan(1, 16));
-                                int offset = 17;
-                                offset += ProtocolHelper.WriteString(relayStartBuf.AsSpan(offset), queryName);
-                                offset += ProtocolHelper.WriteIPEndPoint(relayStartBuf.AsSpan(offset), _udp.LocalEndPoint);
-                                relayStartBuf[offset++] = (byte)(((_localProxy?.IsRelayAllowed(sInfo) ?? true) ? 1 : 0) | (rec.ForceRelay ? 2 : 0));
-                                await _udp.SendAsync(relayStartBuf.AsMemory(0, offset), sInfo.PublicEp, ct);
-                            }
-                            finally
-                            {
-                                ArrayPool<byte>.Shared.Return(relayStartBuf);
-                            }
-
-                            var session = new TunnelSession(_udp, sInfo.PublicEp, sessionId, rec.Mtu, rec.IsTcp, sInfo.KcpConfig, sInfo.Timeout);
-                            session.ChannelDesc = rec.Port.ToString();
-                            session.ForceRelay = rec.ForceRelay;
-                            _sessions[sessionId] = session;
-                            _ = Task.Run(async () =>
-                            {
-                                try
-                                {
-                                    if (rec.Password != null)
-                                    {
-                                        bool authOk = await session.AuthenticateClientAsync(rec.Password, sInfo.STimestamp, sInfo.PRecvTimeTicks, ct);
-                                        if (!authOk) { Log.Warn($"[C] Auth failed for session {sessionId}"); return; }
-                                    }
-                                    await session.RunTcpBridgeAsync(client, ct);
-                                }
-                                finally { _sessions.TryRemove(sessionId, out _); session.Dispose(); }
-                            }, ct);
-                        }
-                        else
-                        {
-                            Log.Warn($"[C] DirectQuery failed for {queryName}");
-                            client.Close();
-                        }
-                        continue;
-                    }
-
-                    // 2. 常规模式: 向 P 发起 Query (UDP)
                     _ = Task.Run(async () =>
                     {
                         try
                         {
-                            var pEndPoint = await ProtocolHelper.ResolveEndPointAsync(rec.TargetServer, Constants.DefaultProxyPort);
-                            if (pEndPoint == null)
+                            for (int retry = 0; retry < 2; retry++)
                             {
-                                Log.Error($"[C] Failed to resolve P server: {rec.TargetServer}");
-                                client.Close();
-                                return;
-                            }
-
-                            var tcs = new TaskCompletionSource<QueryResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
-                            _pendingQueries[sessionId] = tcs;
-
-                            // 发送 Query 包: [MsgType 1][SessionId 16][TargetName string]
-                            byte[] qBuf = ArrayPool<byte>.Shared.Rent(256);
-                            try
-                            {
-                                qBuf[0] = (byte)MsgType.Query;
-                                sessionId.TryWriteBytes(qBuf.AsSpan(1, 16));
-                                int qLen = 17 + ProtocolHelper.WriteString(qBuf.AsSpan(17), queryName);
-                                qBuf[qLen++] = (byte)(rec.ForceRelay ? 1 : 0);
-                                await _udp.SendAsync(qBuf.AsMemory(0, qLen), pEndPoint, ct);
-                            }
-                            finally
-                            {
-                                ArrayPool<byte>.Shared.Return(qBuf);
-                            }
-
-                            // 等待 P 的查询响应 (5秒超时)
-                            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-                            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
-
-                            QueryResponse resp;
-                            try
-                            {
-                                resp = await tcs.Task.WaitAsync(linkedCts.Token);
-                            }
-                            catch
-                            {
-                                _pendingQueries.TryRemove(sessionId, out _);
-                                Log.Warn($"[C] Query timeout for session {sessionId}");
-                                client.Close();
-                                return;
-                            }
-
-                            if (!resp.Success)
-                            {
-                                Log.Warn($"[C] P returned NotFound for {queryName}");
-                                client.Close();
-                                return;
-                            }
-
-                            if (resp.RequiresPassword && (rec.Password == null || rec.Password.Length == 0))
-                            {
-                                Log.Info($"[C] Password required for {queryName}.");
-                                Console.Write($"Password for {queryName}: ");
-                                string input = ReadPassword();
-                                rec.Password = ManagedSHA256.ComputeHashBytes(System.Text.Encoding.UTF8.GetBytes(input));
-                            }
-
-                            if (!resp.AllowRelay)
-                            {
-                                Log.Info($"[C] P relay not allowed for {queryName}. Waiting for UDP punch before bridging TCP...");
-                                var session = new TunnelSession(_udp, resp.ServerPublicEp, sessionId, rec.Mtu, rec.IsTcp, resp.KcpConfig, resp.Timeout);
-                                session.ChannelDesc = rec.Port.ToString();
-                                _sessions[sessionId] = session;
-
-                                bool punchSuccess = await StartPunchingAsync(session, resp.DevId, resp.ServerPublicEp, resp.ServerWanPort, resp.LocalEps, ct);
-                                if (!punchSuccess)
+                                var session = await GetOrCreateTunnelSessionAsync(rec, queryName, ct, forceNew: retry > 0);
+                                if (session == null)
                                 {
-                                    Log.Warn($"[C] P relay is disabled and UDP punch timed out for session {sessionId}. Connection closed.");
-                                    _sessions.TryRemove(sessionId, out _);
-                                    session.Dispose();
                                     client.Close();
                                     return;
                                 }
 
-                                Log.Info($"[C] UDP punch succeeded without P relay! Starting direct P2P bridge for session {sessionId}.");
                                 try
                                 {
-                                    if (rec.Password != null)
-                                    {
-                                        bool authOk = await session.AuthenticateClientAsync(rec.Password, resp.STimestamp, DateTime.UtcNow.Ticks, ct);
-                                        if (!authOk) { Log.Warn($"[C] Auth failed for session {sessionId}"); return; }
-                                    }
-                                    await session.RunTcpBridgeAsync(client, ct);
+                                    await session.OpenAndBridgeChannelAsync(client, ct);
+                                    break;
                                 }
-                                finally
+                                catch (Exception) when (retry == 0 && session.IsClosed)
                                 {
-                                    if (_sessions.TryRemove(sessionId, out _))
-                                    {
-                                        Log.Info($"[C] Session {sessionId} closed.");
-                                    }
-                                    session.Dispose();
-                                }
-                            }
-                            else
-                            {
-                                // 初始通过 P 中继通信，应用协商好的 KCP 参数
-                                var session = new TunnelSession(_udp, pEndPoint, sessionId, rec.Mtu, rec.IsTcp, resp.KcpConfig, resp.Timeout);
-                                session.ChannelDesc = rec.Port.ToString();
-                                session.ForceRelay = rec.ForceRelay;
-                                _sessions[sessionId] = session;
-
-                                // 并行启动向 S 的公网地址和 WanPort 进行 UDP 打洞
-                                if (!rec.ForceRelay)
-                                {
-                                    _ = StartPunchingAsync(session, resp.DevId, resp.ServerPublicEp, resp.ServerWanPort, resp.LocalEps, ct);
-                                }
-                                else
-                                {
-                                    Log.Info($"[C] ForceRelay is enabled for session {sessionId}, skipping UDP punch.");
-                                }
-
-                                try
-                                {
-                                    if (rec.Password != null)
-                                    {
-                                        bool authOk = await session.AuthenticateClientAsync(rec.Password, resp.STimestamp, DateTime.UtcNow.Ticks, ct);
-                                        if (!authOk) { Log.Warn($"[C] Auth failed for session {sessionId}"); return; }
-                                    }
-                                    await session.RunTcpBridgeAsync(client, ct);
-                                }
-                                finally
-                                {
-                                    if (_sessions.TryRemove(sessionId, out _))
-                                    {
-                                        Log.Info($"[C] Session {sessionId} closed.");
-                                    }
-                                    session.Dispose();
+                                    Log.Warn($"[C] Data tunnel {session.SessionId} was closed or rejected by peer. Retrying with a fresh data tunnel...");
+                                    continue;
                                 }
                             }
                         }
                         catch (Exception ex)
                         {
-                            Log.Debug($"[C] Session {sessionId} error: {ex.Message}");
+                            Log.Debug($"[C] TCP bridge error: {ex.Message}");
                             client.Close();
                         }
                     }, ct);
@@ -489,7 +381,6 @@ namespace UDRoute
 
         private async Task AcceptUdpLoopAsync(ClientRecord rec, CancellationToken ct)
         {
-            // UDP 端口代理转发循环
             using var localUdp = new ZeroCopyUdpSocket(rec.Port);
             string queryName = rec.TargetName.EndsWith("/tcp", StringComparison.OrdinalIgnoreCase) || rec.TargetName.EndsWith("/udp", StringComparison.OrdinalIgnoreCase)
                 ? rec.TargetName
@@ -498,7 +389,6 @@ namespace UDRoute
             Log.Info($"[C] UDP listening on port {rec.Port} -> {queryName}@{rec.TargetServer}");
 
             byte[] poolBuf = ArrayPool<byte>.Shared.Rent(65535);
-            var clientChannelMap = new ConcurrentDictionary<EndPoint, Channel<byte[]>>();
 
             try
             {
@@ -511,222 +401,137 @@ namespace UDRoute
 
                         byte[] packetCopy = poolBuf.AsSpan(0, len).ToArray();
 
-                        if (!clientChannelMap.TryGetValue(clientEp, out var channel))
+                        _ = Task.Run(async () =>
                         {
-                            channel = Channel.CreateUnbounded<byte[]>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
-                            clientChannelMap[clientEp] = channel;
-
-                            Guid sessionId = Guid.NewGuid();
-
-                            _ = Task.Run(async () =>
+                            try
                             {
-                                TunnelSession? session = null;
-                                QueryResponse? resp = null;
-                                try
+                                var session = await GetOrCreateTunnelSessionAsync(rec, queryName, ct);
+                                if (session == null || session.IsClosed)
                                 {
-                                    if (rec.IsThis && _localProxy != null)
+                                    session = await GetOrCreateTunnelSessionAsync(rec, queryName, ct, forceNew: true);
+                                    if (session == null || session.IsClosed) return;
+                                }
+
+                                if (!_udpContexts.TryGetValue(session.SessionId, out var ctx))
+                                {
+                                    lock (session)
                                     {
-                                        var sInfo = _localProxy.DirectQuery(queryName);
-                                        if (sInfo != null)
+                                        if (!_udpContexts.TryGetValue(session.SessionId, out ctx))
                                         {
-                                            // 通知 S 端发起准备与打洞 (RelayStart)
-                                            byte[] relayStartBuf = ArrayPool<byte>.Shared.Rent(512);
-                                            try
+                                            ctx = new UdpTunnelContext();
+                                            _udpContexts[session.SessionId] = ctx;
+
+                                            session.OnClientUdpDataReceived = (chId, data) =>
                                             {
-                                                relayStartBuf[0] = (byte)MsgType.RelayStart;
-                                                sessionId.TryWriteBytes(relayStartBuf.AsSpan(1, 16));
-                                                int offset = 17;
-                                                offset += ProtocolHelper.WriteString(relayStartBuf.AsSpan(offset), queryName);
-                                                offset += ProtocolHelper.WriteIPEndPoint(relayStartBuf.AsSpan(offset), _udp.LocalEndPoint);
-                                                relayStartBuf[offset++] = (byte)(((_localProxy?.IsRelayAllowed(sInfo) ?? true) ? 1 : 0) | (rec.ForceRelay ? 2 : 0));
-                                                await _udp.SendAsync(relayStartBuf.AsMemory(0, offset), sInfo.PublicEp, ct);
-                                            }
-                                            finally
-                                            {
-                                                ArrayPool<byte>.Shared.Return(relayStartBuf);
-                                            }
-
-                                            session = new TunnelSession(_udp, sInfo.PublicEp, sessionId, rec.Mtu, isTcp: false, null, sInfo.Timeout);
-                                            session.ForceRelay = rec.ForceRelay;
-                                        }
-                                        else
-                                        {
-                                            Log.Warn($"[C] UDP DirectQuery failed for {queryName}");
-                                            return;
-                                        }
-                                    }
-                                    else
-                                    {
-                                        var pEndPoint = await ProtocolHelper.ResolveEndPointAsync(rec.TargetServer, Constants.DefaultProxyPort);
-                                        if (pEndPoint == null)
-                                        {
-                                            Log.Error($"[C] Failed to resolve P server: {rec.TargetServer}");
-                                            return;
-                                        }
-
-                                        var tcs = new TaskCompletionSource<QueryResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
-                                        _pendingQueries[sessionId] = tcs;
-
-                                        byte[] qBuf = ArrayPool<byte>.Shared.Rent(256);
-                                        try
-                                        {
-                                            qBuf[0] = (byte)MsgType.Query;
-                                            sessionId.TryWriteBytes(qBuf.AsSpan(1, 16));
-                                            int qLen = 17 + ProtocolHelper.WriteString(qBuf.AsSpan(17), queryName);
-                                            qBuf[qLen++] = (byte)(rec.ForceRelay ? 1 : 0);
-                                            await _udp.SendAsync(qBuf.AsMemory(0, qLen), pEndPoint, ct);
-                                        }
-                                        finally
-                                        {
-                                            ArrayPool<byte>.Shared.Return(qBuf);
-                                        }
-
-                                        using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-                                        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
-
-                                        try
-                                        {
-                                            resp = await tcs.Task.WaitAsync(linkedCts.Token);
-                                        }
-                                        catch
-                                        {
-                                            _pendingQueries.TryRemove(sessionId, out _);
-                                            Log.Warn($"[C] UDP Query timeout for session {sessionId}");
-                                            return;
-                                        }
-
-                                        if (!resp.Success)
-                                        {
-                                            Log.Warn($"[C] P returned NotFound for UDP service {queryName}");
-                                            return;
-                                        }
-
-                                        if (resp.RequiresPassword && (rec.Password == null || rec.Password.Length == 0))
-                                        {
-                                            Log.Info($"[C] Password required for {queryName}.");
-                                            Console.Write($"Password for {queryName}: ");
-                                            string input = ReadPassword();
-                                            rec.Password = ManagedSHA256.ComputeHashBytes(System.Text.Encoding.UTF8.GetBytes(input));
-                                        }
-
-                                        if (!resp.AllowRelay)
-                                        {
-                                            Log.Info($"[C] P relay not allowed for UDP service {queryName}. Waiting for UDP punch before bridging UDP...");
-                                            session = new TunnelSession(_udp, resp.ServerPublicEp, sessionId, rec.Mtu, isTcp: false, null, resp.Timeout);
-                                            bool punchSuccess = await StartPunchingAsync(session, resp.DevId, resp.ServerPublicEp, resp.ServerWanPort, resp.LocalEps, ct);
-                                            if (!punchSuccess)
-                                            {
-                                                Log.Warn($"[C] P relay is disabled and UDP punch timed out for UDP session {sessionId}.");
-                                                clientChannelMap.TryRemove(clientEp, out _);
-                                                session.Dispose();
-                                                return;
-                                            }
-                                        }
-                                        else
-                                        {
-                                            session = new TunnelSession(_udp, pEndPoint, sessionId, rec.Mtu, isTcp: false, null, resp.Timeout);
-                                            session.ForceRelay = rec.ForceRelay;
-                                            if (!rec.ForceRelay)
-                                            {
-                                                _ = StartPunchingAsync(session, resp.DevId, resp.ServerPublicEp, resp.ServerWanPort, resp.LocalEps, ct);
-                                            }
-                                            else
-                                            {
-                                                Log.Info($"[C] ForceRelay is enabled for UDP session {sessionId}, skipping UDP punch.");
-                                            }
-                                        }
-                                    }
-
-                                    session.ChannelDesc = rec.Port.ToString();
-                                    _sessions[sessionId] = session;
-
-                                    if (rec.Password != null)
-                                    {
-                                        long st = 0, pt = 0;
-                                        if (rec.IsThis && _localProxy != null)
-                                        {
-                                            var info = _localProxy.DirectQuery(queryName);
-                                            st = info?.STimestamp ?? 0;
-                                            pt = info?.PRecvTimeTicks ?? 0;
-                                        }
-                                        else if (resp != null)
-                                        {
-                                            st = resp.STimestamp;
-                                            pt = DateTime.UtcNow.Ticks;
-                                        }
-                                        bool authOk = await session.AuthenticateClientAsync(rec.Password, st, pt, ct);
-                                        if (!authOk)
-                                        {
-                                            Log.Warn($"[C] UDP Auth failed for session {sessionId}");
-                                            clientChannelMap.TryRemove(clientEp, out _);
-                                            session.Dispose();
-                                            return;
-                                        }
-                                    }
-
-                                    var sessionToken = session.SessionToken;
-                                    byte[] sendBuf = ArrayPool<byte>.Shared.Rent(rec.Mtu + 17);
-
-                                    // 1. 回传循环 (S/P -> Client)
-                                    var inboundTask = Task.Run(async () =>
-                                    {
-                                        try
-                                        {
-                                            while (await session.InboundChannel.Reader.WaitToReadAsync(sessionToken))
-                                            {
-                                                while (session.InboundChannel.Reader.TryRead(out var p))
+                                                if (_udpContexts.TryGetValue(session.SessionId, out var currentCtx))
                                                 {
-                                                    session.UpdateActivity();
-                                                    await localUdp.SendAsync(p, clientEp, sessionToken);
+                                                    EndPoint? targetClientEp = null;
+                                                    lock (currentCtx.Lock)
+                                                    {
+                                                        if (currentCtx.ChannelToClient.TryGetValue(chId, out var ep))
+                                                        {
+                                                            targetClientEp = ep;
+                                                        }
+                                                    }
+                                                    if (targetClientEp != null)
+                                                    {
+                                                        _ = Task.Run(async () =>
+                                                        {
+                                                            try
+                                                            {
+                                                                await localUdp.SendAsync(data, targetClientEp, session.SessionToken);
+                                                            }
+                                                            catch (Exception ex)
+                                                            {
+                                                                Log.Warn($"[C] Failed to send reply to client {targetClientEp}: {ex.Message}");
+                                                            }
+                                                        });
+                                                    }
+                                                    else
+                                                    {
+                                                        Log.Warn($"[C] Received reply for unknown ch={chId}!");
+                                                    }
                                                 }
-                                            }
-                                        }
-                                        catch { }
-                                    }, ct);
+                                            };
 
-                                    // 2. 出站循环 (Client -> S/P)
-                                    var outboundTask = Task.Run(async () =>
-                                    {
-                                        try
-                                        {
-                                            while (await channel.Reader.WaitToReadAsync(sessionToken))
+                                            session.OnUdpChannelClosed = (chId) =>
                                             {
-                                                while (channel.Reader.TryRead(out var p))
+                                                if (_udpContexts.TryGetValue(session.SessionId, out var currentCtx))
                                                 {
-                                                    session.UpdateActivity();
-                                                    sendBuf[0] = (byte)MsgType.Data;
-                                                    sessionId.TryWriteBytes(sendBuf.AsSpan(1, 16));
-                                                    p.CopyTo(sendBuf.AsSpan(17));
-                                                    await _udp.SendAsync(sendBuf.AsMemory(0, 17 + p.Length), session.ActiveRemoteEp, sessionToken);
+                                                    lock (currentCtx.Lock)
+                                                    {
+                                                        if (currentCtx.ChannelToClient.Remove(chId, out var cEp))
+                                                        {
+                                                            currentCtx.ClientToChannel.Remove(cEp);
+                                                            currentCtx.ClientLastActive.Remove(cEp);
+                                                            session.DecrementActiveChannel();
+                                                        }
+                                                    }
                                                 }
-                                            }
-                                        }
-                                        catch { }
-                                        finally
-                                        {
-                                            ArrayPool<byte>.Shared.Return(sendBuf);
-                                        }
-                                    }, ct);
+                                            };
 
-                                    await Task.WhenAny(inboundTask, outboundTask);
-                                }
-                                catch (Exception ex)
-                                {
-                                    Log.Debug($"[C] UDP Session {sessionId} error: {ex.Message}");
-                                }
-                                finally
-                                {
-                                    if (_sessions.TryRemove(sessionId, out _))
-                                    {
-                                        Log.Info($"[C] Session {sessionId} closed.");
+                                            _ = Task.Run(async () =>
+                                            {
+                                                int timeoutMs = (rec.Timeout > 0 ? rec.Timeout : (session.ReuseInterval > 0 && session.ReuseInterval < 60 ? session.ReuseInterval : 60)) * 1000;
+                                                int checkInterval = Math.Min(1000, Math.Max(200, timeoutMs / 2));
+                                                while (!session.SessionToken.IsCancellationRequested)
+                                                {
+                                                    await Task.Delay(checkInterval, session.SessionToken).ConfigureAwait(false);
+                                                    if (!_udpContexts.TryGetValue(session.SessionId, out var currentCtx))
+                                                        break;
+                                                    long now = Environment.TickCount64;
+                                                    List<KeyValuePair<EndPoint, uint>> toClose = new();
+                                                    lock (currentCtx.Lock)
+                                                    {
+                                                        var expiredEps = new List<EndPoint>();
+                                                        foreach (var kvp in currentCtx.ClientLastActive)
+                                                        {
+                                                            if (now - kvp.Value > timeoutMs)
+                                                            {
+                                                                expiredEps.Add(kvp.Key);
+                                                            }
+                                                        }
+                                                        foreach (var ep in expiredEps)
+                                                        {
+                                                            currentCtx.ClientLastActive.Remove(ep);
+                                                            if (currentCtx.ClientToChannel.Remove(ep, out uint chId))
+                                                            {
+                                                                currentCtx.ChannelToClient.Remove(chId);
+                                                                session.DecrementActiveChannel();
+                                                                toClose.Add(new KeyValuePair<EndPoint, uint>(ep, chId));
+                                                            }
+                                                        }
+                                                    }
+                                                    foreach (var item in toClose)
+                                                    {
+                                                        _ = session.SendUdpCloseAsync(item.Value, session.SessionToken);
+                                                    }
+                                                }
+                                            }, session.SessionToken);
+                                        }
                                     }
-                                    clientChannelMap.TryRemove(clientEp, out _);
-                                    session?.Dispose();
                                 }
-                            }, ct);
-                        }
 
-                        channel.Writer.TryWrite(packetCopy);
+                                uint channelId;
+                                lock (ctx.Lock)
+                                {
+                                    if (!ctx.ClientToChannel.TryGetValue(clientEp, out channelId))
+                                    {
+                                        channelId = session.AllocateChannelId();
+                                        ctx.ClientToChannel[clientEp] = channelId;
+                                        ctx.ChannelToClient[channelId] = clientEp;
+                                        session.IncrementActiveChannel();
+                                        Log.Info($"[C] Assigned UDP channel {channelId} for client {clientEp} on Session {session.SessionId}");
+                                    }
+                                    ctx.ClientLastActive[clientEp] = Environment.TickCount64;
+                                }
+                                await session.SendUdpDataAsync(channelId, packetCopy, session.SessionToken);
+                            }
+                            catch (Exception ex)
+                            {
+                                Log.Debug($"[C] UDP forward packet error: {ex.Message}");
+                            }
+                        }, ct);
                     }
                     catch (OperationCanceledException) when (ct.IsCancellationRequested)
                     {
@@ -743,6 +548,369 @@ namespace UDRoute
             {
                 ArrayPool<byte>.Shared.Return(poolBuf);
             }
+        }
+
+        private async Task<bool> EnsureRelayActiveAsync(TunnelSession session, ClientRecord rec, string queryName, CancellationToken ct)
+        {
+            if (session.IsClosed) return false;
+
+            if (rec.IsThis && _localProxy != null)
+            {
+                var sInfo = _localProxy.DirectQuery(queryName);
+                if (sInfo == null) return false;
+                // 通知 S 端刷新中继
+                byte[] relayStartBuf = ArrayPool<byte>.Shared.Rent(512);
+                try
+                {
+                    relayStartBuf[0] = (byte)MsgType.RelayStart;
+                    session.SessionId.TryWriteBytes(relayStartBuf.AsSpan(1, 16));
+                    int offset = 17;
+                    offset += ProtocolHelper.WriteString(relayStartBuf.AsSpan(offset), queryName);
+                    offset += ProtocolHelper.WriteIPEndPoint(relayStartBuf.AsSpan(offset), _udp.LocalEndPoint);
+                    bool allowRelay = _localProxy.IsRelayAllowed(sInfo);
+                    bool effectiveForceRelay = rec.ForceRelay && allowRelay;
+                    relayStartBuf[offset++] = (byte)((allowRelay ? 1 : 0) | (effectiveForceRelay ? 2 : 0) | 4);
+                    await _udp.SendAsync(relayStartBuf.AsMemory(0, offset), sInfo.PublicEp, ct);
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(relayStartBuf);
+                }
+                return true;
+            }
+
+            var pEndPoint = session.ProxyEp ?? await ProtocolHelper.ResolveEndPointAsync(rec.TargetServer, Constants.DefaultProxyPort);
+            if (pEndPoint == null) return false;
+
+            var tcs = new TaskCompletionSource<QueryResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _pendingQueries[session.SessionId] = tcs;
+
+            byte[] qBuf = ArrayPool<byte>.Shared.Rent(256);
+            try
+            {
+                qBuf[0] = (byte)MsgType.Query;
+                session.SessionId.TryWriteBytes(qBuf.AsSpan(1, 16));
+                int qLen = 17 + ProtocolHelper.WriteString(qBuf.AsSpan(17), queryName);
+                qBuf[qLen++] = (byte)((rec.ForceRelay ? 1 : 0) | 2); // Bit 0: ForceRelay, Bit 1: IsReuse
+                await _udp.SendAsync(qBuf.AsMemory(0, qLen), pEndPoint, ct);
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(qBuf);
+            }
+
+            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
+
+            try
+            {
+                var resp = await tcs.Task.WaitAsync(linkedCts.Token);
+                return resp.Success && resp.AllowRelay;
+            }
+            catch
+            {
+                _pendingQueries.TryRemove(session.SessionId, out _);
+                return false;
+            }
+        }
+
+        private async Task<TunnelSession?> GetOrCreateTunnelSessionAsync(ClientRecord rec, string queryName, CancellationToken ct, bool forceNew = false)
+        {
+            string tunnelKey = $"{rec.TargetServer}@{queryName}";
+            var sem = _tunnelLocks.GetOrAdd(tunnelKey, _ => new SemaphoreSlim(1, 1));
+            await sem.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                TunnelSession? existing = null;
+                lock (_tunnelStateLock)
+                {
+                    if (!forceNew && _reusableTunnels.TryGetValue(tunnelKey, out existing))
+                    {
+                        if (existing.IsClosed)
+                        {
+                            _reusableTunnels.Remove(tunnelKey);
+                            existing = null;
+                        }
+                    }
+                }
+
+                if (existing != null)
+                {
+                    if (!existing.IsDirect && existing.ActiveChannelCount == 0)
+                    {
+                        bool relayOk = await EnsureRelayActiveAsync(existing, rec, queryName, ct);
+                        if (!relayOk)
+                        {
+                            Log.Warn($"[C] Reused relay tunnel {existing.SessionId} failed to re-activate on P (target server may have restarted or closed). Recreating tunnel...");
+                            lock (_tunnelStateLock)
+                            {
+                                if (_reusableTunnels.TryGetValue(tunnelKey, out var cur) && ReferenceEquals(cur, existing))
+                                {
+                                    _reusableTunnels.Remove(tunnelKey);
+                                }
+                            }
+                            existing.Dispose();
+                            existing = null;
+                        }
+                    }
+
+                    if (existing != null)
+                    {
+                        if (rec.IsTcp)
+                        {
+                            Log.Info($"[C] Reusing active data tunnel {existing.SessionId} for {queryName} on port {rec.Port}");
+                        }
+                        return existing;
+                    }
+                }
+
+                lock (_tunnelStateLock)
+                {
+                    _reusableTunnels.Remove(tunnelKey);
+                }
+
+                var session = await CreateTunnelSessionAsync(rec, queryName, ct).ConfigureAwait(false);
+                if (session != null)
+                {
+                    lock (_tunnelStateLock)
+                    {
+                        if (session.ReuseInterval >= 0)
+                        {
+                            _reusableTunnels[tunnelKey] = session;
+                        }
+                    }
+
+                    _ = session.SessionClosedTask.ContinueWith(t =>
+                    {
+                        lock (_tunnelStateLock)
+                        {
+                            if (_reusableTunnels.TryGetValue(tunnelKey, out var cur) && ReferenceEquals(cur, session))
+                            {
+                                _reusableTunnels.Remove(tunnelKey);
+                            }
+                        }
+                        lock (_sessionLock)
+                        {
+                            if (_sessions.TryGetValue(session.SessionId, out var curS) && ReferenceEquals(curS, session))
+                            {
+                                _sessions.Remove(session.SessionId);
+                                Log.Info($"[C] Session {session.SessionId} closed.");
+                            }
+                        }
+                        _udpContexts.TryRemove(session.SessionId, out _);
+                        session.Dispose();
+                    });
+                }
+                return session;
+            }
+            finally
+            {
+                sem.Release();
+            }
+        }
+
+        private async Task<TunnelSession?> CreateTunnelSessionAsync(ClientRecord rec, string queryName, CancellationToken ct)
+        {
+            Guid sessionId = Guid.NewGuid();
+
+            if (rec.IsThis && _localProxy != null)
+            {
+                var sInfo = _localProxy.DirectQuery(queryName);
+                if (sInfo != null)
+                {
+                    if (sInfo.RequiresPassword && (rec.Password == null || rec.Password.Length == 0))
+                    {
+                        Log.Info($"[C] Password required for {queryName}.");
+                        Console.Write($"Password for {queryName}: ");
+                        string input = ReadPassword();
+                        rec.Password = ManagedSHA256.ComputeHashBytes(System.Text.Encoding.UTF8.GetBytes(input));
+                    }
+
+                    bool allowRelay = _localProxy?.IsRelayAllowed(sInfo) ?? true;
+                    bool effectiveForceRelay = rec.ForceRelay && allowRelay;
+                    if (!allowRelay && rec.ForceRelay)
+                    {
+                        Log.Info($"[C] AllowRelay is false for {queryName}, ignoring ForceRelay.");
+                    }
+
+                    // 通知 S 端发起准备与打洞 (RelayStart)
+                    byte[] relayStartBuf = ArrayPool<byte>.Shared.Rent(512);
+                    try
+                    {
+                        relayStartBuf[0] = (byte)MsgType.RelayStart;
+                        sessionId.TryWriteBytes(relayStartBuf.AsSpan(1, 16));
+                        int offset = 17;
+                        offset += ProtocolHelper.WriteString(relayStartBuf.AsSpan(offset), queryName);
+                        offset += ProtocolHelper.WriteIPEndPoint(relayStartBuf.AsSpan(offset), _udp.LocalEndPoint);
+                        relayStartBuf[offset++] = (byte)((allowRelay ? 1 : 0) | (effectiveForceRelay ? 2 : 0));
+                        await _udp.SendAsync(relayStartBuf.AsMemory(0, offset), sInfo.PublicEp, ct);
+                    }
+                    finally
+                    {
+                        ArrayPool<byte>.Shared.Return(relayStartBuf);
+                    }
+
+                    var session = new TunnelSession(_udp, sInfo.PublicEp, sessionId, rec.Mtu, rec.IsTcp, sInfo.KcpConfig, sInfo.Timeout, sInfo.TunnelReuseInterval);
+                    session.ChannelDesc = rec.Port.ToString();
+                    session.ForceRelay = effectiveForceRelay;
+                    lock (_sessionLock)
+                    {
+                        _sessions[sessionId] = session;
+                    }
+
+                    if (rec.Password != null)
+                    {
+                        bool authOk = await session.AuthenticateClientAsync(rec.Password, sInfo.STimestamp, sInfo.PRecvTimeTicks, ct);
+                        if (!authOk)
+                        {
+                            Log.Warn($"[C] Auth failed for session {sessionId}");
+                            lock (_sessionLock)
+                            {
+                                if (_sessions.TryGetValue(sessionId, out var cur) && ReferenceEquals(cur, session))
+                                {
+                                    _sessions.Remove(sessionId);
+                                }
+                            }
+                            session.Dispose();
+                            return null;
+                        }
+                    }
+
+                    return session;
+                }
+                else
+                {
+                    Log.Warn($"[C] DirectQuery failed for {queryName}");
+                    return null;
+                }
+            }
+
+            // 常规模式: 向 P 发起 Query (UDP)
+            var pEndPoint = await ProtocolHelper.ResolveEndPointAsync(rec.TargetServer, Constants.DefaultProxyPort);
+            if (pEndPoint == null)
+            {
+                Log.Error($"[C] Failed to resolve P server: {rec.TargetServer}");
+                return null;
+            }
+
+            var tcs = new TaskCompletionSource<QueryResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _pendingQueries[sessionId] = tcs;
+
+            byte[] qBuf = ArrayPool<byte>.Shared.Rent(256);
+            try
+            {
+                qBuf[0] = (byte)MsgType.Query;
+                sessionId.TryWriteBytes(qBuf.AsSpan(1, 16));
+                int qLen = 17 + ProtocolHelper.WriteString(qBuf.AsSpan(17), queryName);
+                qBuf[qLen++] = (byte)(rec.ForceRelay ? 1 : 0);
+                await _udp.SendAsync(qBuf.AsMemory(0, qLen), pEndPoint, ct);
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(qBuf);
+            }
+
+            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
+
+            QueryResponse resp;
+            try
+            {
+                resp = await tcs.Task.WaitAsync(linkedCts.Token);
+            }
+            catch
+            {
+                _pendingQueries.TryRemove(sessionId, out _);
+                Log.Warn($"[C] Query timeout for session {sessionId}");
+                return null;
+            }
+
+            if (!resp.Success)
+            {
+                Log.Warn($"[C] P returned NotFound for {queryName}");
+                return null;
+            }
+
+            if (resp.RequiresPassword && (rec.Password == null || rec.Password.Length == 0))
+            {
+                Log.Info($"[C] Password required for {queryName}.");
+                Console.Write($"Password for {queryName}: ");
+                string input = ReadPassword();
+                rec.Password = ManagedSHA256.ComputeHashBytes(System.Text.Encoding.UTF8.GetBytes(input));
+            }
+
+            TunnelSession tunnelSession;
+            if (!resp.AllowRelay)
+            {
+                if (rec.ForceRelay)
+                {
+                    Log.Info($"[C] Server/Proxy does not allow relay (AllowRelay=false) for {queryName}, ignoring ForceRelay.");
+                }
+                Log.Info($"[C] P relay not allowed for {queryName}. Waiting for UDP punch before starting tunnel...");
+                tunnelSession = new TunnelSession(_udp, resp.ServerPublicEp, sessionId, rec.Mtu, rec.IsTcp, resp.KcpConfig, resp.Timeout, resp.TunnelReuseInterval);
+                tunnelSession.ChannelDesc = rec.Port.ToString();
+                tunnelSession.ForceRelay = false;
+                lock (_sessionLock)
+                {
+                    _sessions[sessionId] = tunnelSession;
+                }
+
+                bool punchSuccess = await StartPunchingAsync(tunnelSession, resp.DevId, resp.ServerPublicEp, resp.ServerWanPort, resp.LocalEps, ct);
+                if (!punchSuccess)
+                {
+                    Log.Warn($"[C] P relay is disabled and UDP punch timed out for session {sessionId}.");
+                    lock (_sessionLock)
+                    {
+                        if (_sessions.TryGetValue(sessionId, out var cur) && ReferenceEquals(cur, tunnelSession))
+                        {
+                            _sessions.Remove(sessionId);
+                        }
+                    }
+                    tunnelSession.Dispose();
+                    return null;
+                }
+            }
+            else
+            {
+                tunnelSession = new TunnelSession(_udp, pEndPoint, sessionId, rec.Mtu, rec.IsTcp, resp.KcpConfig, resp.Timeout, resp.TunnelReuseInterval);
+                tunnelSession.ChannelDesc = rec.Port.ToString();
+                bool isForceRelay = rec.ForceRelay;
+                tunnelSession.ForceRelay = isForceRelay;
+                tunnelSession.ProxyEp = pEndPoint;
+                lock (_sessionLock)
+                {
+                    _sessions[sessionId] = tunnelSession;
+                }
+
+                if (!isForceRelay)
+                {
+                    _ = StartPunchingAsync(tunnelSession, resp.DevId, resp.ServerPublicEp, resp.ServerWanPort, resp.LocalEps, ct);
+                }
+                else
+                {
+                    Log.Info($"[C] ForceRelay is enabled for session {sessionId}, skipping UDP punch.");
+                }
+            }
+
+            if (rec.Password != null)
+            {
+                bool authOk = await tunnelSession.AuthenticateClientAsync(rec.Password, resp.STimestamp, DateTime.UtcNow.Ticks, ct);
+                if (!authOk)
+                {
+                    Log.Warn($"[C] Auth failed for session {sessionId}");
+                    lock (_sessionLock)
+                    {
+                        if (_sessions.TryGetValue(sessionId, out var cur) && ReferenceEquals(cur, tunnelSession))
+                        {
+                            _sessions.Remove(sessionId);
+                        }
+                    }
+                    tunnelSession.Dispose();
+                    return null;
+                }
+            }
+
+            return tunnelSession;
         }
 
         private string ReadPassword()
@@ -765,6 +933,6 @@ namespace UDRoute
             return pass;
         }
 
-        private record QueryResponse(bool Success, Guid DevId, IPEndPoint ServerPublicEp, int ServerWanPort, int Timeout, long STimestamp, bool RequiresPassword, KcpConfig? KcpConfig, List<IPEndPoint> LocalEps, bool AllowRelay = true);
+        private record QueryResponse(bool Success, Guid DevId, IPEndPoint ServerPublicEp, int ServerWanPort, int Timeout, long STimestamp, bool RequiresPassword, KcpConfig? KcpConfig, List<IPEndPoint> LocalEps, bool AllowRelay = true, int TunnelReuseInterval = Constants.DefaultTunnelReuseInterval);
     }
 }

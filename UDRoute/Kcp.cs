@@ -184,6 +184,7 @@ namespace UDRoute
                 bool isStream = _stream;
                 int count = 0;
                 int offset = 0;
+                bool recover = _rcvQueue.Count >= _rcvWnd;
 
                 for (int i = 0; i < _rcvQueue.Count; i++)
                 {
@@ -213,6 +214,12 @@ namespace UDRoute
                     {
                         break;
                     }
+                }
+
+                // fast recover: 腾出空间后立即标记通知对端最新可用窗口
+                if (recover && _rcvQueue.Count < _rcvWnd)
+                {
+                    _probe |= IKCP_ASK_TELL;
                 }
 
                 return offset;
@@ -394,7 +401,7 @@ namespace UDRoute
 
             int n = _rcvBuf.Count;
             int repeat = 0;
-            int insertIdx = n;
+            int insertIdx = 0;
 
             for (int i = n - 1; i >= 0; i--)
             {

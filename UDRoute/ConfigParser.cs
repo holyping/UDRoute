@@ -34,7 +34,20 @@ namespace UDRoute
                 config.ConfigPath = Path.GetFullPath(iniPath);
             }
 
+            if (args.Any(a => a.Equals("-forcerelay", StringComparison.OrdinalIgnoreCase)))
+            {
+                config.ForceRelay = true;
+            }
+
             ParseCommandLine(args, config);
+
+            if (config.ForceRelay)
+            {
+                foreach (var r in config.ClientRecords)
+                {
+                    r.ForceRelay = true;
+                }
+            }
 
             // 处理命令行参数中的 -log
             for (int i = 0; i < args.Length; i++)
@@ -84,6 +97,8 @@ namespace UDRoute
             int currentRegInterval = Constants.DefaultRegInterval;
             var currentKcpConfig = new KcpConfig();
             int timeout = Constants.DefaultTimeout;
+            int currentTunnelReuseInterval = cfg.TunnelReuseInterval;
+            bool currentAllowRelay = true;
             bool missingDevId = !lines.Any(l => l.TrimStart().StartsWith("devid", StringComparison.OrdinalIgnoreCase));
             bool configModified = missingDevId;
             ServerRecord? sRec = null;
@@ -115,6 +130,8 @@ namespace UDRoute
                         RegInterval = currentRegInterval,
                         Mtu = currentMtu,
                         Timeout = timeout,
+                        TunnelReuseInterval = currentTunnelReuseInterval,
+                        AllowRelay = currentAllowRelay,
                         KcpConfig = currentKcpConfig.Clone()
                     });
                     continue;
@@ -140,6 +157,10 @@ namespace UDRoute
                         case "regtimeout": cfg.RegTimeout = int.Parse(val); cfg.EnableProxy = true; break;
                         case "reginterval": currentRegInterval = int.Parse(val); break;
                         case "timeout": timeout = int.Parse(val); break;
+                        case "tunnelreuseinterval" or "tunnelreuse":
+                            currentTunnelReuseInterval = int.Parse(val);
+                            cfg.TunnelReuseInterval = currentTunnelReuseInterval;
+                            break;
                         case "loglevel":
                             cfg.LogLevel = val.ToLower() switch
                             {
@@ -171,13 +192,17 @@ namespace UDRoute
                                 _ => AuthMode.None
                             };
                             break;
-                        case "allowunauthrelay" or "allowanonymousrelay" or "allowrelay":
+                        case "allowunauthrelay" or "allowanonymousrelay":
                             cfg.AllowUnauthRelay = val.ToLower() switch
                             {
                                 "allow" or "true" or "1" or "yes" => AllowUnauthRelay.Allow,
                                 "deny" or "false" or "0" or "no" => AllowUnauthRelay.Deny,
                                 _ => AllowUnauthRelay.Default
                             };
+                            break;
+                        case "allowrelay":
+                            currentAllowRelay = val == "1" || val.Equals("true", StringComparison.OrdinalIgnoreCase) || val.Equals("allow", StringComparison.OrdinalIgnoreCase);
+                            cfg.AllowUnauthRelay = currentAllowRelay ? AllowUnauthRelay.Allow : AllowUnauthRelay.Deny;
                             break;
                         case "maxunauthnamesperuser" or "maxunauthnames" or "maxunauthperuser": cfg.MaxUnauthNamesPerUser = int.Parse(val); break;
                         case "maxunauthnamestotal" or "maxtotalunauthnames": cfg.MaxUnauthNamesTotal = int.Parse(val); break;
@@ -207,7 +232,9 @@ namespace UDRoute
                         case "kcpnc": currentKcpConfig.Nc = int.Parse(val); break;
                         case "kcpsndwnd": currentKcpConfig.SndWnd = int.Parse(val); break;
                         case "kcprcvwnd": currentKcpConfig.RcvWnd = int.Parse(val); break;
-                        case "forcerelay": cfg.ForceRelay = val == "1" || val.Equals("true", StringComparison.OrdinalIgnoreCase); break;
+                        case "forcerelay":
+                            cfg.ForceRelay = val == "1" || val.Equals("true", StringComparison.OrdinalIgnoreCase);
+                            break;
                         default:
                             // 解析C模式：15389/tcp=rdp@www.pserver.com
                             if (char.IsDigit(key[0]))
@@ -234,6 +261,8 @@ namespace UDRoute
                             break;
                         case "mtu": sRec.Mtu = int.Parse(val); break;
                         case "reginterval": sRec.RegInterval = int.Parse(val); break;
+                        case "tunnelreuseinterval" or "tunnelreuse": sRec.TunnelReuseInterval = int.Parse(val); break;
+                        case "allowrelay": sRec.AllowRelay = val == "1" || val.Equals("true", StringComparison.OrdinalIgnoreCase); break;
                         case "readonly": sRec.ReadOnly = val == "1" || val.Equals("true", StringComparison.OrdinalIgnoreCase); break;
                         case "kcp": sRec.KcpConfig.SetProfile(val); break;
                         case "kcpnodelay": sRec.KcpConfig.NoDelay = val == "1" || bool.Parse(val); break;
@@ -282,6 +311,10 @@ namespace UDRoute
             if (cfg.ServerRecords.Count == 0 && cfg.ClientRecords.Count == 0)
             {
                 cfg.EnableProxy = true;
+            }
+            foreach (var r in cfg.ClientRecords)
+            {
+                r.ForceRelay = cfg.ForceRelay;
             }
 
             foreach (var item in cfg.ServerRecords)
