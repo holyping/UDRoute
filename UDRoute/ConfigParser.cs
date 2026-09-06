@@ -155,6 +155,12 @@ namespace UDRoute
                         case "devname": cfg.DevName = val; break;
                         case "devid": cfg.DevId = Guid.Parse(val); break;
                         case "regtimeout": cfg.RegTimeout = int.Parse(val); cfg.EnableProxy = true; break;
+                        case "idlethreshold" or "tunnelidle": cfg.IdleThreshold = int.Parse(val); cfg.EnableProxy = true; break;
+                        case "probetimeout" or "handshaketimeout": cfg.ProbeTimeout = int.Parse(val); cfg.EnableProxy = true; break;
+                        case "maxrecentrequests" or "maxsize":
+                            int parsedMaxRecent = int.Parse(val);
+                            cfg.MaxRecentRequests = parsedMaxRecent < Constants.MinMaxRecentRequests ? Constants.MinMaxRecentRequests : parsedMaxRecent;
+                            break;
                         case "reginterval": currentRegInterval = int.Parse(val); break;
                         case "timeout": timeout = int.Parse(val); break;
                         case "tunnelreuseinterval" or "tunnelreuse":

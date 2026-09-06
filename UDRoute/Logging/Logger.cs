@@ -34,7 +34,11 @@ namespace UDRoute.Logging
         public void Write(LogLevel level, string message)
         {
             if (!IsEnabled(level)) return;
-            WriteCore(level, message);
+            try
+            {
+                WriteCore(level, message);
+            }
+            catch { }
         }
 
         protected abstract void WriteCore(LogLevel level, string message);

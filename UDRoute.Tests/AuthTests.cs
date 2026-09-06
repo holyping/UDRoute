@@ -139,17 +139,18 @@ public class AuthTests : IDisposable
     // ProxyMode Registration & Auth Level Tests
     // =========================================================================
 
-    private byte[] BuildRegisterPacket(string serviceName, bool isTcp, string devName, Guid devId, string? username, string? password)
+    private byte[] BuildRegisterPacket(string serviceName, bool isTcp, string devName, Guid devId, string? username, string? password, ushort contextId = 1)
     {
         byte[] buffer = new byte[1024];
         buffer[0] = (byte)MsgType.Register;
-        devId.TryWriteBytes(buffer.AsSpan(1, 16));
-        BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(17, 4), 0); // WanPort
-        buffer[21] = (byte)(isTcp ? 1 : 0);
-        BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(22, 4), 300); // Timeout
-        BinaryPrimitives.WriteInt64LittleEndian(buffer.AsSpan(26, 8), DateTime.UtcNow.Ticks); // Timestamp
-        buffer[34] = 0; // ReqPass
-        int offset = 35;
+        BinaryPrimitives.WriteUInt16LittleEndian(buffer.AsSpan(1, 2), contextId);
+        devId.TryWriteBytes(buffer.AsSpan(3, 16));
+        BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(19, 4), 0); // WanPort
+        buffer[23] = (byte)(isTcp ? 1 : 0);
+        BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(24, 4), 300); // Timeout
+        BinaryPrimitives.WriteInt64LittleEndian(buffer.AsSpan(28, 8), DateTime.UtcNow.Ticks); // Timestamp
+        buffer[36] = 0; // ReqPass
+        int offset = 37;
         offset += ProtocolHelper.WriteKcpConfig(buffer.AsSpan(offset), new KcpConfig());
         offset += ProtocolHelper.WriteString(buffer.AsSpan(offset), serviceName);
         offset += ProtocolHelper.WriteString(buffer.AsSpan(offset), devName);

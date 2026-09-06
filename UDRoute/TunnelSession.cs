@@ -637,15 +637,10 @@ namespace UDRoute
                 case ChannelCmd.Open:
                     if (OnIncomingChannel != null)
                     {
-                        bool newlyAdded = false;
-                        _tcpChannels.GetOrAdd(channelId, _ =>
+                        var newCh = Channel.CreateUnbounded<byte[]>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
+                        if (_tcpChannels.TryAdd(channelId, newCh))
                         {
-                            newlyAdded = true;
                             IncrementActiveChannel();
-                            return Channel.CreateUnbounded<byte[]>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
-                        });
-                        if (newlyAdded)
-                        {
                             _ = Task.Run(() => OnIncomingChannel(channelId));
                         }
                     }

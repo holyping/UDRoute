@@ -29,12 +29,17 @@ namespace UDRoute
             }
         }
         private readonly ConcurrentDictionary<Guid, TaskCompletionSource<IPEndPoint>> _pendingEchoes = new();
+        private int _contextCounter;
+        private readonly ConcurrentDictionary<ushort, TaskCompletionSource<(bool Success, string Reason)>> _pendingRegistrations = new();
+        private readonly TemporyDictionary<Guid, (ushort ContextId, byte Status)> _recentRelayStarts;
+        private readonly object _recentRelayStartsLock = new();
 
         public ServerMode(AppConfig config, ZeroCopyUdpSocket udp, ProxyMode? localProxy)
         {
             _config = config;
             _udp = udp;
             _localProxy = localProxy;
+            _recentRelayStarts = new TemporyDictionary<Guid, (ushort ContextId, byte Status)>(_config.MaxRecentRequests);
         }
 
         public List<ServerStatusInfo> GetStatusInfo()
@@ -191,16 +196,20 @@ namespace UDRoute
                             }
                         }
 
-                        // 构造注册包: [MsgType 1][DevId 16][WanPort 4][IsTcp 1][Timeout 4][Timestamp 8][ReqPass 1][KcpConfig 21][Name string][Suffix string][LocalEps...]
+                        ushort regContextId = (ushort)Interlocked.Increment(ref _contextCounter);
+                        if (regContextId == 0) regContextId = (ushort)Interlocked.Increment(ref _contextCounter);
+
+                        // 构造注册包: [MsgType 1][ContextId 2][DevId 16][WanPort 4][IsTcp 1][Timeout 4][Timestamp 8][ReqPass 1][KcpConfig 21][Name string][Suffix string][LocalEps...]
                         buffer[0] = (byte)MsgType.Register;
-                        _config.DevId.TryWriteBytes(buffer.AsSpan(1, 16));
-                        BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(17, 4), _config.WanPort);
-                        buffer[21] = (byte)(rec.IsTcp ? 1 : 0);
-                        BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(22, 4), rec.Timeout);
-                        BinaryPrimitives.WriteInt64LittleEndian(buffer.AsSpan(26, 8), DateTime.UtcNow.Ticks);
+                        BinaryPrimitives.WriteUInt16LittleEndian(buffer.AsSpan(1, 2), regContextId);
+                        _config.DevId.TryWriteBytes(buffer.AsSpan(3, 16));
+                        BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(19, 4), _config.WanPort);
+                        buffer[23] = (byte)(rec.IsTcp ? 1 : 0);
+                        BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(24, 4), rec.Timeout);
+                        BinaryPrimitives.WriteInt64LittleEndian(buffer.AsSpan(28, 8), DateTime.UtcNow.Ticks);
                         bool reqPass = rec.Password != null && rec.Password.Length > 0;
-                        buffer[34] = (byte)(reqPass ? 1 : 0);
-                        int offset = 35;
+                        buffer[36] = (byte)(reqPass ? 1 : 0);
+                        int offset = 37;
                         offset += ProtocolHelper.WriteKcpConfig(buffer.AsSpan(offset), rec.KcpConfig);
                         offset += ProtocolHelper.WriteString(buffer.AsSpan(offset), rec.Name);
                         offset += ProtocolHelper.WriteString(buffer.AsSpan(offset), _config.DevName);
@@ -242,10 +251,42 @@ namespace UDRoute
                         buffer[offset++] = (byte)(rec.AllowRelay ? 1 : 0);
 
                         string proto = rec.IsTcp ? "tcp" : "udp";
-                        // Now we just send the register to the first resolved P endpoint (e.g., IPv4)
                         var primaryPEp = pEndPoints[0];
-                        await _udp.SendAsync(buffer.AsMemory(0, offset), primaryPEp, ct);
-                        Log.Info($"[S] Registered service '{rec.Name}/{proto}' with P ({primaryPEp}) + {epCount} IPs");
+                        byte[] regCopy = buffer.AsSpan(0, offset).ToArray();
+
+                        var regTcs = new TaskCompletionSource<(bool Success, string Reason)>(TaskCreationOptions.RunContinuationsAsynchronously);
+                        _pendingRegistrations[regContextId] = regTcs;
+
+                        _ = ProtocolHelper.SendWithRetryAsync(_udp, regCopy, primaryPEp, regTcs.Task, ct);
+
+                        using var waitTimeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(Math.Min(10, Constants.DefaultProbeTimeout + 2)));
+                        using var linkedWaitCts = CancellationTokenSource.CreateLinkedTokenSource(ct, waitTimeoutCts.Token);
+
+                        bool regSuccess = false;
+                        string regReason = "";
+                        try
+                        {
+                            var (success, reason) = await regTcs.Task.WaitAsync(linkedWaitCts.Token);
+                            regSuccess = success;
+                            regReason = reason;
+                        }
+                        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                        {
+                            regReason = "Timeout waiting for proxy ACK";
+                        }
+                        finally
+                        {
+                            _pendingRegistrations.TryRemove(regContextId, out _);
+                        }
+
+                        if (regSuccess)
+                        {
+                            Log.Info($"[S] Registered service '{rec.Name}/{proto}' with P ({primaryPEp}) + {epCount} IPs");
+                        }
+                        else
+                        {
+                            Log.Warn($"[S] Failed to register service '{rec.Name}/{proto}' with P ({primaryPEp}): {regReason}");
+                        }
                     }
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -279,14 +320,33 @@ namespace UDRoute
             }
         }
 
+        public void ProcessRegisterAck(ReadOnlySpan<byte> data, EndPoint remoteEp)
+        {
+            // [MsgType 1 = 9][ContextId 2][Status 1][Reason string (optional)]
+            if (data.Length < 4) return;
+            ushort contextId = BinaryPrimitives.ReadUInt16LittleEndian(data.Slice(1, 2));
+            byte status = data[3];
+            string reason = "";
+            if (data.Length > 4)
+            {
+                (reason, _) = ProtocolHelper.ReadString(data.Slice(4));
+            }
+
+            if (_pendingRegistrations.TryRemove(contextId, out var tcs))
+            {
+                tcs.TrySetResult((status == 1, reason));
+            }
+        }
+
         public async ValueTask ProcessRelayStartAsync(ReadOnlyMemory<byte> packetMem, EndPoint remoteEp, CancellationToken ct)
         {
             var data = packetMem.Span;
-            // [MsgType 1][SessionId 16][TargetName string][ClientPublicEp][AllowRelay 1]
-            if (data.Length < 21) return;
+            // [MsgType 1][ContextId 2][SessionId 16][TargetName string][ClientPublicEp][Flags 1]
+            if (data.Length < 23) return;
 
-            Guid sessionId = new Guid(data.Slice(1, 16));
-            int offset = 17;
+            ushort contextId = BinaryPrimitives.ReadUInt16LittleEndian(data.Slice(1, 2));
+            Guid sessionId = new Guid(data.Slice(3, 16));
+            int offset = 19;
             var (targetName, nLen) = ProtocolHelper.ReadString(data.Slice(offset));
             offset += nLen;
             var (cPublicEp, epLen) = ProtocolHelper.ReadIPEndPoint(data.Slice(offset));
@@ -297,8 +357,6 @@ namespace UDRoute
             bool isReuse = (data[offset] & 4) != 0;
             offset++;
 
-            Log.Info($"[S] RelayStart: Session {sessionId} for '{targetName}', Client: {cPublicEp}, AllowRelay: {allowRelay}, ClientForceRelay: {clientForceRelay}, IsReuse: {isReuse}");
-
             var rec = _config.ServerRecords.FirstOrDefault(r =>
             {
                 string proto = r.IsTcp ? "tcp" : "udp";
@@ -308,8 +366,27 @@ namespace UDRoute
                     || string.Equals(targetName, r.Name, StringComparison.OrdinalIgnoreCase);
             });
 
+            byte ackStatus = (byte)(rec != null ? 1 : 0);
+
+            if (contextId != 0)
+            {
+                lock (_recentRelayStartsLock)
+                {
+                    if (_recentRelayStarts.TryGetValue(sessionId, out var seen) && seen.ContextId == contextId)
+                    {
+                        // 重复握手请求（Burst 3x 重发包）：重送 RelayStartAck 并直接返回
+                        SendRelayStartAck(contextId, sessionId, remoteEp, seen.Status);
+                        return;
+                    }
+                    _recentRelayStarts[sessionId] = (contextId, ackStatus);
+                }
+            }
+
+            Log.Info($"[S] RelayStart: Session {sessionId}, Context: {contextId} for '{targetName}', Client: {cPublicEp}, AllowRelay: {allowRelay}, ClientForceRelay: {clientForceRelay}, IsReuse: {isReuse}");
+
             if (rec != null)
             {
+                SendRelayStartAck(contextId, sessionId, remoteEp, 1);
                 if (!rec.AllowRelay)
                 {
                     allowRelay = false;
@@ -496,6 +573,22 @@ namespace UDRoute
                     }
                 }
             }
+            else
+            {
+                SendRelayStartAck(contextId, sessionId, remoteEp, 0);
+            }
+        }
+
+        private void SendRelayStartAck(ushort contextId, Guid sessionId, EndPoint remoteEp, byte status)
+        {
+            if (contextId == 0) return;
+            byte[] ack = new byte[20];
+            ack[0] = (byte)MsgType.RelayStartAck;
+            BinaryPrimitives.WriteUInt16LittleEndian(ack.AsSpan(1, 2), contextId);
+            sessionId.TryWriteBytes(ack.AsSpan(3, 16));
+            ack[19] = status;
+
+            try { _ = _udp.SendAsync(ack, remoteEp, default); } catch { }
         }
 
         private class UdpChannelEntry
@@ -661,11 +754,12 @@ namespace UDRoute
                 if (status == 2)
                 {
                     // 回送打洞确认，避免死循环 ping-pong
-                    byte[] ackBuf = new byte[34];
+                    byte[] ackBuf = new byte[36];
                     ackBuf[0] = (byte)MsgType.Punch;
-                    sessionId.TryWriteBytes(ackBuf.AsSpan(1, 16));
-                    _config.DevId.TryWriteBytes(ackBuf.AsSpan(17, 16));
-                    ackBuf[33] = 3; // Punch ACK
+                    BinaryPrimitives.WriteUInt16LittleEndian(ackBuf.AsSpan(1, 2), 0);
+                    sessionId.TryWriteBytes(ackBuf.AsSpan(3, 16));
+                    _config.DevId.TryWriteBytes(ackBuf.AsSpan(19, 16));
+                    ackBuf[35] = 3; // Punch ACK
                     await _udp.SendAsync(ackBuf, remoteEp, ct);
                 }
                 else if (status == 3)
@@ -792,11 +886,12 @@ namespace UDRoute
 
         private async Task<bool> StartPunchingAsync(TunnelSession session, IPEndPoint cPublicEp, CancellationToken ct)
         {
-            byte[] punchBuf = new byte[34];
+            byte[] punchBuf = new byte[36];
             punchBuf[0] = (byte)MsgType.Punch;
-            session.SessionId.TryWriteBytes(punchBuf.AsSpan(1, 16));
-            _config.DevId.TryWriteBytes(punchBuf.AsSpan(17, 16));
-            punchBuf[33] = 2; // Direct Punch
+            BinaryPrimitives.WriteUInt16LittleEndian(punchBuf.AsSpan(1, 2), 0);
+            session.SessionId.TryWriteBytes(punchBuf.AsSpan(3, 16));
+            _config.DevId.TryWriteBytes(punchBuf.AsSpan(19, 16));
+            punchBuf[35] = 2; // Direct Punch
 
             var candidates = new List<IPEndPoint> { cPublicEp };
 

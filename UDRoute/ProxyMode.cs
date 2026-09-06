@@ -22,7 +22,7 @@ namespace UDRoute
 
         // 追踪非鉴权用户（按 DevId）注册的 distinct service name 集合 (如 "rdp/tcp")
         private readonly ConcurrentDictionary<Guid, HashSet<string>> _unauthDevServices = new();
-        private readonly object _unauthLock = new();
+        private readonly object _routingLock = new();
 
         // SessionId -> Relay Session (ClientEp <-> ServerEp)
         private readonly Dictionary<Guid, RelaySession> _relaySessions = new();
@@ -31,12 +31,20 @@ namespace UDRoute
         private readonly object _relayLock = new();
         private readonly AuthManager _authManager;
 
+        private int _contextCounter;
+        private readonly ConcurrentDictionary<ushort, TaskCompletionSource<bool>> _pendingProbes = new();
+        private readonly Dictionary<Guid, Guid> _migratedSessions = new();
+        private readonly TemporyDictionary<(Guid SessionId, ushort ContextId), byte[]> _recentQueryResponses;
+        private readonly Dictionary<(Guid SessionId, ushort ContextId), Task> _inFlightQueries = new();
+        private readonly object _queryLock = new();
+
         public int Port => (_udp.LocalEndPoint is IPEndPoint ip) ? ip.Port : (_config.Port > 0 ? _config.Port : Constants.DefaultProxyPort);
 
         public ProxyMode(AppConfig config, ZeroCopyUdpSocket udp)
         {
             _config = config;
             _udp = udp;
+            _recentQueryResponses = new TemporyDictionary<(Guid SessionId, ushort ContextId), byte[]>(_config.MaxRecentRequests);
             _authManager = new AuthManager(config.ConfigPath, config.AuthFile);
             _authManager.Start();
         }
@@ -85,19 +93,20 @@ namespace UDRoute
 
         public void ProcessRegister(ReadOnlySpan<byte> data, EndPoint remoteEp)
         {
-            // 解析 S 端的注册包: [MsgType 1][DevId 16][WanPort 4][IsTcp 1][Timeout 4][Timestamp 8][ReqPass 1][KcpConfig 21][NameString][SuffixString][LocalEps...][User][Pass]
-            if (data.Length < 56) return;
+            // 解析 S 端的注册包: [MsgType 1][ContextId 2][DevId 16][WanPort 4][IsTcp 1][Timeout 4][Timestamp 8][ReqPass 1][KcpConfig 21][NameString][SuffixString][LocalEps...][User][Pass]
+            if (data.Length < 58) return;
 
-            Guid devId = new Guid(data.Slice(1, 16));
-            int wanPort = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(17, 4));
-            bool isTcp = data[21] != 0;
+            ushort contextId = BinaryPrimitives.ReadUInt16LittleEndian(data.Slice(1, 2));
+            Guid devId = new Guid(data.Slice(3, 16));
+            int wanPort = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(19, 4));
+            bool isTcp = data[23] != 0;
             string proto = isTcp ? "tcp" : "udp";
-            int timeout = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(22, 4));
-            long sTimestamp = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(26, 8));
-            bool reqPass = data[34] != 0;
+            int timeout = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(24, 4));
+            long sTimestamp = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(28, 8));
+            bool reqPass = data[36] != 0;
 
-            var (kcpConfig, kLen) = ProtocolHelper.ReadKcpConfig(data.Slice(35));
-            int offset = 35 + kLen;
+            var (kcpConfig, kLen) = ProtocolHelper.ReadKcpConfig(data.Slice(37));
+            int offset = 37 + kLen;
 
             var (name, nLen) = ProtocolHelper.ReadString(data.Slice(offset));
             offset += nLen;
@@ -152,13 +161,15 @@ namespace UDRoute
             {
                 if (!providedAuth)
                 {
-                    RejectAuth(remoteEp, "No credentials provided in Strict mode");
+                    SendRegisterAck(remoteEp, contextId, 0, "No credentials provided in Strict mode");
+                    Log.Warn($"[P] 鉴权失败，拒绝 {remoteEp} 的注册: No credentials provided in Strict mode");
                     return;
                 }
                 var (success, reason) = _authManager.Authenticate(username, password);
                 if (!success)
                 {
-                    RejectAuth(remoteEp, reason);
+                    SendRegisterAck(remoteEp, contextId, 0, reason);
+                    Log.Warn($"[P] 鉴权失败，拒绝 {remoteEp} 的注册: {reason}");
                     return;
                 }
                 isAuthenticated = true;
@@ -170,7 +181,8 @@ namespace UDRoute
                     var (success, reason) = _authManager.Authenticate(username, password);
                     if (!success)
                     {
-                        RejectAuth(remoteEp, reason); // 鉴权失败直接拒绝
+                        SendRegisterAck(remoteEp, contextId, 0, reason);
+                        Log.Warn($"[P] 鉴权失败，拒绝 {remoteEp} 的注册: {reason}");
                         return;
                     }
                     isAuthenticated = true;
@@ -215,30 +227,41 @@ namespace UDRoute
 
             if (isAuthenticated)
             {
-                // 鉴权用户防覆盖检查：已被其他鉴权用户占用的不能抢占
-                if (!CanOverwriteAuth(key1, username, remoteEp)) return;
+                lock (_routingLock)
+                {
+                    // 鉴权用户防覆盖检查：已被其他鉴权用户占用的不能抢占
+                    if (!CanOverwriteAuth(key1, username, remoteEp, contextId))
+                    {
+                        SendRegisterAck(remoteEp, contextId, 0, "权限不足");
+                        Log.Trace($"[P] 鉴权失败，拒绝 {remoteEp} 的注册: 权限不足");
+                        return;
+                    }
 
-                _authRoutingTable[key1] = info;
-                _authRoutingTable[key2] = info;
-                if (key3 != null) _authRoutingTable[key3] = info;
+                    _authRoutingTable[key1] = info;
+                    _authRoutingTable[key2] = info;
+                    if (key3 != null) _authRoutingTable[key3] = info;
 
-                // 鉴权用户凌驾于非鉴权用户之上：若非鉴权表中存在同名主 key，将其收回移除
-                _unauthRoutingTable.TryRemove(key1, out _);
+                    // 鉴权用户凌驾于非鉴权用户之上：若非鉴权表中存在同名主 key，将其收回移除
+                    _unauthRoutingTable.TryRemove(key1, out _);
+                }
 
+                SendRegisterAck(remoteEp, contextId, 1);
                 Log.Info($"[P] S Registered (Auth): {name}/{proto} (User: {username}, Suffix: {suffix}) from {remoteEp}");
             }
             else
             {
                 // 非鉴权用户注册逻辑
-                // 1. 鉴权用户的注册凌驾于非鉴权用户之上：如果鉴权字典中已存在主 key，非鉴权用户严禁注册覆盖
-                if (_authRoutingTable.ContainsKey(key1))
+                lock (_routingLock)
                 {
-                    RejectRegistration(remoteEp, $"{key1} 已被鉴权用户占用，未鉴权用户不能注册或覆盖。");
-                    return;
-                }
+                    // 1. 鉴权用户的注册凌驾于非鉴权用户之上：如果鉴权字典中已存在主 key，非鉴权用户严禁注册覆盖
+                    if (_authRoutingTable.ContainsKey(key1))
+                    {
+                        string reason = $"{key1} 已被鉴权用户占用，未鉴权用户不能注册或覆盖。";
+                        SendRegisterAck(remoteEp, contextId, 0, reason);
+                        Log.Warn($"[P] 拒绝注册: {reason}");
+                        return;
+                    }
 
-                lock (_unauthLock)
-                {
                     bool isRenewal = _unauthDevServices.TryGetValue(devId, out var userServices) && userServices.Contains(serviceName);
                     if (!isRenewal)
                     {
@@ -246,14 +269,18 @@ namespace UDRoute
                         int userCount = userServices?.Count ?? 0;
                         if (_config.MaxUnauthNamesPerUser > 0 && userCount >= _config.MaxUnauthNamesPerUser)
                         {
-                            RejectRegistration(remoteEp, $"非鉴权用户 {devId} 注册服务数已达上限 ({_config.MaxUnauthNamesPerUser})，丢弃注册: {name}/{proto}");
+                            string reason = $"非鉴权用户 {devId} 注册服务数已达上限 ({_config.MaxUnauthNamesPerUser})，丢弃注册: {name}/{proto}";
+                            SendRegisterAck(remoteEp, contextId, 0, reason);
+                            Log.Warn($"[P] 拒绝注册: {reason}");
                             return;
                         }
 
                         int totalCount = _unauthDevServices.Values.Sum(s => s.Count);
                         if (_config.MaxUnauthNamesTotal > 0 && totalCount >= _config.MaxUnauthNamesTotal)
                         {
-                            RejectRegistration(remoteEp, $"非鉴权用户注册服务总数已达上限 ({_config.MaxUnauthNamesTotal})，丢弃注册: {name}/{proto}");
+                            string reason = $"非鉴权用户注册服务总数已达上限 ({_config.MaxUnauthNamesTotal})，丢弃注册: {name}/{proto}";
+                            SendRegisterAck(remoteEp, contextId, 0, reason);
+                            Log.Warn($"[P] 拒绝注册: {reason}");
                             return;
                         }
 
@@ -270,41 +297,40 @@ namespace UDRoute
                     if (key3 != null) _unauthRoutingTable[key3] = info;
                 }
 
+                SendRegisterAck(remoteEp, contextId, 1);
                 Log.Info($"[P] S Registered (Unauth): {name}/{proto} (DevId: {devId}, Suffix: {suffix}) from {remoteEp}");
             }
         }
 
-        private bool CanOverwriteAuth(string key, string newUser, EndPoint remoteEp)
+        private bool CanOverwriteAuth(string key, string newUser, EndPoint remoteEp, ushort contextId)
         {
             if (_authRoutingTable.TryGetValue(key, out var existing))
             {
                 if (existing.OwnerUser != newUser)
                 {
-                    RejectRegistration(remoteEp, $"拒绝覆盖: {key} 已被鉴权用户 '{existing.OwnerUser}' 占用，用户 '{newUser}' 尝试抢占被丢弃。");
+                    string reason = $"拒绝覆盖: {key} 已被鉴权用户 '{existing.OwnerUser}' 占用，用户 '{newUser}' 尝试抢占被丢弃。";
+                    SendRegisterAck(remoteEp, contextId, 0, reason);
+                    Log.Warn($"[P] 拒绝注册: {reason}");
                     return false;
                 }
             }
             return true;
         }
 
-        private void RejectAuth(EndPoint remoteEp, string reason)
+        private void SendRegisterAck(EndPoint remoteEp, ushort contextId, byte status, string reason = "")
         {
-            Log.Warn($"[P] 鉴权失败，拒绝 {remoteEp} 的注册: {reason}");
-            byte[] reasonBytes = Encoding.UTF8.GetBytes(reason);
-            byte[] rejectBuf = new byte[1 + reasonBytes.Length];
-            rejectBuf[0] = (byte)MsgType.AuthFail;
-            Buffer.BlockCopy(reasonBytes, 0, rejectBuf, 1, reasonBytes.Length);
-            _ = _udp.SendAsync(rejectBuf, remoteEp, default);
-        }
-
-        private void RejectRegistration(EndPoint remoteEp, string reason)
-        {
-            Log.Warn($"[P] 拒绝注册: {reason}");
-            byte[] rejectBuf = new byte[1 + 256];
-            rejectBuf[0] = (byte)MsgType.RegFail;
-            int offset = 1;
-            offset += ProtocolHelper.WriteString(rejectBuf.AsSpan(offset), reason);
-            _ = _udp.SendAsync(rejectBuf.AsMemory(0, offset), remoteEp, default);
+            if (contextId == 0) return;
+            int reasonBytes = string.IsNullOrEmpty(reason) ? 0 : Encoding.UTF8.GetByteCount(reason);
+            byte[] ackBuf = new byte[4 + 4 + reasonBytes];
+            ackBuf[0] = (byte)MsgType.RegisterAck;
+            BinaryPrimitives.WriteUInt16LittleEndian(ackBuf.AsSpan(1, 2), contextId);
+            ackBuf[3] = status;
+            int offset = 4;
+            if (status != 1 && !string.IsNullOrEmpty(reason))
+            {
+                offset += ProtocolHelper.WriteString(ackBuf.AsSpan(offset), reason);
+            }
+            _ = _udp.SendAsync(ackBuf.AsMemory(0, offset), remoteEp, default);
         }
 
         public void ProcessRegisterDirect(ServerRecord rec, Guid devId, int wanPort, string devName)
@@ -345,12 +371,13 @@ namespace UDRoute
         public async ValueTask ProcessQueryAsync(ReadOnlyMemory<byte> packetMem, EndPoint remoteEp, CancellationToken ct)
         {
             var data = packetMem.Span;
-            // C 端发起查询: [MsgType 1][SessionId 16][TargetName string]
-            if (data.Length < 21) return;
+            // C 端发起查询: [MsgType 1][ContextId 2][SessionId 16][TargetName string][Flags 1]
+            if (data.Length < 23) return;
 
-            Guid sessionId = new Guid(data.Slice(1, 16));
-            var (targetName, nLen) = ProtocolHelper.ReadString(data.Slice(17));
-            int qOffset = 17 + nLen;
+            ushort contextId = BinaryPrimitives.ReadUInt16LittleEndian(data.Slice(1, 2));
+            Guid sessionId = new Guid(data.Slice(3, 16));
+            var (targetName, nLen) = ProtocolHelper.ReadString(data.Slice(19));
+            int qOffset = 19 + nLen;
             bool clientForceRelay = false;
             bool isReuse = false;
             if (qOffset < data.Length)
@@ -360,164 +387,414 @@ namespace UDRoute
                 isReuse = (qFlags & 2) != 0;
             }
 
-            Log.Debug($"[P] Query received for '{targetName}', Session: {sessionId} from {remoteEp}, ClientForceRelay: {clientForceRelay}, IsReuse: {isReuse}");
+            var queryKey = (sessionId, contextId);
+            byte[]? cachedResp = null;
+            TaskCompletionSource<bool>? myTcs = null;
+            Task? inFlight = null;
 
-            var sInfo = DirectQuery(targetName);
-            if (sInfo != null)
+            lock (_queryLock)
             {
-                if (isReuse)
+                if (_recentQueryResponses.TryGetValue(queryKey, out cachedResp))
                 {
-                    long recordedTimestamp = 0;
-                    lock (_relayLock)
+                    // already responded
+                }
+                else if (_inFlightQueries.TryGetValue(queryKey, out inFlight))
+                {
+                    // already processing
+                }
+                else
+                {
+                    myTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    _inFlightQueries[queryKey] = myTcs.Task;
+                }
+            }
+
+            if (cachedResp != null)
+            {
+                try { await _udp.SendAsync(cachedResp, remoteEp, ct); } catch { }
+                return;
+            }
+
+            if (inFlight != null)
+            {
+                try { await inFlight; } catch { }
+                byte[]? resp = null;
+                lock (_queryLock)
+                {
+                    _recentQueryResponses.TryGetValue(queryKey, out resp);
+                }
+                if (resp != null)
+                {
+                    try { await _udp.SendAsync(resp, remoteEp, ct); } catch { }
+                }
+                return;
+            }
+
+            try
+            {
+                Log.Debug($"[P] Query received for '{targetName}', Session: {sessionId}, Context: {contextId} from {remoteEp}, ClientForceRelay: {clientForceRelay}, IsReuse: {isReuse}");
+
+                var sInfo = DirectQuery(targetName);
+                if (sInfo != null)
+                {
+                    if (isReuse)
                     {
-                        if (_relaySessions.TryGetValue(sessionId, out var activeRelay))
+                        long recordedTimestamp = 0;
+                        lock (_relayLock)
                         {
-                            recordedTimestamp = activeRelay.ServerTimestamp;
+                            if (_relaySessions.TryGetValue(sessionId, out var activeRelay))
+                            {
+                                recordedTimestamp = activeRelay.ServerTimestamp;
+                            }
+                            else if (_closedRelaySessions.TryGetValue(sessionId, out var closedRelay))
+                            {
+                                recordedTimestamp = closedRelay.ServerTimestamp;
+                            }
                         }
-                        else if (_closedRelaySessions.TryGetValue(sessionId, out var closedRelay))
+
+                        if (recordedTimestamp != 0 && recordedTimestamp != sInfo.STimestamp)
                         {
-                            recordedTimestamp = closedRelay.ServerTimestamp;
+                            Log.Warn($"[P] S for '{targetName}' restarted since session {sessionId} was created (ts {recordedTimestamp} != {sInfo.STimestamp}). Rejecting reuse.");
+                            lock (_relayLock)
+                            {
+                                _relaySessions.Remove(sessionId);
+                                _closedRelaySessions.Remove(sessionId);
+                            }
+
+                            byte[] failBuf = ArrayPool<byte>.Shared.Rent(64);
+                            try
+                            {
+                                failBuf[0] = (byte)MsgType.Punch;
+                                BinaryPrimitives.WriteUInt16LittleEndian(failBuf.AsSpan(1, 2), contextId);
+                                sessionId.TryWriteBytes(failBuf.AsSpan(3, 16));
+                                Guid.Empty.TryWriteBytes(failBuf.AsSpan(19, 16));
+                                failBuf[35] = 0; // NotFound / Stale
+
+                                byte[] failCopy = failBuf.AsSpan(0, 36).ToArray();
+                                lock (_queryLock)
+                                {
+                                    _recentQueryResponses[queryKey] = failCopy;
+                                }
+                                await _udp.SendAsync(failCopy, remoteEp, ct);
+                            }
+                            finally
+                            {
+                                ArrayPool<byte>.Shared.Return(failBuf);
+                            }
+                            return;
                         }
                     }
 
-                    if (recordedTimestamp != 0 && recordedTimestamp != sInfo.STimestamp)
+                    bool allowRelay = IsRelayAllowed(sInfo);
+                    bool effectiveForceRelay = clientForceRelay && allowRelay;
+                    if (!allowRelay && clientForceRelay)
                     {
-                        Log.Warn($"[P] S for '{targetName}' restarted since session {sessionId} was created (ts {recordedTimestamp} != {sInfo.STimestamp}). Rejecting reuse.");
-                        lock (_relayLock)
-                        {
-                            _relaySessions.Remove(sessionId);
-                            _closedRelaySessions.Remove(sessionId);
-                        }
+                        Log.Info($"[P] AllowRelay is false for '{targetName}', ignoring client ForceRelay.");
+                    }
 
-                        byte[] failBuf = ArrayPool<byte>.Shared.Rent(64);
+                    // 健康判断规则：当有新的握手请求时，若该通路已经超过 T1 秒没有成功通讯过，
+                    // 那么这个握手请求超过 T2 秒没有被响应，则判断为通道死亡。
+                    bool isIdle = (DateTime.UtcNow - sInfo.LastSeen) > TimeSpan.FromSeconds(_config.IdleThreshold);
+                    if (isIdle)
+                    {
+                        Log.Info($"[P] Path to S for '{targetName}' idle > {_config.IdleThreshold}s (LastSeen: {sInfo.LastSeen:HH:mm:ss}). Probing S at {sInfo.PublicEp} (Timeout: {_config.ProbeTimeout}s)...");
+
+                        ushort probeContextId = (ushort)Interlocked.Increment(ref _contextCounter);
+                        if (probeContextId == 0) probeContextId = (ushort)Interlocked.Increment(ref _contextCounter);
+
+                        var probeTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                        _pendingProbes[probeContextId] = probeTcs;
+
+                        // 通知 S 端发起准备与打洞 (RelayStart，带 ContextId 连发3次)
+                        byte[] probeBuf = ArrayPool<byte>.Shared.Rent(512);
                         try
                         {
-                            failBuf[0] = (byte)MsgType.Punch;
-                            sessionId.TryWriteBytes(failBuf.AsSpan(1, 16));
-                            Guid.Empty.TryWriteBytes(failBuf.AsSpan(17, 16));
-                            failBuf[33] = 0; // NotFound / Stale
+                            probeBuf[0] = (byte)MsgType.RelayStart;
+                            BinaryPrimitives.WriteUInt16LittleEndian(probeBuf.AsSpan(1, 2), probeContextId);
+                            sessionId.TryWriteBytes(probeBuf.AsSpan(3, 16));
+                            int offset = 19;
+                            offset += ProtocolHelper.WriteString(probeBuf.AsSpan(offset), targetName);
+                            offset += ProtocolHelper.WriteIPEndPoint(probeBuf.AsSpan(offset), remoteEp);
+                            probeBuf[offset++] = (byte)((allowRelay ? 1 : 0) | (effectiveForceRelay ? 2 : 0) | (isReuse ? 4 : 0));
 
-                            await _udp.SendAsync(failBuf.AsMemory(0, 34), remoteEp, ct);
+                            byte[] probeCopy = probeBuf.AsSpan(0, offset).ToArray();
+                            _ = ProtocolHelper.SendWithRetryAsync(_udp, probeCopy, sInfo.PublicEp, probeTcs.Task, ct);
                         }
                         finally
                         {
-                            ArrayPool<byte>.Shared.Return(failBuf);
+                            ArrayPool<byte>.Shared.Return(probeBuf);
                         }
-                        return;
-                    }
-                }
 
-                bool allowRelay = IsRelayAllowed(sInfo);
-                bool effectiveForceRelay = clientForceRelay && allowRelay;
-                if (!allowRelay && clientForceRelay)
-                {
-                    Log.Info($"[P] AllowRelay is false for '{targetName}', ignoring client ForceRelay.");
-                }
-
-                if (allowRelay)
-                {
-                    lock (_relayLock)
-                    {
-                        _closedRelaySessions.Remove(sessionId);
-                        // 仅在允许转发时记录中继映射，确保即使打洞未完成也能立刻中继数据
-                        _relaySessions[sessionId] = new RelaySession
+                        bool probeSuccess = false;
+                        using (var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(_config.ProbeTimeout)))
+                        using (var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token))
                         {
-                            ClientEp = remoteEp,
-                            ServerEp = sInfo.PublicEp,
-                            LastSeen = DateTime.UtcNow,
-                            TimeoutSeconds = sInfo.Timeout > 0 ? sInfo.Timeout : Constants.DefaultTimeout,
-                            ServerTimestamp = sInfo.STimestamp,
-                            TargetName = targetName
-                        };
+                            try
+                            {
+                                probeSuccess = await probeTcs.Task.WaitAsync(linkedCts.Token);
+                            }
+                            catch
+                            {
+                                probeSuccess = false;
+                            }
+                            finally
+                            {
+                                _pendingProbes.TryRemove(probeContextId, out _);
+                            }
+                        }
+
+                        if (!probeSuccess)
+                        {
+                            Log.Warn($"[P] Health probe timed out after {_config.ProbeTimeout}s for '{targetName}' at {sInfo.PublicEp}. Declaring channel dead.");
+                            RemoveServerRecord(sInfo);
+
+                            byte[] failBuf = ArrayPool<byte>.Shared.Rent(64);
+                            try
+                            {
+                                failBuf[0] = (byte)MsgType.Punch;
+                                BinaryPrimitives.WriteUInt16LittleEndian(failBuf.AsSpan(1, 2), contextId);
+                                sessionId.TryWriteBytes(failBuf.AsSpan(3, 16));
+                                Guid.Empty.TryWriteBytes(failBuf.AsSpan(19, 16));
+                                failBuf[35] = 0; // NotFound / Dead
+
+                                byte[] failCopy = failBuf.AsSpan(0, 36).ToArray();
+                                lock (_queryLock)
+                                {
+                                    _recentQueryResponses[queryKey] = failCopy;
+                                }
+                                await _udp.SendAsync(failCopy, remoteEp, ct);
+                            }
+                            finally
+                            {
+                                ArrayPool<byte>.Shared.Return(failBuf);
+                            }
+                            return;
+                        }
+
+                        sInfo.LastSeen = DateTime.UtcNow;
+                        Log.Info($"[P] Health probe succeeded for '{targetName}' at {sInfo.PublicEp}.");
                     }
-                }
-
-                // 1. 通知 S 端发起准备与打洞 (RelayStart)
-                // [MsgType 1][SessionId 16][TargetName string][ClientPublicEp][AllowRelay 1 (bit 0=AllowRelay, bit 1=ClientForceRelay, bit 2=IsReuse)]
-                byte[] relayStartBuf = ArrayPool<byte>.Shared.Rent(512);
-                try
-                {
-                    relayStartBuf[0] = (byte)MsgType.RelayStart;
-                    sessionId.TryWriteBytes(relayStartBuf.AsSpan(1, 16));
-                    int offset = 17;
-                    offset += ProtocolHelper.WriteString(relayStartBuf.AsSpan(offset), targetName);
-                    offset += ProtocolHelper.WriteIPEndPoint(relayStartBuf.AsSpan(offset), remoteEp);
-                    relayStartBuf[offset++] = (byte)((allowRelay ? 1 : 0) | (effectiveForceRelay ? 2 : 0) | (isReuse ? 4 : 0));
-
-                    await _udp.SendAsync(relayStartBuf.AsMemory(0, offset), sInfo.PublicEp, ct);
-                }
-                finally
-                {
-                    ArrayPool<byte>.Shared.Return(relayStartBuf);
-                }
-
-                // 2. 向 C 端返回 S 的地址信息用于中继与打洞 (Punch / QueryResponse)
-                // [MsgType 1][SessionId 16][DevId 16][Status 1 (1=Success)][ServerPublicEp][ServerWanPort 4][Timeout 4][Timestamp 8][ReqPass 1][KcpConfig 21][LocalEps...][AllowRelay 1]
-                byte[] punchRespBuf = ArrayPool<byte>.Shared.Rent(1024);
-                try
-                {
-                    punchRespBuf[0] = (byte)MsgType.Punch;
-                    sessionId.TryWriteBytes(punchRespBuf.AsSpan(1, 16));
-                    sInfo.DevId.TryWriteBytes(punchRespBuf.AsSpan(17, 16));
-                    punchRespBuf[33] = 1; // Success
-                    int offset = 34;
-                    offset += ProtocolHelper.WriteIPEndPoint(punchRespBuf.AsSpan(offset), sInfo.PublicEp);
-                    BinaryPrimitives.WriteInt32LittleEndian(punchRespBuf.AsSpan(offset, 4), sInfo.WanPort);
-                    offset += 4;
-                    BinaryPrimitives.WriteInt32LittleEndian(punchRespBuf.AsSpan(offset, 4), sInfo.Timeout);
-                    offset += 4;
-                    
-                    long elapsed = DateTime.UtcNow.Ticks - sInfo.PRecvTimeTicks;
-                    long approxTime = sInfo.STimestamp + elapsed;
-                    BinaryPrimitives.WriteInt64LittleEndian(punchRespBuf.AsSpan(offset, 8), approxTime);
-                    offset += 8;
-                    punchRespBuf[offset++] = (byte)(sInfo.RequiresPassword ? 1 : 0);
-
-                    offset += ProtocolHelper.WriteKcpConfig(punchRespBuf.AsSpan(offset), sInfo.KcpConfig);
-
-                    int countPos = offset++;
-                    byte epCount = 0;
-                    foreach (var ep in sInfo.LocalEps)
+                    else
                     {
-                        if (offset + 21 > punchRespBuf.Length) break;
-                        offset += ProtocolHelper.WriteIPEndPoint(punchRespBuf.AsSpan(offset), ep);
-                        epCount++;
-                        if (epCount >= 10) break;
+                        // 活跃通路：通知 S 端 (RelayStart 连发3次)
+                        byte[] relayStartBuf = ArrayPool<byte>.Shared.Rent(512);
+                        try
+                        {
+                            ushort relayContextId = (ushort)Interlocked.Increment(ref _contextCounter);
+                            if (relayContextId == 0) relayContextId = (ushort)Interlocked.Increment(ref _contextCounter);
+
+                            relayStartBuf[0] = (byte)MsgType.RelayStart;
+                            BinaryPrimitives.WriteUInt16LittleEndian(relayStartBuf.AsSpan(1, 2), relayContextId);
+                            sessionId.TryWriteBytes(relayStartBuf.AsSpan(3, 16));
+                            int offset = 19;
+                            offset += ProtocolHelper.WriteString(relayStartBuf.AsSpan(offset), targetName);
+                            offset += ProtocolHelper.WriteIPEndPoint(relayStartBuf.AsSpan(offset), remoteEp);
+                            relayStartBuf[offset++] = (byte)((allowRelay ? 1 : 0) | (effectiveForceRelay ? 2 : 0) | (isReuse ? 4 : 0));
+
+                            byte[] relayCopy = relayStartBuf.AsSpan(0, offset).ToArray();
+                            var relayTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                            _pendingProbes[relayContextId] = relayTcs;
+                            _ = Task.Run(async () =>
+                            {
+                                try
+                                {
+                                    await ProtocolHelper.SendWithRetryAsync(_udp, relayCopy, sInfo.PublicEp, relayTcs.Task, ct);
+                                }
+                                finally
+                                {
+                                    _pendingProbes.TryRemove(relayContextId, out _);
+                                }
+                            });
+                        }
+                        finally
+                        {
+                            ArrayPool<byte>.Shared.Return(relayStartBuf);
+                        }
                     }
-                    punchRespBuf[countPos] = epCount;
-                    punchRespBuf[offset++] = (byte)(allowRelay ? 1 : 0);
-                    BinaryPrimitives.WriteInt32LittleEndian(punchRespBuf.AsSpan(offset, 4), sInfo.TunnelReuseInterval);
-                    offset += 4;
 
-                    await _udp.SendAsync(punchRespBuf.AsMemory(0, offset), remoteEp, ct);
+                    if (allowRelay)
+                    {
+                        lock (_relayLock)
+                        {
+                            // 新通道建立，旧通道删除，如果仍有旧的通讯连接依赖该通道，则都走该通道，但通讯连接lastactive时间不变
+                            var oldSessionIds = new List<Guid>();
+                            foreach (var kvp in _relaySessions)
+                            {
+                                if (kvp.Key != sessionId &&
+                                    ProtocolHelper.AreEndPointsEqual(kvp.Value.ClientEp, remoteEp) &&
+                                    string.Equals(kvp.Value.TargetName, targetName, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    oldSessionIds.Add(kvp.Key);
+                                }
+                            }
+                            foreach (var kvp in _closedRelaySessions)
+                            {
+                                if (kvp.Key != sessionId &&
+                                    ProtocolHelper.AreEndPointsEqual(kvp.Value.ClientEp, remoteEp) &&
+                                    string.Equals(kvp.Value.TargetName, targetName, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    oldSessionIds.Add(kvp.Key);
+                                }
+                            }
+
+                            foreach (var oldId in oldSessionIds)
+                            {
+                                _relaySessions.Remove(oldId);
+                                _closedRelaySessions.Remove(oldId);
+                                _migratedSessions[oldId] = sessionId;
+                            }
+
+                            _closedRelaySessions.Remove(sessionId);
+                            _relaySessions[sessionId] = new RelaySession
+                            {
+                                ClientEp = remoteEp,
+                                ServerEp = sInfo.PublicEp,
+                                LastSeen = DateTime.UtcNow,
+                                TimeoutSeconds = sInfo.Timeout > 0 ? sInfo.Timeout : Constants.DefaultTimeout,
+                                ServerTimestamp = sInfo.STimestamp,
+                                TargetName = targetName
+                            };
+                        }
+                    }
+
+                    // 2. 向 C 端返回 S 的地址信息用于中继与打洞 (Punch / QueryResponse) - 单次发送，严禁连发
+                    // [MsgType 1][ContextId 2][SessionId 16][DevId 16][Status 1 (1=Success)][ServerPublicEp][ServerWanPort 4][Timeout 4][Timestamp 8][ReqPass 1][KcpConfig 21][LocalEps...][AllowRelay 1]
+                    byte[] punchRespBuf = ArrayPool<byte>.Shared.Rent(1024);
+                    try
+                    {
+                        punchRespBuf[0] = (byte)MsgType.Punch;
+                        BinaryPrimitives.WriteUInt16LittleEndian(punchRespBuf.AsSpan(1, 2), contextId);
+                        sessionId.TryWriteBytes(punchRespBuf.AsSpan(3, 16));
+                        sInfo.DevId.TryWriteBytes(punchRespBuf.AsSpan(19, 16));
+                        punchRespBuf[35] = 1; // Success
+                        int offset = 36;
+                        offset += ProtocolHelper.WriteIPEndPoint(punchRespBuf.AsSpan(offset), sInfo.PublicEp);
+                        BinaryPrimitives.WriteInt32LittleEndian(punchRespBuf.AsSpan(offset, 4), sInfo.WanPort);
+                        offset += 4;
+                        BinaryPrimitives.WriteInt32LittleEndian(punchRespBuf.AsSpan(offset, 4), sInfo.Timeout);
+                        offset += 4;
+
+                        long elapsed = DateTime.UtcNow.Ticks - sInfo.PRecvTimeTicks;
+                        long approxTime = sInfo.STimestamp + elapsed;
+                        BinaryPrimitives.WriteInt64LittleEndian(punchRespBuf.AsSpan(offset, 8), approxTime);
+                        offset += 8;
+                        punchRespBuf[offset++] = (byte)(sInfo.RequiresPassword ? 1 : 0);
+
+                        offset += ProtocolHelper.WriteKcpConfig(punchRespBuf.AsSpan(offset), sInfo.KcpConfig);
+
+                        int countPos = offset++;
+                        byte epCount = 0;
+                        foreach (var ep in sInfo.LocalEps)
+                        {
+                            if (offset + 21 > punchRespBuf.Length) break;
+                            offset += ProtocolHelper.WriteIPEndPoint(punchRespBuf.AsSpan(offset), ep);
+                            epCount++;
+                            if (epCount >= 10) break;
+                        }
+                        punchRespBuf[countPos] = epCount;
+                        punchRespBuf[offset++] = (byte)(allowRelay ? 1 : 0);
+                        BinaryPrimitives.WriteInt32LittleEndian(punchRespBuf.AsSpan(offset, 4), sInfo.TunnelReuseInterval);
+                        offset += 4;
+
+                        byte[] punchCopy = punchRespBuf.AsSpan(0, offset).ToArray();
+                        lock (_queryLock)
+                        {
+                            _recentQueryResponses[queryKey] = punchCopy;
+                        }
+                        await _udp.SendAsync(punchCopy, remoteEp, ct);
+                    }
+                    finally
+                    {
+                        ArrayPool<byte>.Shared.Return(punchRespBuf);
+                    }
+
+                    Log.Info($"[P] Query success: Routed {sessionId} to S ({sInfo.PublicEp}), AllowRelay={allowRelay}");
                 }
-                finally
+                else
                 {
-                    ArrayPool<byte>.Shared.Return(punchRespBuf);
-                }
+                    // 未找到 S 记录，回送失败响应 (单次发送，严禁连发)
+                    // [MsgType 1][ContextId 2][SessionId 16][DevId 16 (Empty)][Status 1 (0=NotFound)]
+                    byte[] failBuf = ArrayPool<byte>.Shared.Rent(64);
+                    try
+                    {
+                        failBuf[0] = (byte)MsgType.Punch;
+                        BinaryPrimitives.WriteUInt16LittleEndian(failBuf.AsSpan(1, 2), contextId);
+                        sessionId.TryWriteBytes(failBuf.AsSpan(3, 16));
+                        Guid.Empty.TryWriteBytes(failBuf.AsSpan(19, 16));
+                        failBuf[35] = 0; // NotFound
 
-                Log.Info($"[P] Query success: Routed {sessionId} to S ({sInfo.PublicEp}), AllowRelay={allowRelay}");
+                        byte[] failCopy = failBuf.AsSpan(0, 36).ToArray();
+                        lock (_queryLock)
+                        {
+                            _recentQueryResponses[queryKey] = failCopy;
+                        }
+                        await _udp.SendAsync(failCopy, remoteEp, ct);
+                    }
+                    finally
+                    {
+                        ArrayPool<byte>.Shared.Return(failBuf);
+                    }
+
+                    Log.Warn($"[P] Query failed: Target '{targetName}' not found for Session: {sessionId}");
+                }
             }
-            else
+            finally
             {
-                // 未找到 S 记录，回送失败响应
-                // [MsgType 1][SessionId 16][DevId 16 (Empty)][Status 1 (0=NotFound)]
-                byte[] failBuf = ArrayPool<byte>.Shared.Rent(64);
-                try
+                if (myTcs != null)
                 {
-                    failBuf[0] = (byte)MsgType.Punch;
-                    sessionId.TryWriteBytes(failBuf.AsSpan(1, 16));
-                    Guid.Empty.TryWriteBytes(failBuf.AsSpan(17, 16));
-                    failBuf[33] = 0; // NotFound
-
-                    await _udp.SendAsync(failBuf.AsMemory(0, 34), remoteEp, ct);
+                    lock (_queryLock)
+                    {
+                        _inFlightQueries.Remove(queryKey);
+                    }
+                    myTcs.TrySetResult(true);
                 }
-                finally
+            }
+        }
+
+        private void RemoveServerRecord(ServerRecordInfo sInfo)
+        {
+            lock (_routingLock)
+            {
+                var authKeysToRemove = new List<string>();
+                foreach (var kvp in _authRoutingTable)
                 {
-                    ArrayPool<byte>.Shared.Return(failBuf);
+                    if (ReferenceEquals(kvp.Value, sInfo))
+                    {
+                        authKeysToRemove.Add(kvp.Key);
+                    }
+                }
+                foreach (var k in authKeysToRemove)
+                {
+                    _authRoutingTable.TryRemove(k, out _);
                 }
 
-                Log.Warn($"[P] Query failed: Target '{targetName}' not found for Session: {sessionId}");
+                var unauthKeysToRemove = new List<string>();
+                foreach (var kvp in _unauthRoutingTable)
+                {
+                    if (ReferenceEquals(kvp.Value, sInfo))
+                    {
+                        unauthKeysToRemove.Add(kvp.Key);
+                    }
+                }
+                foreach (var k in unauthKeysToRemove)
+                {
+                    _unauthRoutingTable.TryRemove(k, out _);
+                }
+            }
+        }
+
+        public void ProcessRelayStartAck(ReadOnlySpan<byte> data, EndPoint remoteEp)
+        {
+            // [MsgType 1 = 14][ContextId 2][SessionId 16][Status 1]
+            if (data.Length < 20) return;
+
+            ushort contextId = BinaryPrimitives.ReadUInt16LittleEndian(data.Slice(1, 2));
+            Guid sessionId = new Guid(data.Slice(3, 16));
+            byte status = data[19];
+
+            if (_pendingProbes.TryRemove(contextId, out var tcs))
+            {
+                tcs.TrySetResult(status == 1);
             }
         }
 
@@ -543,6 +820,7 @@ namespace UDRoute
         {
             RelaySession? sessionToForward = null;
             bool sendDisconnect = false;
+            bool isMigrated = false;
 
             lock (_relayLock)
             {
@@ -551,24 +829,38 @@ namespace UDRoute
                     session.LastSeen = DateTime.UtcNow;
                     sessionToForward = session;
                 }
-                else if (_closedRelaySessions.Remove(sessionId, out var closedInfo))
-                {
-                    var restoredSession = new RelaySession
-                    {
-                        ClientEp = ProtocolHelper.AreEndPointsEqual(remoteEp, closedInfo.ClientEp) ? remoteEp : closedInfo.ClientEp,
-                        ServerEp = ProtocolHelper.AreEndPointsEqual(remoteEp, closedInfo.ServerEp) ? remoteEp : closedInfo.ServerEp,
-                        LastSeen = DateTime.UtcNow,
-                        TimeoutSeconds = closedInfo.TimeoutSeconds,
-                        ServerTimestamp = closedInfo.ServerTimestamp,
-                        TargetName = closedInfo.TargetName
-                    };
-                    _relaySessions[sessionId] = restoredSession;
-                    sessionToForward = restoredSession;
-                    Log.Info($"[P] Closed/inactive relay session {sessionId} re-established upon receiving data packet from {remoteEp}.");
-                }
                 else
                 {
-                    sendDisconnect = true;
+                    Guid curId = sessionId;
+                    while (_migratedSessions.TryGetValue(curId, out var nextId))
+                    {
+                        curId = nextId;
+                    }
+
+                    if (_relaySessions.TryGetValue(curId, out var migratedSession))
+                    {
+                        sessionToForward = migratedSession;
+                        isMigrated = true;
+                    }
+                    else if (_closedRelaySessions.Remove(sessionId, out var closedInfo))
+                    {
+                        var restoredSession = new RelaySession
+                        {
+                            ClientEp = ProtocolHelper.AreEndPointsEqual(remoteEp, closedInfo.ClientEp) ? remoteEp : closedInfo.ClientEp,
+                            ServerEp = ProtocolHelper.AreEndPointsEqual(remoteEp, closedInfo.ServerEp) ? remoteEp : closedInfo.ServerEp,
+                            LastSeen = DateTime.UtcNow,
+                            TimeoutSeconds = closedInfo.TimeoutSeconds,
+                            ServerTimestamp = closedInfo.ServerTimestamp,
+                            TargetName = closedInfo.TargetName
+                        };
+                        _relaySessions[sessionId] = restoredSession;
+                        sessionToForward = restoredSession;
+                        Log.Info($"[P] Closed/inactive relay session {sessionId} re-established upon receiving data packet from {remoteEp}.");
+                    }
+                    else
+                    {
+                        sendDisconnect = true;
+                    }
                 }
             }
 
@@ -581,6 +873,18 @@ namespace UDRoute
                 }
                 else if (ProtocolHelper.AreEndPointsEqual(remoteEp, sessionToForward.ServerEp))
                 {
+                    if (!isMigrated)
+                    {
+                        sessionToForward.LastSeen = DateTime.UtcNow;
+                    }
+                    if (_authRoutingTable.TryGetValue(sessionToForward.TargetName, out var authS))
+                    {
+                        authS.LastSeen = DateTime.UtcNow;
+                    }
+                    else if (_unauthRoutingTable.TryGetValue(sessionToForward.TargetName, out var unauthS))
+                    {
+                        unauthS.LastSeen = DateTime.UtcNow;
+                    }
                     await _udp.SendAsync(packetMem, sessionToForward.ClientEp, ct);
                     return true;
                 }
@@ -659,18 +963,23 @@ namespace UDRoute
                     var timeout = TimeSpan.FromSeconds(_config.RegTimeout);
                     var now = DateTime.UtcNow;
 
-                    // 清理鉴权表
-                    foreach (var kvp in _authRoutingTable)
+                    lock (_routingLock)
                     {
-                        if (now - kvp.Value.LastSeen > timeout)
+                        // 清理鉴权表
+                        var expiredAuthKeys = new List<string>();
+                        foreach (var kvp in _authRoutingTable)
                         {
-                            _authRoutingTable.TryRemove(kvp.Key, out _);
+                            if (now - kvp.Value.LastSeen > timeout)
+                            {
+                                expiredAuthKeys.Add(kvp.Key);
+                            }
                         }
-                    }
+                        foreach (var key in expiredAuthKeys)
+                        {
+                            _authRoutingTable.TryRemove(key, out _);
+                        }
 
-                    // 清理非鉴权表并归还配额
-                    lock (_unauthLock)
-                    {
+                        // 清理非鉴权表并归还配额
                         var expiredKeys = new List<string>();
                         foreach (var kvp in _unauthRoutingTable)
                         {
@@ -738,6 +1047,20 @@ namespace UDRoute
                         foreach (var key in expiredClosedKeys)
                         {
                             _closedRelaySessions.Remove(key);
+                        }
+
+                        // 4. 清理目标会话已彻底释放的迁移映射
+                        var deadMigratedKeys = new List<Guid>();
+                        foreach (var kvp in _migratedSessions)
+                        {
+                            if (!_relaySessions.ContainsKey(kvp.Value) && !_closedRelaySessions.ContainsKey(kvp.Value))
+                            {
+                                deadMigratedKeys.Add(kvp.Key);
+                            }
+                        }
+                        foreach (var key in deadMigratedKeys)
+                        {
+                            _migratedSessions.Remove(key);
                         }
                     }
                 }

@@ -41,6 +41,14 @@ namespace UDRoute
         public byte[]? Password { get; set; }
         public bool ForceRelay { get; set; }
         public int TunnelReuseInterval { get; set; } = Constants.DefaultTunnelReuseInterval;
+        public int IdleThreshold { get; set; } = Constants.DefaultIdleThreshold;
+        public int ProbeTimeout { get; set; } = Constants.DefaultProbeTimeout;
+        public int MaxRecentRequests { get; set; } = Constants.DefaultMaxRecentRequests;
+        public int MaxSize
+        {
+            get => MaxRecentRequests;
+            set => MaxRecentRequests = value;
+        }
 
         public List<ClientRecord> ClientRecords { get; set; } = new();
         public List<ServerRecord> ServerRecords { get; set; } = new();

@@ -28,7 +28,21 @@ namespace UDRoute
                 }
             }
         }
-        private readonly ConcurrentDictionary<Guid, TaskCompletionSource<QueryResponse>> _pendingQueries = new();
+        private int _contextCounter;
+        private class PendingQueryRequest
+        {
+            public Guid SessionId { get; }
+            public ushort ContextId { get; }
+            public TaskCompletionSource<QueryResponse> Tcs { get; }
+            public PendingQueryRequest(Guid sessionId, ushort contextId, TaskCompletionSource<QueryResponse> tcs)
+            {
+                SessionId = sessionId;
+                ContextId = contextId;
+                Tcs = tcs;
+            }
+        }
+        private readonly Dictionary<ushort, PendingQueryRequest> _pendingQueries = new();
+        private readonly object _pendingQueriesLock = new();
         private readonly Dictionary<string, TunnelSession> _reusableTunnels = new();
         private readonly object _tunnelStateLock = new();
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _tunnelLocks = new();
@@ -93,15 +107,44 @@ namespace UDRoute
 
         public bool TryHandleQueryResponse(ReadOnlySpan<byte> data)
         {
-            if (data.Length < 34) return false;
+            if (data.Length < 36) return false;
 
-            Guid sessionId = new Guid(data.Slice(1, 16));
-            Guid devId = new Guid(data.Slice(17, 16));
-            byte status = data[33];
+            ushort contextId = BinaryPrimitives.ReadUInt16LittleEndian(data.Slice(1, 2));
+            Guid sessionId = new Guid(data.Slice(3, 16));
+            Guid devId = new Guid(data.Slice(19, 16));
+            byte status = data[35];
+
+            PendingQueryRequest? req = null;
+            lock (_pendingQueriesLock)
+            {
+                if (contextId != 0)
+                {
+                    _pendingQueries.Remove(contextId, out req);
+                }
+                if (req == null)
+                {
+                    ushort matchedKey = 0;
+                    foreach (var kvp in _pendingQueries)
+                    {
+                        if (kvp.Value.SessionId == sessionId)
+                        {
+                            matchedKey = kvp.Key;
+                            req = kvp.Value;
+                            break;
+                        }
+                    }
+                    if (matchedKey != 0)
+                    {
+                        _pendingQueries.Remove(matchedKey);
+                    }
+                }
+            }
+
+            if (req == null) return false; // 重复响应包自动丢弃
 
             if (status == 1) // P 回复的查询成功
             {
-                int offset = 34;
+                int offset = 36;
                 var (sPublicEp, epLen) = ProtocolHelper.ReadIPEndPoint(data.Slice(offset));
                 offset += epLen;
                 int sWanPort = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(offset, 4));
@@ -141,19 +184,13 @@ namespace UDRoute
                     offset += 4;
                 }
 
-                if (_pendingQueries.TryRemove(sessionId, out var tcs))
-                {
-                    tcs.TrySetResult(new QueryResponse(true, devId, sPublicEp, sWanPort, timeout, sTimestamp, reqPass, kcpConfig, localEps, allowRelay, tunnelReuseInterval));
-                    return true;
-                }
+                req.Tcs.TrySetResult(new QueryResponse(true, devId, sPublicEp, sWanPort, timeout, sTimestamp, reqPass, kcpConfig, localEps, allowRelay, tunnelReuseInterval));
+                return true;
             }
-            else if (status == 0) // P 回复的目标不存在
+            else if (status == 0) // P 回复的目标不存在或通道死亡
             {
-                if (_pendingQueries.TryRemove(sessionId, out var tcs))
-                {
-                    tcs.TrySetResult(new QueryResponse(false, Guid.Empty, null!, 0, 0, 0, false, null, null!));
-                    return true;
-                }
+                req.Tcs.TrySetResult(new QueryResponse(false, Guid.Empty, null!, 0, 0, 0, false, null, null!));
+                return true;
             }
 
             return false;
@@ -179,11 +216,12 @@ namespace UDRoute
                 if (status == 2)
                 {
                     // 回送打洞确认，避免死循环 ping-pong
-                    byte[] ackBuf = new byte[34];
+                    byte[] ackBuf = new byte[36];
                     ackBuf[0] = (byte)MsgType.Punch;
-                    sessionId.TryWriteBytes(ackBuf.AsSpan(1, 16));
-                    _config.DevId.TryWriteBytes(ackBuf.AsSpan(17, 16));
-                    ackBuf[33] = 3; // Punch ACK
+                    BinaryPrimitives.WriteUInt16LittleEndian(ackBuf.AsSpan(1, 2), 0);
+                    sessionId.TryWriteBytes(ackBuf.AsSpan(3, 16));
+                    _config.DevId.TryWriteBytes(ackBuf.AsSpan(19, 16));
+                    ackBuf[35] = 3; // Punch ACK
                     await _udp.SendAsync(ackBuf, remoteEp, ct);
                 }
                 else if (status == 3)
@@ -249,9 +287,27 @@ namespace UDRoute
 
         public bool TryHandleDisconnect(Guid sessionId, EndPoint remoteEp)
         {
-            if (_pendingQueries.TryRemove(sessionId, out var tcs))
+            PendingQueryRequest? req = null;
+            lock (_pendingQueriesLock)
             {
-                tcs.TrySetResult(new QueryResponse(false, Guid.Empty, null!, 0, 0, 0, false, null, null!));
+                ushort matchedKey = 0;
+                foreach (var kvp in _pendingQueries)
+                {
+                    if (kvp.Value.SessionId == sessionId)
+                    {
+                        matchedKey = kvp.Key;
+                        req = kvp.Value;
+                        break;
+                    }
+                }
+                if (matchedKey != 0)
+                {
+                    _pendingQueries.Remove(matchedKey);
+                }
+            }
+            if (req != null)
+            {
+                req.Tcs.TrySetResult(new QueryResponse(false, Guid.Empty, null!, 0, 0, 0, false, null, null!));
             }
             TunnelSession? session;
             lock (_sessionLock)
@@ -337,11 +393,12 @@ namespace UDRoute
 
         private async Task<bool> StartPunchingAsync(TunnelSession session, Guid expectedDevId, IPEndPoint sPublicEp, int sWanPort, List<IPEndPoint> localEps, CancellationToken ct)
         {
-            byte[] punchBuf = new byte[34];
+            byte[] punchBuf = new byte[36];
             punchBuf[0] = (byte)MsgType.Punch;
-            session.SessionId.TryWriteBytes(punchBuf.AsSpan(1, 16));
-            _config.DevId.TryWriteBytes(punchBuf.AsSpan(17, 16));
-            punchBuf[33] = 2; // Direct Punch
+            BinaryPrimitives.WriteUInt16LittleEndian(punchBuf.AsSpan(1, 2), 0);
+            session.SessionId.TryWriteBytes(punchBuf.AsSpan(3, 16));
+            _config.DevId.TryWriteBytes(punchBuf.AsSpan(19, 16));
+            punchBuf[35] = 2; // Direct Punch
 
             var candidates = new List<IPEndPoint> { sPublicEp };
             if (sWanPort > 0 && sWanPort != sPublicEp.Port)
@@ -563,8 +620,9 @@ namespace UDRoute
                 try
                 {
                     relayStartBuf[0] = (byte)MsgType.RelayStart;
-                    session.SessionId.TryWriteBytes(relayStartBuf.AsSpan(1, 16));
-                    int offset = 17;
+                    BinaryPrimitives.WriteUInt16LittleEndian(relayStartBuf.AsSpan(1, 2), 0);
+                    session.SessionId.TryWriteBytes(relayStartBuf.AsSpan(3, 16));
+                    int offset = 19;
                     offset += ProtocolHelper.WriteString(relayStartBuf.AsSpan(offset), queryName);
                     offset += ProtocolHelper.WriteIPEndPoint(relayStartBuf.AsSpan(offset), _udp.LocalEndPoint);
                     bool allowRelay = _localProxy.IsRelayAllowed(sInfo);
@@ -582,24 +640,34 @@ namespace UDRoute
             var pEndPoint = session.ProxyEp ?? await ProtocolHelper.ResolveEndPointAsync(rec.TargetServer, Constants.DefaultProxyPort);
             if (pEndPoint == null) return false;
 
+            ushort contextId = (ushort)Interlocked.Increment(ref _contextCounter);
+            if (contextId == 0) contextId = (ushort)Interlocked.Increment(ref _contextCounter);
+
             var tcs = new TaskCompletionSource<QueryResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
-            _pendingQueries[session.SessionId] = tcs;
+            lock (_pendingQueriesLock)
+            {
+                _pendingQueries[contextId] = new PendingQueryRequest(session.SessionId, contextId, tcs);
+            }
 
             byte[] qBuf = ArrayPool<byte>.Shared.Rent(256);
             try
             {
                 qBuf[0] = (byte)MsgType.Query;
-                session.SessionId.TryWriteBytes(qBuf.AsSpan(1, 16));
-                int qLen = 17 + ProtocolHelper.WriteString(qBuf.AsSpan(17), queryName);
+                BinaryPrimitives.WriteUInt16LittleEndian(qBuf.AsSpan(1, 2), contextId);
+                session.SessionId.TryWriteBytes(qBuf.AsSpan(3, 16));
+                int qLen = 19 + ProtocolHelper.WriteString(qBuf.AsSpan(19), queryName);
                 qBuf[qLen++] = (byte)((rec.ForceRelay ? 1 : 0) | 2); // Bit 0: ForceRelay, Bit 1: IsReuse
-                await _udp.SendAsync(qBuf.AsMemory(0, qLen), pEndPoint, ct);
+
+                byte[] qCopy = qBuf.AsSpan(0, qLen).ToArray();
+                _ = ProtocolHelper.SendWithRetryAsync(_udp, qCopy, pEndPoint, tcs.Task, ct);
             }
             finally
             {
                 ArrayPool<byte>.Shared.Return(qBuf);
             }
 
-            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+            int waitTimeoutSec = Math.Max(Constants.DefaultProbeTimeout + 2, 7);
+            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(waitTimeoutSec));
             using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
 
             try
@@ -609,7 +677,10 @@ namespace UDRoute
             }
             catch
             {
-                _pendingQueries.TryRemove(session.SessionId, out _);
+                lock (_pendingQueriesLock)
+                {
+                    _pendingQueries.Remove(contextId);
+                }
                 return false;
             }
         }
@@ -738,8 +809,9 @@ namespace UDRoute
                     try
                     {
                         relayStartBuf[0] = (byte)MsgType.RelayStart;
-                        sessionId.TryWriteBytes(relayStartBuf.AsSpan(1, 16));
-                        int offset = 17;
+                        BinaryPrimitives.WriteUInt16LittleEndian(relayStartBuf.AsSpan(1, 2), 0);
+                        sessionId.TryWriteBytes(relayStartBuf.AsSpan(3, 16));
+                        int offset = 19;
                         offset += ProtocolHelper.WriteString(relayStartBuf.AsSpan(offset), queryName);
                         offset += ProtocolHelper.WriteIPEndPoint(relayStartBuf.AsSpan(offset), _udp.LocalEndPoint);
                         relayStartBuf[offset++] = (byte)((allowRelay ? 1 : 0) | (effectiveForceRelay ? 2 : 0));
@@ -785,7 +857,7 @@ namespace UDRoute
                 }
             }
 
-            // 常规模式: 向 P 发起 Query (UDP)
+            // 常规模式: 向 P 发起 Query (UDP，带 ContextId 连发3次)
             var pEndPoint = await ProtocolHelper.ResolveEndPointAsync(rec.TargetServer, Constants.DefaultProxyPort);
             if (pEndPoint == null)
             {
@@ -793,24 +865,34 @@ namespace UDRoute
                 return null;
             }
 
+            ushort contextId = (ushort)Interlocked.Increment(ref _contextCounter);
+            if (contextId == 0) contextId = (ushort)Interlocked.Increment(ref _contextCounter);
+
             var tcs = new TaskCompletionSource<QueryResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
-            _pendingQueries[sessionId] = tcs;
+            lock (_pendingQueriesLock)
+            {
+                _pendingQueries[contextId] = new PendingQueryRequest(sessionId, contextId, tcs);
+            }
 
             byte[] qBuf = ArrayPool<byte>.Shared.Rent(256);
             try
             {
                 qBuf[0] = (byte)MsgType.Query;
-                sessionId.TryWriteBytes(qBuf.AsSpan(1, 16));
-                int qLen = 17 + ProtocolHelper.WriteString(qBuf.AsSpan(17), queryName);
+                BinaryPrimitives.WriteUInt16LittleEndian(qBuf.AsSpan(1, 2), contextId);
+                sessionId.TryWriteBytes(qBuf.AsSpan(3, 16));
+                int qLen = 19 + ProtocolHelper.WriteString(qBuf.AsSpan(19), queryName);
                 qBuf[qLen++] = (byte)(rec.ForceRelay ? 1 : 0);
-                await _udp.SendAsync(qBuf.AsMemory(0, qLen), pEndPoint, ct);
+
+                byte[] qCopy = qBuf.AsSpan(0, qLen).ToArray();
+                _ = ProtocolHelper.SendWithRetryAsync(_udp, qCopy, pEndPoint, tcs.Task, ct);
             }
             finally
             {
                 ArrayPool<byte>.Shared.Return(qBuf);
             }
 
-            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            int waitTimeoutSec = Math.Max(Constants.DefaultProbeTimeout + 2, 7);
+            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(waitTimeoutSec));
             using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
 
             QueryResponse resp;
@@ -820,7 +902,10 @@ namespace UDRoute
             }
             catch
             {
-                _pendingQueries.TryRemove(sessionId, out _);
+                lock (_pendingQueriesLock)
+                {
+                    _pendingQueries.Remove(contextId);
+                }
                 Log.Warn($"[C] Query timeout for session {sessionId}");
                 return null;
             }

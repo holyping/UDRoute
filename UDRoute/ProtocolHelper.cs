@@ -292,5 +292,47 @@ namespace UDRoute
                 Logging.Log.Error($"[IPv6] Failed to reset IPv6 stack: {ex.Message}");
             }
         }
+
+        public static async Task SendWithRetryAsync(
+            ZeroCopyUdpSocket udp,
+            byte[] packet,
+            EndPoint remoteEp,
+            Task? completedCheck,
+            CancellationToken ct,
+            int maxAttempts = 3,
+            int retryIntervalMs = Constants.DefaultRetryIntervalMs)
+        {
+            for (int i = 0; i < maxAttempts; i++)
+            {
+                if (ct.IsCancellationRequested) break;
+                if (completedCheck != null && completedCheck.IsCompleted) break;
+                try
+                {
+                    await udp.SendAsync(packet, remoteEp, ct);
+                }
+                catch { }
+
+                if (i < maxAttempts - 1)
+                {
+                    if (completedCheck != null)
+                    {
+                        try
+                        {
+                            var delayTask = Task.Delay(retryIntervalMs, ct);
+                            var completed = await Task.WhenAny(completedCheck, delayTask);
+                            if (completed == completedCheck || completedCheck.IsCompleted)
+                            {
+                                break;
+                            }
+                        }
+                        catch { break; }
+                    }
+                    else
+                    {
+                        try { await Task.Delay(10, ct); } catch { break; }
+                    }
+                }
+            }
+        }
     }
 }

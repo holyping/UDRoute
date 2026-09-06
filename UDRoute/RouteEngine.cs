@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading.Channels;
@@ -142,6 +143,13 @@ namespace UDRoute
                                 }
                                 break;
 
+                            case MsgType.RelayStartAck:
+                                if (_proxy != null)
+                                {
+                                    _proxy.ProcessRelayStartAck(span, remoteEp);
+                                }
+                                break;
+
                             case MsgType.Punch:
                                 await DispatchPunchAsync(mem, remoteEp, ct);
                                 break;
@@ -162,20 +170,8 @@ namespace UDRoute
                                 _server?.TryHandleEchoResp(span);
                                 break;
 
-                            case MsgType.AuthFail:
-                            {
-                                string reason = "Unknown reason";
-                                if (span.Length > 1) reason = Encoding.UTF8.GetString(span.Slice(1).ToArray());
-                                Log.Error($"[S] 鉴权失败：收到来自代理服务器({remoteEp})的拒绝连接响应！原因: {reason}。请检查配置。");
-                                break;
-                            }
-
-                            case MsgType.RegFail:
-                                if (span.Length >= 5)
-                                {
-                                    var (reason, _) = ProtocolHelper.ReadString(span.Slice(1));
-                                    Log.Warn($"[S] 注册被代理服务器({remoteEp})拒绝: {reason}");
-                                }
+                            case MsgType.RegisterAck:
+                                _server?.ProcessRegisterAck(span, remoteEp);
                                 break;
 
                             case MsgType.AuthReq:
@@ -244,13 +240,14 @@ namespace UDRoute
         private async ValueTask DispatchPunchAsync(ReadOnlyMemory<byte> mem, EndPoint remoteEp, CancellationToken ct)
         {
             var span = mem.Span;
-            if (span.Length < 34) return;
+            if (span.Length < 36) return;
 
-            byte status = span[33];
-            Guid sessionId = new Guid(span.Slice(1, 16));
-            Guid devId = new Guid(span.Slice(17, 16));
+            ushort contextId = BinaryPrimitives.ReadUInt16LittleEndian(span.Slice(1, 2));
+            Guid sessionId = new Guid(span.Slice(3, 16));
+            Guid devId = new Guid(span.Slice(19, 16));
+            byte status = span[35];
 
-            // Status 0 (NotFound) / Status 1 (Success) -> 属于 Client 端的查询响应
+            // Status 0 (NotFound / Dead) / Status 1 (Success) -> 属于 Client 端的查询响应
             if (status == 0 || status == 1)
             {
                 if (_client != null && _client.TryHandleQueryResponse(span))

@@ -13,10 +13,10 @@ namespace UDRoute
         Disconnect = 6,
         EchoReq = 7,
         EchoResp = 8,
-        AuthFail = 9,
-        RegFail = 10,
+        RegisterAck = 9,
         AuthReq = 11,
         AuthRes = 12,
-        RelayEnd = 13
+        RelayEnd = 13,
+        RelayStartAck = 14
     }
 }
