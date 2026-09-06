@@ -3,6 +3,7 @@
 [English](README_en.md) | [简体中文](README.md)
 
 **udroute** is a high-performance, cross-platform UDP P2P hole-punching and relay tunnel tool built on .NET 10. It is designed to effortlessly traverse NAT networks, securely and stably exposing or mapping your internal TCP/UDP services to the outside world. Whether you need ultra-low latency for gaming or reliable intranet access, udroute provides a perfect solution.
+** This project is compiled into a native application using AOT and does not require the .NET runtime. **
 
 ## 🌟 Key Features
 
