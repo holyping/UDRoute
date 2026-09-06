@@ -19,5 +19,6 @@ namespace UDRoute
         public string? Username { get; set; }
         public byte[]? Password { get; set; }
         public KcpConfig KcpConfig { get; set; } = new();
+        public int KeepAlive { get; set; } = Constants.DefaultKeepAlive;
     }
 }

@@ -89,6 +89,18 @@ namespace UDRoute
                 }
             }
 
+            // 启动 S 到各 P 目标服务器的 NAT KeepAlive 保活循环 (按 TargetServer 分组取最小保活间隔)
+            var keepAliveTargets = _config.ServerRecords
+                .Where(r => !r.IsThis && !string.IsNullOrWhiteSpace(r.TargetServer) && r.KeepAlive > 0)
+                .GroupBy(r => r.TargetServer, StringComparer.OrdinalIgnoreCase)
+                .Select(g => (TargetServer: g.Key, Interval: g.Min(r => r.KeepAlive)))
+                .ToList();
+
+            foreach (var target in keepAliveTargets)
+            {
+                _ = Task.Run(() => RunPKeepAliveAsync(target.TargetServer, target.Interval, ct), ct);
+            }
+
             byte[] buffer = new byte[1024];
             while (!ct.IsCancellationRequested)
             {
@@ -414,7 +426,7 @@ namespace UDRoute
                         }
                         else
                         {
-                            session = new TunnelSession(_udp, cPublicEp, sessionId, mtu, rec.IsTcp, rec.KcpConfig, rec.Timeout, rec.TunnelReuseInterval);
+                            session = new TunnelSession(_udp, cPublicEp, sessionId, mtu, rec.IsTcp, rec.KcpConfig, rec.Timeout, rec.TunnelReuseInterval, rec.KeepAlive);
                             session.ChannelDesc = $"{rec.TargetIp}:{rec.TargetPort}";
                             session.PasswordHash = rec.Password;
                             session.ForceRelay = false;
@@ -497,7 +509,7 @@ namespace UDRoute
                             }
                             else
                             {
-                                var session = new TunnelSession(_udp, remoteEp, sessionId, mtu, rec.IsTcp, rec.KcpConfig, rec.Timeout, rec.TunnelReuseInterval);
+                                var session = new TunnelSession(_udp, remoteEp, sessionId, mtu, rec.IsTcp, rec.KcpConfig, rec.Timeout, rec.TunnelReuseInterval, rec.KeepAlive);
                                 session.ChannelDesc = $"{rec.TargetIp}:{rec.TargetPort}";
                                 session.PasswordHash = rec.Password;
                                 session.ProxyEp = remoteEp;
@@ -916,6 +928,50 @@ namespace UDRoute
             }
 
             return session.IsDirect;
+        }
+
+        private async Task RunPKeepAliveAsync(string pServer, int intervalSec, CancellationToken ct)
+        {
+            Log.Info($"[S] Started NAT KeepAlive to P server '{pServer}' (interval: {intervalSec}s)");
+            byte[] pingBuf = new byte[17];
+            pingBuf[0] = (byte)MsgType.EchoReq;
+            Guid.NewGuid().TryWriteBytes(pingBuf.AsSpan(1, 16));
+
+            IPEndPoint? cachedEp = null;
+            DateTime lastResolve = DateTime.MinValue;
+
+            while (!ct.IsCancellationRequested)
+            {
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(intervalSec), ct);
+
+                    if (cachedEp == null || (DateTime.UtcNow - lastResolve).TotalMinutes > 5)
+                    {
+                        var eps = await ProtocolHelper.ResolveAllEndPointsAsync(pServer, Constants.DefaultProxyPort);
+                        if (eps != null && eps.Length > 0)
+                        {
+                            cachedEp = eps[0];
+                            lastResolve = DateTime.UtcNow;
+                        }
+                    }
+
+                    if (cachedEp != null)
+                    {
+                        await _udp.SendAsync(pingBuf, cachedEp, ct);
+                        Log.Trace($"[S] Sent NAT KeepAlive to P ({cachedEp})");
+                    }
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    Log.Trace($"[S] NAT KeepAlive to P failed: {ex.Message}");
+                    cachedEp = null;
+                }
+            }
         }
     }
 }

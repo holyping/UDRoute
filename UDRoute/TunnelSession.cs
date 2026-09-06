@@ -52,6 +52,8 @@ namespace UDRoute
         private readonly TaskCompletionSource _sessionClosedTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly object _stateLock = new();
         private int _disposed = 0;
+        private readonly int _keepAliveInterval;
+        private int _directKeepAliveStarted = 0;
 
         public readonly TaskCompletionSource<bool> AuthTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -109,7 +111,7 @@ namespace UDRoute
             return count;
         }
 
-        public TunnelSession(ZeroCopyUdpSocket udpCore, EndPoint initialEp, Guid sessionId, int mtu, bool isTcp = true, KcpConfig? kcpConfig = null, int timeoutSeconds = 0, int reuseInterval = 0)
+        public TunnelSession(ZeroCopyUdpSocket udpCore, EndPoint initialEp, Guid sessionId, int mtu, bool isTcp = true, KcpConfig? kcpConfig = null, int timeoutSeconds = 0, int reuseInterval = 0, int keepAlive = Constants.DefaultKeepAlive)
         {
             _udpCore = udpCore;
             _activeRemoteEp = initialEp;
@@ -118,6 +120,7 @@ namespace UDRoute
             _isTcp = isTcp;
             _kcpConfig = kcpConfig ?? new KcpConfig();
             ReuseInterval = reuseInterval;
+            _keepAliveInterval = keepAlive;
 
             if (reuseInterval > 0)
             {
@@ -303,6 +306,42 @@ namespace UDRoute
             }
         }
 
+        private void StartDirectKeepAliveLoop()
+        {
+            if (_keepAliveInterval <= 0) return;
+            if (Interlocked.CompareExchange(ref _directKeepAliveStarted, 1, 0) != 0) return;
+
+            _ = Task.Run(async () =>
+            {
+                byte[] keepAliveBuf = new byte[18];
+                keepAliveBuf[0] = (byte)MsgType.Data;
+                _sessionId.TryWriteBytes(keepAliveBuf.AsSpan(1, 16));
+                keepAliveBuf[17] = (byte)MuxType.KeepAlive;
+
+                while (!_sessionCts.IsCancellationRequested && _isDirect)
+                {
+                    try
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(_keepAliveInterval), _sessionCts.Token).ConfigureAwait(false);
+                        if (!_sessionCts.IsCancellationRequested && _isDirect)
+                        {
+                            var targetEp = _activeRemoteEp;
+                            if (targetEp != null && (ProxyEp == null || !targetEp.Equals(ProxyEp)))
+                            {
+                                await _udpCore.SendAsync(keepAliveBuf, targetEp, _sessionCts.Token).ConfigureAwait(false);
+                                Log.Trace($"[Tunnel] Session {_sessionId} sent direct KeepAlive to peer {targetEp}");
+                            }
+                        }
+                    }
+                    catch (OperationCanceledException) when (_sessionCts.IsCancellationRequested)
+                    {
+                        break;
+                    }
+                    catch { }
+                }
+            });
+        }
+
         // 当收到对方直接发来的打洞包，切换路由
         public void SwitchToDirect(EndPoint directEp)
         {
@@ -311,6 +350,7 @@ namespace UDRoute
                 _activeRemoteEp = directEp;
                 _isDirect = true;
                 Log.Info($"[Tunnel] Session {_sessionId} route switched to direct: {directEp}");
+                StartDirectKeepAliveLoop();
             }
         }
 
@@ -365,14 +405,20 @@ namespace UDRoute
         // 接收来自 UDP 的数据包（载荷，进入复用协议层）
         public void OnUdpDataReceived(ReadOnlySpan<byte> payload)
         {
-            UpdateActivity();
+            if (payload.Length == 0) return;
+
+            byte muxType = payload[0];
+            // 保活心跳帧仅用于维持 NAT 网关的打洞孔洞存活，严格不刷新活跃计时 _lastActiveTime
+            if (muxType != (byte)MuxType.KeepAlive)
+            {
+                UpdateActivity();
+            }
+
             if (_isDirect)
             {
                 NotifyDirectCommunicationEstablished();
             }
-            if (payload.Length == 0) return;
 
-            byte muxType = payload[0];
             if (muxType == (byte)MuxType.Kcp)
             {
                 // 分支 2: KCP 协议包 -> 传送的 TCP 数据
@@ -395,7 +441,7 @@ namespace UDRoute
             }
             else if (muxType == (byte)MuxType.KeepAlive)
             {
-                // 已调用 UpdateActivity()
+                // 直连心跳保活帧，仅用于 NAT 路由器保活孔洞，不调用 UpdateActivity()
             }
             else
             {

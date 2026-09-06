@@ -461,16 +461,17 @@ namespace UDRoute
                                 _closedRelaySessions.Remove(sessionId);
                             }
 
-                            byte[] failBuf = ArrayPool<byte>.Shared.Rent(64);
+                            byte[] failBuf = ArrayPool<byte>.Shared.Rent(256);
                             try
                             {
                                 failBuf[0] = (byte)MsgType.Punch;
                                 BinaryPrimitives.WriteUInt16LittleEndian(failBuf.AsSpan(1, 2), contextId);
                                 sessionId.TryWriteBytes(failBuf.AsSpan(3, 16));
                                 Guid.Empty.TryWriteBytes(failBuf.AsSpan(19, 16));
-                                failBuf[35] = 0; // NotFound / Stale
+                                failBuf[35] = PunchStatus.StaleSession; // S restarted
+                                int failLen = 36 + ProtocolHelper.WriteString(failBuf.AsSpan(36), $"Target '{targetName}' restarted since session was created");
 
-                                byte[] failCopy = failBuf.AsSpan(0, 36).ToArray();
+                                byte[] failCopy = failBuf.AsSpan(0, failLen).ToArray();
                                 lock (_queryLock)
                                 {
                                     _recentQueryResponses[queryKey] = failCopy;
@@ -546,18 +547,18 @@ namespace UDRoute
                         if (!probeSuccess)
                         {
                             Log.Warn($"[P] Health probe timed out after {_config.ProbeTimeout}s for '{targetName}' at {sInfo.PublicEp}. Declaring channel dead.");
-                            RemoveServerRecord(sInfo);
 
-                            byte[] failBuf = ArrayPool<byte>.Shared.Rent(64);
+                            byte[] failBuf = ArrayPool<byte>.Shared.Rent(256);
                             try
                             {
                                 failBuf[0] = (byte)MsgType.Punch;
                                 BinaryPrimitives.WriteUInt16LittleEndian(failBuf.AsSpan(1, 2), contextId);
                                 sessionId.TryWriteBytes(failBuf.AsSpan(3, 16));
                                 Guid.Empty.TryWriteBytes(failBuf.AsSpan(19, 16));
-                                failBuf[35] = 0; // NotFound / Dead
+                                failBuf[35] = PunchStatus.SUnresponsive; // Health probe timed out / KeepAlive failed
+                                int failLen = 36 + ProtocolHelper.WriteString(failBuf.AsSpan(36), $"Target '{targetName}' is unresponsive (health probe timed out / keepalive failed)");
 
-                                byte[] failCopy = failBuf.AsSpan(0, 36).ToArray();
+                                byte[] failCopy = failBuf.AsSpan(0, failLen).ToArray();
                                 lock (_queryLock)
                                 {
                                     _recentQueryResponses[queryKey] = failCopy;
@@ -714,16 +715,17 @@ namespace UDRoute
                 {
                     // 未找到 S 记录，回送失败响应 (单次发送，严禁连发)
                     // [MsgType 1][ContextId 2][SessionId 16][DevId 16 (Empty)][Status 1 (0=NotFound)]
-                    byte[] failBuf = ArrayPool<byte>.Shared.Rent(64);
+                    byte[] failBuf = ArrayPool<byte>.Shared.Rent(256);
                     try
                     {
                         failBuf[0] = (byte)MsgType.Punch;
                         BinaryPrimitives.WriteUInt16LittleEndian(failBuf.AsSpan(1, 2), contextId);
                         sessionId.TryWriteBytes(failBuf.AsSpan(3, 16));
                         Guid.Empty.TryWriteBytes(failBuf.AsSpan(19, 16));
-                        failBuf[35] = 0; // NotFound
+                        failBuf[35] = PunchStatus.NotFound; // NotFound
+                        int failLen = 36 + ProtocolHelper.WriteString(failBuf.AsSpan(36), $"Service '{targetName}' is not registered on P");
 
-                        byte[] failCopy = failBuf.AsSpan(0, 36).ToArray();
+                        byte[] failCopy = failBuf.AsSpan(0, failLen).ToArray();
                         lock (_queryLock)
                         {
                             _recentQueryResponses[queryKey] = failCopy;
@@ -747,38 +749,6 @@ namespace UDRoute
                         _inFlightQueries.Remove(queryKey);
                     }
                     myTcs.TrySetResult(true);
-                }
-            }
-        }
-
-        private void RemoveServerRecord(ServerRecordInfo sInfo)
-        {
-            lock (_routingLock)
-            {
-                var authKeysToRemove = new List<string>();
-                foreach (var kvp in _authRoutingTable)
-                {
-                    if (ReferenceEquals(kvp.Value, sInfo))
-                    {
-                        authKeysToRemove.Add(kvp.Key);
-                    }
-                }
-                foreach (var k in authKeysToRemove)
-                {
-                    _authRoutingTable.TryRemove(k, out _);
-                }
-
-                var unauthKeysToRemove = new List<string>();
-                foreach (var kvp in _unauthRoutingTable)
-                {
-                    if (ReferenceEquals(kvp.Value, sInfo))
-                    {
-                        unauthKeysToRemove.Add(kvp.Key);
-                    }
-                }
-                foreach (var k in unauthKeysToRemove)
-                {
-                    _unauthRoutingTable.TryRemove(k, out _);
                 }
             }
         }

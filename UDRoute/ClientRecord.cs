@@ -12,5 +12,6 @@ namespace UDRoute
         public int Mtu { get; set; } = Constants.DefaultMtu;
         public bool ForceRelay { get; set; }
         public int Timeout { get; set; } = 0;
+        public int KeepAlive { get; set; } = Constants.DefaultKeepAlive;
     }
 }

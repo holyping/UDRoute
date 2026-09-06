@@ -247,15 +247,15 @@ namespace UDRoute
             Guid devId = new Guid(span.Slice(19, 16));
             byte status = span[35];
 
-            // Status 0 (NotFound / Dead) / Status 1 (Success) -> 属于 Client 端的查询响应
-            if (status == 0 || status == 1)
+            // 非打洞请求/确认包 -> 统一属于 Client 端的查询响应 (Success, NotFound, SUnresponsive, StaleSession 等)
+            if (status != PunchStatus.PunchReq && status != PunchStatus.PunchAck)
             {
                 if (_client != null && _client.TryHandleQueryResponse(span))
                 {
                     return;
                 }
             }
-            else if (status == 2 || status == 3) // 直接打洞包(2) 或 打洞确认包(3)
+            else // 直接打洞包(PunchReq=2) 或 打洞确认包(PunchAck=3)
             {
                 // 1. 尝试匹配 ClientMode 活动会话
                 if (_client != null && await _client.TryHandlePunchAsync(sessionId, devId, remoteEp, status, ct))

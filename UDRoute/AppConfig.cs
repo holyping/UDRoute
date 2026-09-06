@@ -49,6 +49,7 @@ namespace UDRoute
             get => MaxRecentRequests;
             set => MaxRecentRequests = value;
         }
+        public int KeepAlive { get; set; } = Constants.DefaultKeepAlive;
 
         public List<ClientRecord> ClientRecords { get; set; } = new();
         public List<ServerRecord> ServerRecords { get; set; } = new();

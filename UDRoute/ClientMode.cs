@@ -102,6 +102,21 @@ namespace UDRoute
                     tasks.Add(AcceptUdpLoopAsync(rec, ct));
             }
 
+            // 启动 C 到各 P 目标服务器的 NAT KeepAlive 保活循环 (使用全局 KeepAlive 间隔)
+            if (_config.KeepAlive > 0)
+            {
+                var distinctPServers = _config.ClientRecords
+                    .Where(r => !r.IsThis && !string.IsNullOrWhiteSpace(r.TargetServer))
+                    .Select(r => r.TargetServer)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
+                foreach (var pServer in distinctPServers)
+                {
+                    tasks.Add(RunPKeepAliveAsync(pServer, _config.KeepAlive, ct));
+                }
+            }
+
             await Task.WhenAll(tasks);
         }
 
@@ -184,16 +199,24 @@ namespace UDRoute
                     offset += 4;
                 }
 
-                req.Tcs.TrySetResult(new QueryResponse(true, devId, sPublicEp, sWanPort, timeout, sTimestamp, reqPass, kcpConfig, localEps, allowRelay, tunnelReuseInterval));
+                req.Tcs.TrySetResult(new QueryResponse(true, status, null, devId, sPublicEp, sWanPort, timeout, sTimestamp, reqPass, kcpConfig, localEps, allowRelay, tunnelReuseInterval));
                 return true;
             }
-            else if (status == 0) // P 回复的目标不存在或通道死亡
+            else // status != 1: 查询失败 (NotFound=0, SUnresponsive=4, StaleSession=5 等)
             {
-                req.Tcs.TrySetResult(new QueryResponse(false, Guid.Empty, null!, 0, 0, 0, false, null, null!));
+                string? errorMsg = null;
+                if (data.Length > 36)
+                {
+                    try
+                    {
+                        var (msg, _) = ProtocolHelper.ReadString(data.Slice(36));
+                        errorMsg = msg;
+                    }
+                    catch { }
+                }
+                req.Tcs.TrySetResult(new QueryResponse(false, status, errorMsg, Guid.Empty, null!, 0, 0, 0, false, null, null!));
                 return true;
             }
-
-            return false;
         }
 
         public async ValueTask<bool> TryHandlePunchAsync(Guid sessionId, Guid peerDevId, EndPoint remoteEp, byte status, CancellationToken ct)
@@ -307,7 +330,7 @@ namespace UDRoute
             }
             if (req != null)
             {
-                req.Tcs.TrySetResult(new QueryResponse(false, Guid.Empty, null!, 0, 0, 0, false, null, null!));
+                req.Tcs.TrySetResult(new QueryResponse(false, PunchStatus.NotFound, "Disconnected", Guid.Empty, null!, 0, 0, 0, false, null, null!));
             }
             TunnelSession? session;
             lock (_sessionLock)
@@ -673,7 +696,24 @@ namespace UDRoute
             try
             {
                 var resp = await tcs.Task.WaitAsync(linkedCts.Token);
-                return resp.Success && resp.AllowRelay;
+                if (!resp.Success)
+                {
+                    switch (resp.StatusCode)
+                    {
+                        case PunchStatus.SUnresponsive:
+                            Log.Warn($"[C] Relay refresh failed for '{queryName}': Target service S is unresponsive (health probe timed out / keepalive failed). {(resp.ErrorMessage != null ? $"Details: {resp.ErrorMessage}" : "")}");
+                            break;
+                        case PunchStatus.StaleSession:
+                            Log.Warn($"[C] Relay refresh failed for '{queryName}': Target server S restarted, session is stale. {(resp.ErrorMessage != null ? $"Details: {resp.ErrorMessage}" : "")}");
+                            break;
+                        case PunchStatus.NotFound:
+                        default:
+                            Log.Warn($"[C] Relay refresh failed for '{queryName}': Service not registered on P. {(resp.ErrorMessage != null ? $"Details: {resp.ErrorMessage}" : "")}");
+                            break;
+                    }
+                    return false;
+                }
+                return resp.AllowRelay;
             }
             catch
             {
@@ -822,7 +862,7 @@ namespace UDRoute
                         ArrayPool<byte>.Shared.Return(relayStartBuf);
                     }
 
-                    var session = new TunnelSession(_udp, sInfo.PublicEp, sessionId, rec.Mtu, rec.IsTcp, sInfo.KcpConfig, sInfo.Timeout, sInfo.TunnelReuseInterval);
+                    var session = new TunnelSession(_udp, sInfo.PublicEp, sessionId, rec.Mtu, rec.IsTcp, sInfo.KcpConfig, sInfo.Timeout, sInfo.TunnelReuseInterval, rec.KeepAlive);
                     session.ChannelDesc = rec.Port.ToString();
                     session.ForceRelay = effectiveForceRelay;
                     lock (_sessionLock)
@@ -906,13 +946,25 @@ namespace UDRoute
                 {
                     _pendingQueries.Remove(contextId);
                 }
-                Log.Warn($"[C] Query timeout for session {sessionId}");
+                Log.Warn($"[C] Query timeout for session {sessionId}: P server '{rec.TargetServer}' did not respond within {waitTimeoutSec}s (network unreachable or P offline).");
                 return null;
             }
 
             if (!resp.Success)
             {
-                Log.Warn($"[C] P returned NotFound for {queryName}");
+                switch (resp.StatusCode)
+                {
+                    case PunchStatus.SUnresponsive:
+                        Log.Error($"[C] Connection failed for '{queryName}': Target service S is unresponsive (health probe timed out / NAT keepalive failed). {(resp.ErrorMessage != null ? $"Details: {resp.ErrorMessage}" : "")}");
+                        break;
+                    case PunchStatus.StaleSession:
+                        Log.Warn($"[C] Connection failed for '{queryName}': Target server S restarted since session was created. {(resp.ErrorMessage != null ? $"Details: {resp.ErrorMessage}" : "")}");
+                        break;
+                    case PunchStatus.NotFound:
+                    default:
+                        Log.Warn($"[C] Connection failed for '{queryName}': Service '{queryName}' not registered on P server '{rec.TargetServer}'. {(resp.ErrorMessage != null ? $"Details: {resp.ErrorMessage}" : "")}");
+                        break;
+                }
                 return null;
             }
 
@@ -932,7 +984,7 @@ namespace UDRoute
                     Log.Info($"[C] Server/Proxy does not allow relay (AllowRelay=false) for {queryName}, ignoring ForceRelay.");
                 }
                 Log.Info($"[C] P relay not allowed for {queryName}. Waiting for UDP punch before starting tunnel...");
-                tunnelSession = new TunnelSession(_udp, resp.ServerPublicEp, sessionId, rec.Mtu, rec.IsTcp, resp.KcpConfig, resp.Timeout, resp.TunnelReuseInterval);
+                tunnelSession = new TunnelSession(_udp, resp.ServerPublicEp, sessionId, rec.Mtu, rec.IsTcp, resp.KcpConfig, resp.Timeout, resp.TunnelReuseInterval, rec.KeepAlive);
                 tunnelSession.ChannelDesc = rec.Port.ToString();
                 tunnelSession.ForceRelay = false;
                 lock (_sessionLock)
@@ -957,7 +1009,7 @@ namespace UDRoute
             }
             else
             {
-                tunnelSession = new TunnelSession(_udp, pEndPoint, sessionId, rec.Mtu, rec.IsTcp, resp.KcpConfig, resp.Timeout, resp.TunnelReuseInterval);
+                tunnelSession = new TunnelSession(_udp, pEndPoint, sessionId, rec.Mtu, rec.IsTcp, resp.KcpConfig, resp.Timeout, resp.TunnelReuseInterval, rec.KeepAlive);
                 tunnelSession.ChannelDesc = rec.Port.ToString();
                 bool isForceRelay = rec.ForceRelay;
                 tunnelSession.ForceRelay = isForceRelay;
@@ -1018,6 +1070,75 @@ namespace UDRoute
             return pass;
         }
 
-        private record QueryResponse(bool Success, Guid DevId, IPEndPoint ServerPublicEp, int ServerWanPort, int Timeout, long STimestamp, bool RequiresPassword, KcpConfig? KcpConfig, List<IPEndPoint> LocalEps, bool AllowRelay = true, int TunnelReuseInterval = Constants.DefaultTunnelReuseInterval);
+        private async Task RunPKeepAliveAsync(string pServer, int intervalSec, CancellationToken ct)
+        {
+            Log.Info($"[C] Enabled on-demand NAT KeepAlive to P server '{pServer}' (active only when relay connections are working, interval: {intervalSec}s)");
+            byte[] pingBuf = new byte[17];
+            pingBuf[0] = (byte)MsgType.EchoReq;
+            Guid.NewGuid().TryWriteBytes(pingBuf.AsSpan(1, 16));
+
+            IPEndPoint? cachedEp = null;
+            DateTime lastResolve = DateTime.MinValue;
+
+            while (!ct.IsCancellationRequested)
+            {
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(intervalSec), ct);
+
+                    // 仅当有正在工作的走P中继连接时才向P发送保活包，无连接时停止保活以节省P端算力与带宽
+                    bool hasCandidateSessions;
+                    lock (_sessionLock)
+                    {
+                        hasCandidateSessions = _sessions.Values.Any(s => !s.IsClosed && !s.IsDirect && s.ActiveChannelCount > 0);
+                    }
+
+                    if (!hasCandidateSessions)
+                    {
+                        continue;
+                    }
+
+                    if (cachedEp == null || (DateTime.UtcNow - lastResolve).TotalMinutes > 5)
+                    {
+                        var eps = await ProtocolHelper.ResolveAllEndPointsAsync(pServer, Constants.DefaultProxyPort);
+                        if (eps != null && eps.Length > 0)
+                        {
+                            cachedEp = eps[0];
+                            lastResolve = DateTime.UtcNow;
+                        }
+                    }
+
+                    if (cachedEp != null)
+                    {
+                        bool hasActiveForEp;
+                        lock (_sessionLock)
+                        {
+                            hasActiveForEp = _sessions.Values.Any(s =>
+                                !s.IsClosed &&
+                                !s.IsDirect &&
+                                s.ActiveChannelCount > 0 &&
+                                (s.ProxyEp == null || ProtocolHelper.AreEndPointsEqual(s.ProxyEp, cachedEp)));
+                        }
+
+                        if (hasActiveForEp)
+                        {
+                            await _udp.SendAsync(pingBuf, cachedEp, ct);
+                            Log.Trace($"[C] Sent NAT KeepAlive to P ({cachedEp}) for active working relay session");
+                        }
+                    }
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    Log.Trace($"[C] NAT KeepAlive to P failed: {ex.Message}");
+                    cachedEp = null;
+                }
+            }
+        }
+
+        private record QueryResponse(bool Success, byte StatusCode, string? ErrorMessage, Guid DevId, IPEndPoint ServerPublicEp, int ServerWanPort, int Timeout, long STimestamp, bool RequiresPassword, KcpConfig? KcpConfig, List<IPEndPoint> LocalEps, bool AllowRelay = true, int TunnelReuseInterval = Constants.DefaultTunnelReuseInterval);
     }
 }

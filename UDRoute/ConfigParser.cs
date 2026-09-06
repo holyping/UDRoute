@@ -99,6 +99,7 @@ namespace UDRoute
             int timeout = Constants.DefaultTimeout;
             int currentTunnelReuseInterval = cfg.TunnelReuseInterval;
             bool currentAllowRelay = true;
+            int currentKeepAlive = cfg.KeepAlive;
             bool missingDevId = !lines.Any(l => l.TrimStart().StartsWith("devid", StringComparison.OrdinalIgnoreCase));
             bool configModified = missingDevId;
             ServerRecord? sRec = null;
@@ -132,7 +133,8 @@ namespace UDRoute
                         Timeout = timeout,
                         TunnelReuseInterval = currentTunnelReuseInterval,
                         AllowRelay = currentAllowRelay,
-                        KcpConfig = currentKcpConfig.Clone()
+                        KcpConfig = currentKcpConfig.Clone(),
+                        KeepAlive = currentKeepAlive
                     });
                     continue;
                 }
@@ -166,6 +168,13 @@ namespace UDRoute
                         case "tunnelreuseinterval" or "tunnelreuse":
                             currentTunnelReuseInterval = int.Parse(val);
                             cfg.TunnelReuseInterval = currentTunnelReuseInterval;
+                            break;
+                        case "keepalive" or "keepaliveinterval":
+                            if (int.TryParse(val, out int parsedKa))
+                            {
+                                cfg.KeepAlive = parsedKa;
+                                currentKeepAlive = parsedKa;
+                            }
                             break;
                         case "loglevel":
                             cfg.LogLevel = val.ToLower() switch
@@ -267,6 +276,9 @@ namespace UDRoute
                             break;
                         case "mtu": sRec.Mtu = int.Parse(val); break;
                         case "reginterval": sRec.RegInterval = int.Parse(val); break;
+                        case "keepalive" or "keepaliveinterval":
+                            if (int.TryParse(val, out int sKa)) sRec.KeepAlive = sKa;
+                            break;
                         case "tunnelreuseinterval" or "tunnelreuse": sRec.TunnelReuseInterval = int.Parse(val); break;
                         case "allowrelay": sRec.AllowRelay = val == "1" || val.Equals("true", StringComparison.OrdinalIgnoreCase); break;
                         case "readonly": sRec.ReadOnly = val == "1" || val.Equals("true", StringComparison.OrdinalIgnoreCase); break;
@@ -372,7 +384,8 @@ namespace UDRoute
                 Port = int.Parse(parts[0]),
                 IsTcp = parts.Length == 1 || parts[1].ToLower() == "tcp",
                 Mtu = defaultMtu,
-                ForceRelay = cfg.ForceRelay
+                ForceRelay = cfg.ForceRelay,
+                KeepAlive = cfg.KeepAlive
             };
 
             var valParts = val.Split('@');
@@ -455,7 +468,8 @@ namespace UDRoute
                             IsThis = isThis,
                             RegInterval = Constants.DefaultRegInterval,
                             Mtu = Constants.DefaultMtu,
-                            KcpConfig = new KcpConfig()
+                            KcpConfig = new KcpConfig(),
+                            KeepAlive = cfg.KeepAlive
                         };
 
                         if (valParts[0].EndsWith(";/file", StringComparison.OrdinalIgnoreCase))
