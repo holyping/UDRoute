@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Threading.Channels;
 using UDRoute.Logging;
@@ -54,6 +55,7 @@ namespace UDRoute
             public readonly Dictionary<EndPoint, long> ClientLastActive = new();
         }
         private readonly ConcurrentDictionary<Guid, UdpTunnelContext> _udpContexts = new();
+        private readonly ConcurrentDictionary<Guid, TaskCompletionSource<IPEndPoint>> _pendingEchoes = new();
 
         public ClientMode(AppConfig config, ZeroCopyUdpSocket udp, ProxyMode? localProxy)
         {
@@ -93,31 +95,81 @@ namespace UDRoute
 
         public async Task RunAsync(CancellationToken ct)
         {
-            var tasks = new List<Task>();
-            foreach (var rec in _config.ClientRecords)
+            NetworkAddressChangedEventHandler? netHandler = null;
+            try
             {
-                if (rec.IsTcp)
-                    tasks.Add(AcceptTcpLoopAsync(rec, ct));
-                else
-                    tasks.Add(AcceptUdpLoopAsync(rec, ct));
+                netHandler = (s, e) => OnNetworkAddressChanged();
+                NetworkChange.NetworkAddressChanged += netHandler;
+            }
+            catch (Exception ex)
+            {
+                Log.Debug($"[C] Failed to subscribe to NetworkAddressChanged: {ex.Message}");
             }
 
-            // 启动 C 到各 P 目标服务器的 NAT KeepAlive 保活循环 (使用全局 KeepAlive 间隔)
-            if (_config.KeepAlive > 0)
+            try
             {
-                var distinctPServers = _config.ClientRecords
-                    .Where(r => !r.IsThis && !string.IsNullOrWhiteSpace(r.TargetServer))
-                    .Select(r => r.TargetServer)
-                    .Distinct(StringComparer.OrdinalIgnoreCase)
-                    .ToList();
-
-                foreach (var pServer in distinctPServers)
+                var tasks = new List<Task>();
+                foreach (var rec in _config.ClientRecords)
                 {
-                    tasks.Add(RunPKeepAliveAsync(pServer, _config.KeepAlive, ct));
+                    if (rec.IsTcp)
+                        tasks.Add(AcceptTcpLoopAsync(rec, ct));
+                    else
+                        tasks.Add(AcceptUdpLoopAsync(rec, ct));
+                }
+
+                // 启动 C 到各 P 目标服务器的 NAT KeepAlive 保活循环 (使用全局 KeepAlive 间隔)
+                if (_config.KeepAlive > 0)
+                {
+                    var distinctPServers = _config.ClientRecords
+                        .Where(r => !r.IsThis && !string.IsNullOrWhiteSpace(r.TargetServer))
+                        .Select(r => r.TargetServer)
+                        .Distinct(StringComparer.OrdinalIgnoreCase)
+                        .ToList();
+
+                    foreach (var pServer in distinctPServers)
+                    {
+                        tasks.Add(RunPKeepAliveAsync(pServer, _config.KeepAlive, ct));
+                    }
+                }
+
+                await Task.WhenAll(tasks);
+            }
+            finally
+            {
+                if (netHandler != null)
+                {
+                    try { NetworkChange.NetworkAddressChanged -= netHandler; } catch { }
                 }
             }
+        }
 
-            await Task.WhenAll(tasks);
+        private void OnNetworkAddressChanged()
+        {
+            Log.Info("[C] Network address change detected. Evicting idle reusable tunnels...");
+            List<TunnelSession> toDispose = new();
+            lock (_tunnelStateLock)
+            {
+                var keys = _reusableTunnels.Keys.ToList();
+                foreach (var key in keys)
+                {
+                    if (_reusableTunnels.TryGetValue(key, out var session))
+                    {
+                        if (session.ActiveChannelCount == 0)
+                        {
+                            _reusableTunnels.Remove(key);
+                            toDispose.Add(session);
+                        }
+                    }
+                }
+            }
+            foreach (var s in toDispose)
+            {
+                lock (_sessionLock)
+                {
+                    _sessions.Remove(s.SessionId);
+                }
+                s.Dispose();
+            }
         }
 
         public bool TryHandleQueryResponse(ReadOnlySpan<byte> data)
@@ -344,6 +396,34 @@ namespace UDRoute
             return false;
         }
 
+        public void TryHandleEchoResp(ReadOnlySpan<byte> data)
+        {
+            if (data.Length < 17) return;
+            Guid sessionId = new Guid(data.Slice(1, 16));
+            if (_pendingEchoes.TryRemove(sessionId, out var tcs))
+            {
+                IPEndPoint? ep = null;
+                if (data.Length > 17)
+                {
+                    (ep, _) = ProtocolHelper.ReadIPEndPoint(data.Slice(17));
+                }
+                tcs.TrySetResult(ep!);
+            }
+        }
+
+        public void TryUpdatePeerEndpoint(Guid sessionId, EndPoint remoteEp)
+        {
+            TunnelSession? session;
+            lock (_sessionLock)
+            {
+                _sessions.TryGetValue(sessionId, out session);
+            }
+            if (session != null && !session.IsClosed)
+            {
+                session.EnsureDirectRouteFromPeer(remoteEp);
+            }
+        }
+
         private async Task AcceptTcpLoopAsync(ClientRecord rec, CancellationToken ct)
         {
             TcpListener listener = new TcpListener(IPAddress.IPv6Any, rec.Port);
@@ -388,9 +468,25 @@ namespace UDRoute
                                     await session.OpenAndBridgeChannelAsync(client, ct);
                                     break;
                                 }
-                                catch (Exception) when (retry == 0 && session.IsClosed)
+                                catch (Exception ex) when (retry == 0)
                                 {
-                                    Log.Warn($"[C] Data tunnel {session.SessionId} was closed or rejected by peer. Retrying with a fresh data tunnel...");
+                                    Log.Warn($"[C] Data tunnel {session.SessionId} failed to open channel: {ex.Message}. Evicting stale tunnel and retrying with a fresh session...");
+                                    string tunnelKey = $"{rec.TargetServer}@{queryName}";
+                                    lock (_tunnelStateLock)
+                                    {
+                                        if (_reusableTunnels.TryGetValue(tunnelKey, out var curr) && ReferenceEquals(curr, session))
+                                        {
+                                            _reusableTunnels.Remove(tunnelKey);
+                                        }
+                                    }
+                                    lock (_sessionLock)
+                                    {
+                                        if (_sessions.TryGetValue(session.SessionId, out var curS) && ReferenceEquals(curS, session))
+                                        {
+                                            _sessions.Remove(session.SessionId);
+                                        }
+                                    }
+                                    session.Dispose();
                                     continue;
                                 }
                             }
@@ -725,6 +821,40 @@ namespace UDRoute
             }
         }
 
+        private async Task<bool> EnsureDirectActiveAsync(TunnelSession session, CancellationToken ct)
+        {
+            var targetEp = session.ActiveRemoteEp;
+            if (targetEp == null) return false;
+
+            var tcs = new TaskCompletionSource<IPEndPoint>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _pendingEchoes[session.SessionId] = tcs;
+
+            byte[] echoReq = ArrayPool<byte>.Shared.Rent(17);
+            try
+            {
+                echoReq[0] = (byte)MsgType.EchoReq;
+                session.SessionId.TryWriteBytes(echoReq.AsSpan(1, 16));
+                await _udp.SendAsync(echoReq.AsMemory(0, 17), targetEp, ct);
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(echoReq);
+            }
+
+            using var timeoutCts = new CancellationTokenSource(600);
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
+            try
+            {
+                await tcs.Task.WaitAsync(linkedCts.Token);
+                return true;
+            }
+            catch
+            {
+                _pendingEchoes.TryRemove(session.SessionId, out _);
+                return false;
+            }
+        }
+
         private async Task<TunnelSession?> GetOrCreateTunnelSessionAsync(ClientRecord rec, string queryName, CancellationToken ct, bool forceNew = false)
         {
             string tunnelKey = $"{rec.TargetServer}@{queryName}";
@@ -753,6 +883,23 @@ namespace UDRoute
                         if (!relayOk)
                         {
                             Log.Warn($"[C] Reused relay tunnel {existing.SessionId} failed to re-activate on P (target server may have restarted or closed). Recreating tunnel...");
+                            lock (_tunnelStateLock)
+                            {
+                                if (_reusableTunnels.TryGetValue(tunnelKey, out var cur) && ReferenceEquals(cur, existing))
+                                {
+                                    _reusableTunnels.Remove(tunnelKey);
+                                }
+                            }
+                            existing.Dispose();
+                            existing = null;
+                        }
+                    }
+                    else if (existing.IsDirect && existing.ActiveChannelCount == 0)
+                    {
+                        bool directOk = await EnsureDirectActiveAsync(existing, ct);
+                        if (!directOk)
+                        {
+                            Log.Warn($"[C] Reused direct tunnel {existing.SessionId} failed echo probe (peer unreachable or network changed). Recreating tunnel...");
                             lock (_tunnelStateLock)
                             {
                                 if (_reusableTunnels.TryGetValue(tunnelKey, out var cur) && ReferenceEquals(cur, existing))

@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text;
 using UDRoute.Logging;
@@ -18,6 +19,7 @@ namespace UDRoute
         private readonly ZeroCopyUdpSocket _udp;
         private readonly Dictionary<Guid, TunnelSession> _sessions = new();
         private readonly object _sessionLock = new();
+        private readonly SemaphoreSlim _reRegisterSignal = new(0, 1);
         public IEnumerable<TunnelSession> Sessions
         {
             get
@@ -101,9 +103,18 @@ namespace UDRoute
                 _ = Task.Run(() => RunPKeepAliveAsync(target.TargetServer, target.Interval, ct), ct);
             }
 
-            byte[] buffer = new byte[1024];
-            while (!ct.IsCancellationRequested)
+            NetworkAddressChangedEventHandler netHandler = (s, e) =>
             {
+                Log.Info("[S] Network address change detected. Triggering immediate re-registration with P...");
+                try { _reRegisterSignal.Release(); } catch { }
+            };
+            NetworkChange.NetworkAddressChanged += netHandler;
+
+            try
+            {
+                byte[] buffer = new byte[1024];
+                while (!ct.IsCancellationRequested)
+                {
                 try
                 {
                     var orilocalEps = ProtocolHelper.GetLocalEndPoints(((IPEndPoint)_udp.LocalEndPoint).Port);
@@ -317,7 +328,16 @@ namespace UDRoute
                 int interval = _config.ServerRecords.Count > 0 
                     ? _config.ServerRecords.Min(r => r.RegInterval > 0 ? r.RegInterval : Constants.DefaultRegInterval) 
                     : Constants.DefaultRegInterval;
-                await Task.Delay(interval * 1000, ct);
+                try
+                {
+                    await _reRegisterSignal.WaitAsync(interval * 1000, ct);
+                }
+                catch (TimeoutException) { }
+            }
+            }
+            finally
+            {
+                NetworkChange.NetworkAddressChanged -= netHandler;
             }
         }
 
@@ -329,6 +349,19 @@ namespace UDRoute
             {
                 var (ep, _) = ProtocolHelper.ReadIPEndPoint(data.Slice(17));
                 tcs.TrySetResult(ep);
+            }
+        }
+
+        public void TryUpdatePeerEndpoint(Guid sessionId, EndPoint remoteEp)
+        {
+            TunnelSession? session;
+            lock (_sessionLock)
+            {
+                _sessions.TryGetValue(sessionId, out session);
+            }
+            if (session != null && !session.IsClosed)
+            {
+                session.EnsureDirectRouteFromPeer(remoteEp);
             }
         }
 
@@ -625,6 +658,7 @@ namespace UDRoute
                         var targetClient = new TcpClient();
                         await targetClient.ConnectAsync(rec.TargetIp, rec.TargetPort, ct);
                         Log.Info($"[S] Connected to Target TCP {rec.TargetIp}:{rec.TargetPort} for Session {sessionId}, Channel {channelId}");
+                        await session.SendFrameAsync(channelId, ChannelCmd.OpenAck, ReadOnlyMemory<byte>.Empty, CancellationToken.None);
                         await session.RunChannelBridgeAsync(channelId, targetClient, ct);
                     }
                     catch (Exception ex)

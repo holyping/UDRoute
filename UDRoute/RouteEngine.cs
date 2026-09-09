@@ -163,11 +163,24 @@ namespace UDRoute
                                 break;
 
                             case MsgType.EchoReq:
+                                if (span.Length >= 17)
+                                {
+                                    var echoSessionId = new Guid(span.Slice(1, 16));
+                                    _server?.TryUpdatePeerEndpoint(echoSessionId, remoteEp);
+                                    _client?.TryUpdatePeerEndpoint(echoSessionId, remoteEp);
+                                }
                                 await HandleEchoReqAsync(mem, remoteEp, ct);
                                 break;
 
                             case MsgType.EchoResp:
+                                if (span.Length >= 17)
+                                {
+                                    var echoSessionId = new Guid(span.Slice(1, 16));
+                                    _server?.TryUpdatePeerEndpoint(echoSessionId, remoteEp);
+                                    _client?.TryUpdatePeerEndpoint(echoSessionId, remoteEp);
+                                }
                                 _server?.TryHandleEchoResp(span);
+                                _client?.TryHandleEchoResp(span);
                                 break;
 
                             case MsgType.RegisterAck:

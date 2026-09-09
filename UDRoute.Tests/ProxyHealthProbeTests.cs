@@ -114,9 +114,9 @@ public class ProxyHealthProbeTests
         Guid respSessionId = new Guid(recvBuf.AsSpan(3, 16));
         Assert.Equal(sessionId, respSessionId);
         byte status = recvBuf[35];
-        Assert.Equal(0, status); // Status 0 = Dead / NotFound!
+        Assert.True(status == PunchStatus.SUnresponsive || status == PunchStatus.NotFound); // Status 4 = SUnresponsive, 0 = NotFound
 
-        _out.WriteLine("Verified: P probed S, timed out after T2, declared channel dead and returned Status 0 to C.");
+        _out.WriteLine("Verified: P probed S, timed out after T2, declared channel dead and returned status to C.");
     }
 
     [Fact]

@@ -300,6 +300,24 @@ namespace UDRoute
                 SendRegisterAck(remoteEp, contextId, 1);
                 Log.Info($"[P] S Registered (Unauth): {name}/{proto} (DevId: {devId}, Suffix: {suffix}) from {remoteEp}");
             }
+
+            // 同步更新现有关联该服务的中继会话的 ServerEp
+            lock (_relayLock)
+            {
+                foreach (var rKvp in _relaySessions)
+                {
+                    if (string.Equals(rKvp.Value.TargetName, serviceName, StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(rKvp.Value.TargetName, key2, StringComparison.OrdinalIgnoreCase) ||
+                        (key3 != null && string.Equals(rKvp.Value.TargetName, key3, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        if (!ProtocolHelper.AreEndPointsEqual(rKvp.Value.ServerEp, remoteEp))
+                        {
+                            Log.Info($"[P] Synced RelaySession {rKvp.Key} ServerEp: {rKvp.Value.ServerEp} -> {remoteEp} upon S re-registration ({serviceName}).");
+                            rKvp.Value.ServerEp = remoteEp;
+                        }
+                    }
+                }
+            }
         }
 
         private bool CanOverwriteAuth(string key, string newUser, EndPoint remoteEp, ushort contextId)
@@ -814,10 +832,14 @@ namespace UDRoute
                     }
                     else if (_closedRelaySessions.Remove(sessionId, out var closedInfo))
                     {
+                        bool isFromS = ProtocolHelper.AreEndPointsEqual(remoteEp, closedInfo.ServerEp) ||
+                                       (_authRoutingTable.TryGetValue(closedInfo.TargetName, out var authSInfo) && ProtocolHelper.AreEndPointsEqual(remoteEp, authSInfo.PublicEp)) ||
+                                       (_unauthRoutingTable.TryGetValue(closedInfo.TargetName, out var unauthSInfo) && ProtocolHelper.AreEndPointsEqual(remoteEp, unauthSInfo.PublicEp));
+
                         var restoredSession = new RelaySession
                         {
-                            ClientEp = ProtocolHelper.AreEndPointsEqual(remoteEp, closedInfo.ClientEp) ? remoteEp : closedInfo.ClientEp,
-                            ServerEp = ProtocolHelper.AreEndPointsEqual(remoteEp, closedInfo.ServerEp) ? remoteEp : closedInfo.ServerEp,
+                            ClientEp = isFromS ? closedInfo.ClientEp : remoteEp,
+                            ServerEp = isFromS ? remoteEp : closedInfo.ServerEp,
                             LastSeen = DateTime.UtcNow,
                             TimeoutSeconds = closedInfo.TimeoutSeconds,
                             ServerTimestamp = closedInfo.ServerTimestamp,
@@ -825,7 +847,7 @@ namespace UDRoute
                         };
                         _relaySessions[sessionId] = restoredSession;
                         sessionToForward = restoredSession;
-                        Log.Info($"[P] Closed/inactive relay session {sessionId} re-established upon receiving data packet from {remoteEp}.");
+                        Log.Info($"[P] Closed/inactive relay session {sessionId} re-established upon receiving data packet from {remoteEp} (Sender: {(isFromS ? "Server" : "Client")}).");
                     }
                     else
                     {
@@ -836,29 +858,46 @@ namespace UDRoute
 
             if (sessionToForward != null)
             {
-                if (ProtocolHelper.AreEndPointsEqual(remoteEp, sessionToForward.ClientEp))
+                bool isServer = ProtocolHelper.AreEndPointsEqual(remoteEp, sessionToForward.ServerEp) ||
+                                (_authRoutingTable.TryGetValue(sessionToForward.TargetName, out var authS) && ProtocolHelper.AreEndPointsEqual(remoteEp, authS.PublicEp)) ||
+                                (_unauthRoutingTable.TryGetValue(sessionToForward.TargetName, out var unauthS) && ProtocolHelper.AreEndPointsEqual(remoteEp, unauthS.PublicEp));
+
+                if (isServer)
                 {
-                    await _udp.SendAsync(packetMem, sessionToForward.ServerEp, ct);
-                    return true;
-                }
-                else if (ProtocolHelper.AreEndPointsEqual(remoteEp, sessionToForward.ServerEp))
-                {
+                    if (!ProtocolHelper.AreEndPointsEqual(remoteEp, sessionToForward.ServerEp))
+                    {
+                        Log.Info($"[P] Relay session {sessionId} ServerEp migrated: {sessionToForward.ServerEp} -> {remoteEp}");
+                        sessionToForward.ServerEp = remoteEp;
+                    }
+
                     if (!isMigrated)
                     {
                         sessionToForward.LastSeen = DateTime.UtcNow;
                     }
-                    if (_authRoutingTable.TryGetValue(sessionToForward.TargetName, out var authS))
+                    if (_authRoutingTable.TryGetValue(sessionToForward.TargetName, out var authCur))
                     {
-                        authS.LastSeen = DateTime.UtcNow;
+                        authCur.LastSeen = DateTime.UtcNow;
                     }
-                    else if (_unauthRoutingTable.TryGetValue(sessionToForward.TargetName, out var unauthS))
+                    else if (_unauthRoutingTable.TryGetValue(sessionToForward.TargetName, out var unauthCur))
                     {
-                        unauthS.LastSeen = DateTime.UtcNow;
+                        unauthCur.LastSeen = DateTime.UtcNow;
                     }
                     await _udp.SendAsync(packetMem, sessionToForward.ClientEp, ct);
                     return true;
                 }
-                return false;
+                else
+                {
+                    // 来源非 S 端，携带着合法的 SessionId，必定为 C 端发来的数据包
+                    // 检查并动态自适应更新 C 端的回复端点（针对 C 端网卡切换、NAT 端口漂移等）
+                    if (!ProtocolHelper.AreEndPointsEqual(remoteEp, sessionToForward.ClientEp))
+                    {
+                        Log.Info($"[P] Relay session {sessionId} ClientEp migrated: {sessionToForward.ClientEp} -> {remoteEp}");
+                        sessionToForward.ClientEp = remoteEp;
+                    }
+
+                    await _udp.SendAsync(packetMem, sessionToForward.ServerEp, ct);
+                    return true;
+                }
             }
 
             if (sendDisconnect)
@@ -885,15 +924,13 @@ namespace UDRoute
             {
                 try
                 {
-                    if (ProtocolHelper.AreEndPointsEqual(remoteEp, session.ClientEp))
-                    {
-                        await _udp.SendAsync(packetMem, session.ServerEp, ct);
-                    }
-                    else if (ProtocolHelper.AreEndPointsEqual(remoteEp, session.ServerEp))
-                    {
-                        await _udp.SendAsync(packetMem, session.ClientEp, ct);
-                    }
-                    Log.Info($"[P] Session {sessionId} disconnected by peer, relayed notice and closed relay session on P.");
+                    bool isFromS = ProtocolHelper.AreEndPointsEqual(remoteEp, session.ServerEp) ||
+                                   (_authRoutingTable.TryGetValue(session.TargetName, out var authSInfo) && ProtocolHelper.AreEndPointsEqual(remoteEp, authSInfo.PublicEp)) ||
+                                   (_unauthRoutingTable.TryGetValue(session.TargetName, out var unauthSInfo) && ProtocolHelper.AreEndPointsEqual(remoteEp, unauthSInfo.PublicEp));
+
+                    var targetEp = isFromS ? session.ClientEp : session.ServerEp;
+                    await _udp.SendAsync(packetMem, targetEp, ct);
+                    Log.Info($"[P] Session {sessionId} disconnected by {(isFromS ? "Server" : "Client")}, relayed notice to {targetEp} and closed relay session on P.");
                 }
                 catch (Exception ex)
                 {

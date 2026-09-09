@@ -15,7 +15,8 @@ namespace UDRoute
         Open = 1,
         Data = 2,
         Close = 3,
-        KeepAlive = 4
+        KeepAlive = 4,
+        OpenAck = 5
     }
 
     public enum MuxType : byte
@@ -40,6 +41,7 @@ namespace UDRoute
         private readonly SemaphoreSlim _signal = new(0);
         private readonly Channel<byte[]> _inboundChannel;
         private readonly CancellationTokenSource _sessionCts = new();
+        private readonly ConcurrentDictionary<uint, TaskCompletionSource<bool>> _openAckTcs = new();
         private bool _isDirect = false;
         private long _lastActiveTime = Environment.TickCount64;
         private long _lastUdpOutTick = 0;
@@ -72,9 +74,60 @@ namespace UDRoute
         public uint AllocateChannelId() => Interlocked.Increment(ref _nextChannelId);
         public Task SessionClosedTask => _sessionClosedTcs.Task;
         public bool IsClosed => _sessionCts.IsCancellationRequested;
-        public Func<uint, Task>? OnIncomingChannel { get; set; }
-        public Func<uint, byte[], Task>? OnIncomingUdpPacket { get; set; }
-        public Action<uint, byte[]>? OnClientUdpDataReceived { get; set; }
+        private Func<uint, Task>? _onIncomingChannel;
+        private readonly ConcurrentQueue<uint> _pendingIncomingChannels = new();
+        public Func<uint, Task>? OnIncomingChannel
+        {
+            get => _onIncomingChannel;
+            set
+            {
+                _onIncomingChannel = value;
+                if (value != null)
+                {
+                    while (_pendingIncomingChannels.TryDequeue(out var pendingCh))
+                    {
+                        _ = Task.Run(() => value(pendingCh));
+                    }
+                }
+            }
+        }
+
+        private Func<uint, byte[], Task>? _onIncomingUdpPacket;
+        private readonly ConcurrentQueue<(uint ChannelId, byte[] Data)> _pendingIncomingUdpPackets = new();
+        public Func<uint, byte[], Task>? OnIncomingUdpPacket
+        {
+            get => _onIncomingUdpPacket;
+            set
+            {
+                _onIncomingUdpPacket = value;
+                if (value != null)
+                {
+                    while (_pendingIncomingUdpPackets.TryDequeue(out var pending))
+                    {
+                        _ = Task.Run(() => value(pending.ChannelId, pending.Data));
+                    }
+                }
+            }
+        }
+
+        private Action<uint, byte[]>? _onClientUdpDataReceived;
+        private readonly ConcurrentQueue<(uint ChannelId, byte[] Data)> _pendingClientUdpPackets = new();
+        public Action<uint, byte[]>? OnClientUdpDataReceived
+        {
+            get => _onClientUdpDataReceived;
+            set
+            {
+                _onClientUdpDataReceived = value;
+                if (value != null)
+                {
+                    while (_pendingClientUdpPackets.TryDequeue(out var pending))
+                    {
+                        value(pending.ChannelId, pending.Data);
+                    }
+                }
+            }
+        }
+
         public Action<uint>? OnUdpChannelClosed { get; set; }
         public int IncrementActiveChannel()
         {
@@ -345,7 +398,7 @@ namespace UDRoute
         // 当收到对方直接发来的打洞包，切换路由
         public void SwitchToDirect(EndPoint directEp)
         {
-            if (!_isDirect || !_activeRemoteEp.Equals(directEp))
+            if (!_isDirect || !ProtocolHelper.AreEndPointsEqual(_activeRemoteEp, directEp))
             {
                 _activeRemoteEp = directEp;
                 _isDirect = true;
@@ -358,9 +411,9 @@ namespace UDRoute
         public void EnsureDirectRouteFromPeer(EndPoint remoteEp)
         {
             if (ForceRelay) return;
-            if (ProxyEp != null && remoteEp.Equals(ProxyEp)) return;
+            if (ProxyEp != null && ProtocolHelper.AreEndPointsEqual(remoteEp, ProxyEp)) return;
 
-            if (!_isDirect || !_activeRemoteEp.Equals(remoteEp))
+            if (!_isDirect || !ProtocolHelper.AreEndPointsEqual(_activeRemoteEp, remoteEp))
             {
                 Log.Info($"[Tunnel] Session {_sessionId} received direct signal from peer {remoteEp} (was {(_isDirect ? _activeRemoteEp : "Relay")}). Switched route to direct.");
                 SwitchToDirect(remoteEp);
@@ -466,17 +519,20 @@ namespace UDRoute
             {
                 case ChannelCmd.Data:
                     byte[] copy = data.ToArray();
-                    if (OnIncomingUdpPacket != null)
+                    var udpHandler = _onIncomingUdpPacket;
+                    var clientHandler = _onClientUdpDataReceived;
+                    if (udpHandler != null)
                     {
-                        _ = Task.Run(() => OnIncomingUdpPacket(channelId, copy));
+                        _ = Task.Run(() => udpHandler(channelId, copy));
                     }
-                    else if (OnClientUdpDataReceived != null)
+                    else if (clientHandler != null)
                     {
-                        OnClientUdpDataReceived(channelId, copy);
+                        clientHandler(channelId, copy);
                     }
                     else
                     {
-                        _inboundChannel.Writer.TryWrite(copy);
+                        _pendingIncomingUdpPackets.Enqueue((channelId, copy));
+                        _pendingClientUdpPackets.Enqueue((channelId, copy));
                     }
                     break;
                 case ChannelCmd.Close:
@@ -531,12 +587,12 @@ namespace UDRoute
             // 防御性代码：如果当前 session 已经是直连模式，而断开信号来自 P 端或非直连对端，则忽略该信号
             if (_isDirect)
             {
-                if (ProxyEp != null && remoteEp.Equals(ProxyEp))
+                if (ProxyEp != null && ProtocolHelper.AreEndPointsEqual(remoteEp, ProxyEp))
                 {
                     Log.Info($"[Tunnel] Session {_sessionId} is in direct mode. Ignored disconnect signal from Proxy {remoteEp}.");
                     return true;
                 }
-                if (!remoteEp.Equals(_activeRemoteEp))
+                if (!ProtocolHelper.AreEndPointsEqual(remoteEp, _activeRemoteEp))
                 {
                     Log.Info($"[Tunnel] Session {_sessionId} is in direct mode. Ignored disconnect signal from non-direct endpoint {remoteEp}.");
                     return true;
@@ -681,23 +737,42 @@ namespace UDRoute
             switch (cmd)
             {
                 case ChannelCmd.Open:
-                    if (OnIncomingChannel != null)
+                    var chHandler = _onIncomingChannel;
+                    var newCh = Channel.CreateUnbounded<byte[]>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
+                    if (_tcpChannels.TryAdd(channelId, newCh))
                     {
-                        var newCh = Channel.CreateUnbounded<byte[]>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
-                        if (_tcpChannels.TryAdd(channelId, newCh))
+                        IncrementActiveChannel();
+                        if (chHandler != null)
                         {
-                            IncrementActiveChannel();
-                            _ = Task.Run(() => OnIncomingChannel(channelId));
+                            _ = Task.Run(() => chHandler(channelId));
+                        }
+                        else
+                        {
+                            _pendingIncomingChannels.Enqueue(channelId);
                         }
                     }
                     break;
+                case ChannelCmd.OpenAck:
+                    if (_openAckTcs.TryGetValue(channelId, out var openAckTcs))
+                    {
+                        openAckTcs.TrySetResult(true);
+                    }
+                    break;
                 case ChannelCmd.Data:
+                    if (_openAckTcs.TryGetValue(channelId, out var dataAckTcs))
+                    {
+                        dataAckTcs.TrySetResult(true);
+                    }
                     if (_tcpChannels.TryGetValue(channelId, out var dataCh))
                     {
                         dataCh.Writer.TryWrite(payload);
                     }
                     break;
                 case ChannelCmd.Close:
+                    if (_openAckTcs.TryGetValue(channelId, out var closeAckTcs))
+                    {
+                        closeAckTcs.TrySetResult(false);
+                    }
                     if (_tcpChannels.TryGetValue(channelId, out var closeCh))
                     {
                         closeCh.Writer.TryComplete();
@@ -879,8 +954,36 @@ namespace UDRoute
             {
                 throw new InvalidOperationException("TunnelSession is already closed.");
             }
+            StartKcpDriver(ct);
             uint channelId = AllocateChannelId();
-            await SendFrameAsync(channelId, ChannelCmd.Open, ReadOnlyMemory<byte>.Empty, ct);
+            var ackTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _openAckTcs[channelId] = ackTcs;
+
+            try
+            {
+                await SendFrameAsync(channelId, ChannelCmd.Open, ReadOnlyMemory<byte>.Empty, ct);
+
+                using var openTimeoutCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(2000));
+                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, openTimeoutCts.Token, _sessionCts.Token);
+
+                try
+                {
+                    bool openOk = await ackTcs.Task.WaitAsync(linkedCts.Token);
+                    if (!openOk)
+                    {
+                        throw new IOException($"Channel {channelId} was rejected or closed by peer.");
+                    }
+                }
+                catch (OperationCanceledException) when (openTimeoutCts.IsCancellationRequested)
+                {
+                    throw new TimeoutException($"Channel {channelId} open timed out (peer unresponsive).");
+                }
+            }
+            finally
+            {
+                _openAckTcs.TryRemove(channelId, out _);
+            }
+
             await RunChannelBridgeAsync(channelId, tcp, ct);
         }
 
@@ -975,6 +1078,11 @@ namespace UDRoute
             if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
             try { _sessionCts.Cancel(); } catch { }
             _sessionClosedTcs.TrySetResult();
+            foreach (var kvp in _openAckTcs)
+            {
+                kvp.Value.TrySetResult(false);
+            }
+            _openAckTcs.Clear();
             // 出于高并发安全考虑，不显式 Dispose _signal 和 _sessionCts，交由 GC 回收以避免 ObjectDisposedException 竞争
         }
     }

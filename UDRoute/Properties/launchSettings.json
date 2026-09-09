@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "UDRoute": {
+      "commandName": "Project",
+      "commandLineArgs": "-c cli.ini"
+    }
+  }
+}
