@@ -2,7 +2,6 @@ using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Net;
-using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Threading.Channels;
 using UDRoute.Logging;
@@ -95,81 +94,31 @@ namespace UDRoute
 
         public async Task RunAsync(CancellationToken ct)
         {
-            NetworkAddressChangedEventHandler? netHandler = null;
-            try
+            var tasks = new List<Task>();
+            foreach (var rec in _config.ClientRecords)
             {
-                netHandler = (s, e) => OnNetworkAddressChanged();
-                NetworkChange.NetworkAddressChanged += netHandler;
-            }
-            catch (Exception ex)
-            {
-                Log.Debug($"[C] Failed to subscribe to NetworkAddressChanged: {ex.Message}");
+                if (rec.IsTcp)
+                    tasks.Add(AcceptTcpLoopAsync(rec, ct));
+                else
+                    tasks.Add(AcceptUdpLoopAsync(rec, ct));
             }
 
-            try
+            // 启动 C 到各 P 目标服务器的 NAT KeepAlive 保活循环 (使用全局 KeepAlive 间隔)
+            if (_config.KeepAlive > 0)
             {
-                var tasks = new List<Task>();
-                foreach (var rec in _config.ClientRecords)
-                {
-                    if (rec.IsTcp)
-                        tasks.Add(AcceptTcpLoopAsync(rec, ct));
-                    else
-                        tasks.Add(AcceptUdpLoopAsync(rec, ct));
-                }
+                var distinctPServers = _config.ClientRecords
+                    .Where(r => !r.IsThis && !string.IsNullOrWhiteSpace(r.TargetServer))
+                    .Select(r => r.TargetServer)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
 
-                // 启动 C 到各 P 目标服务器的 NAT KeepAlive 保活循环 (使用全局 KeepAlive 间隔)
-                if (_config.KeepAlive > 0)
+                foreach (var pServer in distinctPServers)
                 {
-                    var distinctPServers = _config.ClientRecords
-                        .Where(r => !r.IsThis && !string.IsNullOrWhiteSpace(r.TargetServer))
-                        .Select(r => r.TargetServer)
-                        .Distinct(StringComparer.OrdinalIgnoreCase)
-                        .ToList();
-
-                    foreach (var pServer in distinctPServers)
-                    {
-                        tasks.Add(RunPKeepAliveAsync(pServer, _config.KeepAlive, ct));
-                    }
-                }
-
-                await Task.WhenAll(tasks);
-            }
-            finally
-            {
-                if (netHandler != null)
-                {
-                    try { NetworkChange.NetworkAddressChanged -= netHandler; } catch { }
+                    tasks.Add(RunPKeepAliveAsync(pServer, _config.KeepAlive, ct));
                 }
             }
-        }
 
-        private void OnNetworkAddressChanged()
-        {
-            Log.Info("[C] Network address change detected. Evicting idle reusable tunnels...");
-            List<TunnelSession> toDispose = new();
-            lock (_tunnelStateLock)
-            {
-                var keys = _reusableTunnels.Keys.ToList();
-                foreach (var key in keys)
-                {
-                    if (_reusableTunnels.TryGetValue(key, out var session))
-                    {
-                        if (session.ActiveChannelCount == 0)
-                        {
-                            _reusableTunnels.Remove(key);
-                            toDispose.Add(session);
-                        }
-                    }
-                }
-            }
-            foreach (var s in toDispose)
-            {
-                lock (_sessionLock)
-                {
-                    _sessions.Remove(s.SessionId);
-                }
-                s.Dispose();
-            }
+            await Task.WhenAll(tasks);
         }
 
         public bool TryHandleQueryResponse(ReadOnlySpan<byte> data)
