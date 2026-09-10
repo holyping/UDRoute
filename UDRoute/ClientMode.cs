@@ -160,48 +160,60 @@ namespace UDRoute
 
             if (status == 1) // P 回复的查询成功
             {
-                int offset = 36;
-                var (sPublicEp, epLen) = ProtocolHelper.ReadIPEndPoint(data.Slice(offset));
-                offset += epLen;
-                int sWanPort = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(offset, 4));
-                offset += 4;
-                int timeout = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(offset, 4));
-                offset += 4;
-                long sTimestamp = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(offset, 8));
-                offset += 8;
-                bool reqPass = data[offset++] != 0;
-
-                KcpConfig? kcpConfig = null;
-                if (data.Length >= offset + 21)
+                try
                 {
-                    var (cfg, kLen) = ProtocolHelper.ReadKcpConfig(data.Slice(offset));
-                    kcpConfig = cfg;
-                    offset += kLen;
-                }
-
-                var localEps = new List<IPEndPoint>();
-                if (offset < data.Length)
-                {
-                    byte epCount = data[offset++];
-                    for (int i = 0; i < epCount; i++)
-                    {
-                        if (offset >= data.Length) break;
-                        var (ep, localEpLen) = ProtocolHelper.ReadIPEndPoint(data.Slice(offset));
-                        localEps.Add(ep);
-                        offset += localEpLen;
-                    }
-                }
-
-                bool allowRelay = data[offset++] != 0;
-                int tunnelReuseInterval = Constants.DefaultTunnelReuseInterval;
-                if (offset + 4 <= data.Length)
-                {
-                    tunnelReuseInterval = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(offset, 4));
+                    int offset = 36;
+                    var (sPublicEp, epLen) = ProtocolHelper.ReadIPEndPoint(data.Slice(offset));
+                    offset += epLen;
+                    int sWanPort = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(offset, 4));
                     offset += 4;
-                }
+                    int timeout = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(offset, 4));
+                    offset += 4;
+                    long sTimestamp = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(offset, 8));
+                    offset += 8;
+                    bool reqPass = data[offset++] != 0;
 
-                req.Tcs.TrySetResult(new QueryResponse(true, status, null, devId, sPublicEp, sWanPort, timeout, sTimestamp, reqPass, kcpConfig, localEps, allowRelay, tunnelReuseInterval));
-                return true;
+                    KcpConfig? kcpConfig = null;
+                    if (data.Length >= offset + 21)
+                    {
+                        var (cfg, kLen) = ProtocolHelper.ReadKcpConfig(data.Slice(offset));
+                        kcpConfig = cfg;
+                        offset += kLen;
+                    }
+
+                    var localEps = new List<IPEndPoint>();
+                    if (offset < data.Length)
+                    {
+                        byte epCount = data[offset++];
+                        for (int i = 0; i < epCount; i++)
+                        {
+                            if (offset >= data.Length) break;
+                            var (ep, localEpLen) = ProtocolHelper.ReadIPEndPoint(data.Slice(offset));
+                            localEps.Add(ep);
+                            offset += localEpLen;
+                        }
+                    }
+
+                    bool allowRelay = false;
+                    if (offset < data.Length) allowRelay = data[offset++] != 0;
+
+                    int tunnelReuseInterval = Constants.DefaultTunnelReuseInterval;
+                    if (offset + 4 <= data.Length)
+                    {
+                        tunnelReuseInterval = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(offset, 4));
+                        offset += 4;
+                    }
+
+                    long localRecvTicks = DateTime.UtcNow.Ticks;
+                    req.Tcs.TrySetResult(new QueryResponse(true, status, null, devId, sPublicEp, sWanPort, timeout, sTimestamp, reqPass, kcpConfig, localEps, allowRelay, tunnelReuseInterval) { RecvLocalTicks = localRecvTicks });
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    Log.Error($"[C] TryHandleQueryResponse parsing failed: {ex}");
+                    req.Tcs.TrySetResult(new QueryResponse(false, 0, $"Parse error: {ex.Message}", devId, null!, 0, 0, 0, false, null, null!));
+                    return true;
+                }
             }
             else // status != 1: 查询失败 (NotFound=0, SUnresponsive=4, StaleSession=5 等)
             {
@@ -481,15 +493,15 @@ namespace UDRoute
                 }
             }
 
-            Log.Info($"[C] Session {session.SessionId} starting UDP punch to targets: {string.Join(", ", candidates)}");
+            Log.Info($"[C] Session {session.SessionId} starting UDP punch to targets: {string.Join(", ", candidates)} (duration: {Constants.DefaultPunchRetries * Constants.DefaultPunchIntervalMs / 1000}s, interval: {Constants.DefaultPunchIntervalMs}ms)");
 
-            for (int i = 0; i < 8 && !session.IsDirect && !ct.IsCancellationRequested; i++)
+            for (int i = 0; i < Constants.DefaultPunchRetries && !session.IsDirect && !ct.IsCancellationRequested; i++)
             {
                 foreach (var ep in candidates)
                 {
                     await _udp.SendAsync(punchBuf, ep, ct);
                 }
-                await Task.Delay(100, ct);
+                await Task.Delay(Constants.DefaultPunchIntervalMs, ct);
             }
 
             if (session.IsDirect)
@@ -925,12 +937,26 @@ namespace UDRoute
                 var sInfo = _localProxy.DirectQuery(queryName);
                 if (sInfo != null)
                 {
+                    long queryRecvLocalTicks = DateTime.UtcNow.Ticks;
                     if (sInfo.RequiresPassword && (rec.Password == null || rec.Password.Length == 0))
                     {
-                        Log.Info($"[C] Password required for {queryName}.");
-                        Console.Write($"Password for {queryName}: ");
-                        string input = ReadPassword();
-                        rec.Password = ManagedSHA256.ComputeHashBytes(System.Text.Encoding.UTF8.GetBytes(input));
+                        if (rec.IsConsolePipe)
+                        {
+                            Log.Warn($"[C] Password required for {queryName}, but running in con: pipe mode without password.");
+                        }
+                        else
+                        {
+                            Log.Info($"[C] Password required for {queryName}.");
+                            string input = PromptAndReadPassword(queryName);
+                            if (input.StartsWith("_HASH256_", StringComparison.OrdinalIgnoreCase))
+                            {
+                                rec.Password = Convert.FromBase64String(input.Substring(9));
+                            }
+                            else
+                            {
+                                rec.Password = ManagedSHA256.ComputeHashBytes(System.Text.Encoding.UTF8.GetBytes(input));
+                            }
+                        }
                     }
 
                     bool allowRelay = _localProxy?.IsRelayAllowed(sInfo) ?? true;
@@ -968,7 +994,8 @@ namespace UDRoute
 
                     if (rec.Password != null)
                     {
-                        bool authOk = await session.AuthenticateClientAsync(rec.Password, sInfo.STimestamp, sInfo.PRecvTimeTicks, ct);
+                        long approxSTimestamp = sInfo.STimestamp + (queryRecvLocalTicks - sInfo.PRecvTimeTicks);
+                        bool authOk = await session.AuthenticateClientAsync(rec.Password, approxSTimestamp, queryRecvLocalTicks, ct);
                         if (!authOk)
                         {
                             Log.Warn($"[C] Auth failed for session {sessionId}");
@@ -1066,12 +1093,24 @@ namespace UDRoute
 
             if (resp.RequiresPassword && (rec.Password == null || rec.Password.Length == 0))
             {
-                Log.Info($"[C] Password required for {queryName}.");
-                Console.Write($"Password for {queryName}: ");
-                string input = ReadPassword();
-                rec.Password = ManagedSHA256.ComputeHashBytes(System.Text.Encoding.UTF8.GetBytes(input));
+                if (rec.IsConsolePipe)
+                {
+                    Log.Warn($"[C] Password required for {queryName}, but running in con: pipe mode without password.");
+                }
+                else
+                {
+                    Log.Info($"[C] Password required for {queryName}.");
+                    string input = PromptAndReadPassword(queryName);
+                    if (input.StartsWith("_HASH256_", StringComparison.OrdinalIgnoreCase))
+                    {
+                        rec.Password = Convert.FromBase64String(input.Substring(9));
+                    }
+                    else
+                    {
+                        rec.Password = ManagedSHA256.ComputeHashBytes(System.Text.Encoding.UTF8.GetBytes(input));
+                    }
+                }
             }
-
             TunnelSession tunnelSession;
             if (!resp.AllowRelay)
             {
@@ -1127,7 +1166,7 @@ namespace UDRoute
 
             if (rec.Password != null)
             {
-                bool authOk = await tunnelSession.AuthenticateClientAsync(rec.Password, resp.STimestamp, DateTime.UtcNow.Ticks, ct);
+                bool authOk = await tunnelSession.AuthenticateClientAsync(rec.Password, resp.STimestamp, resp.RecvLocalTicks, ct);
                 if (!authOk)
                 {
                     Log.Warn($"[C] Auth failed for session {sessionId}");
@@ -1146,23 +1185,41 @@ namespace UDRoute
             return tunnelSession;
         }
 
-        private string ReadPassword()
+        public static Action<string>? CustomPasswordPromptWriter;
+        public static Func<string>? CustomPasswordReader;
+
+        private string PromptAndReadPassword(string queryName)
         {
+            if (CustomPasswordPromptWriter != null)
+                CustomPasswordPromptWriter($"[C] Password for {queryName}: ");
+            else
+                Console.Write($"\r[C] Password for {queryName}: ");
+
+            if (CustomPasswordReader != null)
+                return CustomPasswordReader();
+
             string pass = "";
-            while (true)
+            try
             {
-                var key = Console.ReadKey(true);
-                if (key.Key == ConsoleKey.Enter) break;
-                if (key.Key == ConsoleKey.Backspace)
+                while (true)
                 {
-                    if (pass.Length > 0) pass = pass.Substring(0, pass.Length - 1);
+                    var key = Console.ReadKey(true);
+                    if (key.Key == ConsoleKey.Enter) break;
+                    if (key.Key == ConsoleKey.Backspace)
+                    {
+                        if (pass.Length > 0) pass = pass.Substring(0, pass.Length - 1);
+                    }
+                    else if (key.KeyChar != '\0')
+                    {
+                        pass += key.KeyChar;
+                    }
                 }
-                else if (key.KeyChar != '\0')
-                {
-                    pass += key.KeyChar;
-                }
+                Console.WriteLine();
             }
-            Console.WriteLine();
+            catch (InvalidOperationException)
+            {
+                pass = Console.ReadLine() ?? "";
+            }
             return pass;
         }
 
@@ -1235,6 +1292,27 @@ namespace UDRoute
             }
         }
 
-        private record QueryResponse(bool Success, byte StatusCode, string? ErrorMessage, Guid DevId, IPEndPoint ServerPublicEp, int ServerWanPort, int Timeout, long STimestamp, bool RequiresPassword, KcpConfig? KcpConfig, List<IPEndPoint> LocalEps, bool AllowRelay = true, int TunnelReuseInterval = Constants.DefaultTunnelReuseInterval);
+        private record QueryResponse(
+            bool Success,
+            byte StatusCode,
+            string? ErrorMessage,
+            Guid DevId,
+            IPEndPoint ServerPublicEp,
+            int ServerWanPort,
+            int Timeout,
+            long STimestamp,
+            bool RequiresPassword,
+            KcpConfig? KcpConfig,
+            List<IPEndPoint> LocalEps,
+            bool AllowRelay = true,
+            int TunnelReuseInterval = Constants.DefaultTunnelReuseInterval)
+        {
+            /// <summary>
+            /// 收到 P 响应时的本地时间 Ticks
+            /// 差值 ClockOffset = STimestamp - RecvLocalTicks
+            /// 加密/鉴权时计算最终 ts：finalTs = DateTime.UtcNow.Ticks + ClockOffset
+            /// </summary>
+            public long RecvLocalTicks { get; init; } = DateTime.UtcNow.Ticks;
+        }
     }
 }

@@ -16,6 +16,44 @@ namespace UDRoute
     {
         static async Task Main(string[] args)
         {
+            // 全局异常陷阱，防止任何后台线程或异步任务中的未捕获异常导致静默崩溃
+            AppDomain.CurrentDomain.UnhandledException += (s, e) =>
+            {
+                string msg = e.ExceptionObject?.ToString() ?? "Unknown unhandled exception";
+                Log.Error($"[CRASH] Unhandled AppDomain exception: {msg}"); 
+            };
+
+            TaskScheduler.UnobservedTaskException += (s, e) =>
+            {
+                Log.Error($"[CRASH] Unobserved task exception: {e.Exception}");
+                e.SetObserved();
+            };
+
+            try
+            {
+                await RunAsync(args);
+            }
+            catch (OperationCanceledException)
+            {
+                // 正常取消退出
+            }
+            catch (Exception ex)
+            {
+                Log.Error($"[FATAL] Process terminated unexpectedly: {ex}");
+                Environment.ExitCode = 1;
+            }
+            finally
+            {
+                try
+                {
+                    ConsoleLogger.Shutdown();
+                }
+                catch { }
+            }
+        }
+
+        private static async Task RunAsync(string[] args)
+        {
             if (args.Length == 0)
             {
                 PrintHelp();
@@ -38,23 +76,25 @@ namespace UDRoute
             IsServiceMode = isServiceMode;
 
             var config = ConfigParser.Parse(args, isServiceMode);
+            if (config == null)
+            {
+                Environment.ExitCode = 1;
+                return;
+            }
+
             using var cts = new CancellationTokenSource();
 
-            Console.CancelKeyPress += (s, e) => { e.Cancel = true; cts.Cancel(); };
-
-            var engine = new RouteEngine(config);
             try
             {
-                await engine.StartAsync(cts.Token);
+                Console.CancelKeyPress += (s, e) => { e.Cancel = true; cts.Cancel(); };
             }
-            catch (OperationCanceledException)
+            catch
             {
-                // 忽略正常退出时的取消异常
+                // 在 Windows Service 或重定向环境中，注册 CancelKeyPress 可能会抛出异常，安全忽略
             }
-            catch (Exception ex)
-            {
-                Log.Error($"Fatal error: {ex.Message}");
-            }
+
+            using var engine = new RouteEngine(config);
+            await engine.StartAsync(cts.Token);
         }
 
         public static bool IsServiceMode;
@@ -99,7 +139,7 @@ namespace UDRoute
                 {
                     string pass = args[1];
                     byte[] hash = ManagedSHA256.ComputeHashBytes(System.Text.Encoding.UTF8.GetBytes(pass));
-                    Console.WriteLine("$HASH256$" + Convert.ToBase64String(hash));
+                    Console.WriteLine("_HASH256_" + Convert.ToBase64String(hash));
                 }
                 else
                 {
@@ -118,7 +158,7 @@ namespace UDRoute
                     else
                     {
                         byte[] hash = ManagedSHA256.ComputeHashBytes(System.Text.Encoding.UTF8.GetBytes(pass1));
-                        Console.WriteLine("$HASH256$" + Convert.ToBase64String(hash));
+                        Console.WriteLine("_HASH256_" + Convert.ToBase64String(hash));
                     }
                 }
                 return true;

@@ -5,33 +5,65 @@ namespace UDRoute
 {
     public static class ConfigParser
     {
-        public static AppConfig Parse(string[] args, bool isServiceMode = false)
+        public static AppConfig? Parse(string[] args, bool isServiceMode = false)
         {
             var config = new AppConfig();
             config.DevId = Guid.NewGuid(); // 默认值
 
-            string iniPath = "udroute.ini";
-            // 处理命令行参数中的 -c
+            // 1. 早期预解析命令行参数中的 -log，确保后续解析过程与初期的日志能够正常输出
             for (int i = 0; i < args.Length; i++)
             {
-                if (args[i] == "-c")
+                if (args[i].Equals("-log", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
                 {
+                    string val = args[i + 1];
+                    config.LogLevel = val.ToLower() switch
+                    {
+                        "trace" => LogLevel.Trace,
+                        "debug" => LogLevel.Debug,
+                        "info" => LogLevel.Info,
+                        "warn" or "warning" => LogLevel.Warn,
+                        "error" => LogLevel.Error,
+                        "none" or "off" => LogLevel.None,
+                        _ => config.LogLevel
+                    };
+                }
+            }
+            Log.Init(config, isServiceMode);
+
+            // 2. 检测 -c 参数
+            bool hasExplicitConfig = false;
+            string requestedIni = "udroute.ini";
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (args[i].Equals("-c", StringComparison.OrdinalIgnoreCase))
+                {
+                    hasExplicitConfig = true;
                     if (i + 1 < args.Length && !args[i + 1].StartsWith("-"))
                     {
-                        iniPath = args[i + 1];
+                        requestedIni = args[i + 1];
                     }
                     break;
                 }
             }
 
-            if (File.Exists(iniPath))
+            // 解析配置文件的物理路径（优先当前目录，其次可执行文件所在目录）
+            string? resolvedIni = ResolveIniPath(requestedIni);
+            if (hasExplicitConfig && resolvedIni == null)
             {
-                config.ConfigPath = Path.GetFullPath(iniPath);
-                ParseIniFile(iniPath, config);
+                Log.Error($"[Config] Configuration file '{requestedIni}' was not found in current directory ({Environment.CurrentDirectory}) or executable directory ({AppContext.BaseDirectory}).");
+                return null;
             }
-            else
+
+            if (!CheckHasTemporyAction(args))
             {
-                config.ConfigPath = Path.GetFullPath(iniPath);
+                if (resolvedIni != null && (hasExplicitConfig || File.Exists(resolvedIni)))
+                {
+                    config.ConfigPath = resolvedIni;
+                    if (!ParseIniFile(resolvedIni, config))
+                    {
+                        return null;
+                    }
+                }
             }
 
             if (args.Any(a => a.Equals("-forcerelay", StringComparison.OrdinalIgnoreCase)))
@@ -49,7 +81,7 @@ namespace UDRoute
                 }
             }
 
-            // 处理命令行参数中的 -log
+            // 命令行 -log 参数拥有最高优先级，覆盖 ini 中的 loglevel
             for (int i = 0; i < args.Length; i++)
             {
                 if (args[i].Equals("-log", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
@@ -70,10 +102,10 @@ namespace UDRoute
 
             if (string.IsNullOrEmpty(config.LogFile))
             {
-                config.LogFile = Path.ChangeExtension(iniPath, ".log");
+                config.LogFile = Path.ChangeExtension(config.ConfigPath ?? "udroute.ini", ".log");
             }
 
-            // 初始化全局日志系统
+            // 刷新日志系统配置
             Log.Init(config, isServiceMode);
 
             if (config.ServerRecords.Count == 0 && config.ClientRecords.Count == 0)
@@ -86,12 +118,86 @@ namespace UDRoute
                 config.Port = Constants.DefaultProxyPort;
             }
 
+            if (Log.IsInfoEnabled)
+            {
+                Log.Info("==================================================");
+                Log.Info($"UDRoute Starting... (PID: {Environment.ProcessId})");
+                if (!string.IsNullOrEmpty(config.ConfigPath))
+                {
+                    Log.Info($"Loaded Config: {config.ConfigPath}");
+                }
+                if (config.ServerRecords.Count > 0)
+                {
+                    Log.Info($"[S] Server Mode: {config.ServerRecords.Count} service(s) ({string.Join(", ", config.ServerRecords.Select(s => s.Name))})");
+                }
+                if (config.ClientRecords.Count > 0)
+                {
+                    Log.Info($"[C] Client Mode: {config.ClientRecords.Count} tunnel(s)");
+                }
+                if (config.EnableProxy)
+                {
+                    Log.Info($"[P] Proxy Mode: UDP Port {config.Port}");
+                }
+                Log.Info($"Log Level: {config.LogLevel}");
+                Log.Info("==================================================");
+            }
+
             return config;
         }
 
-        private static void ParseIniFile(string path, AppConfig cfg)
+        //检查是否命令行有S和C命令，有的话不加载ini
+        static bool CheckHasTemporyAction(string[] args)
         {
-            var lines = File.ReadAllLines(path);
+            foreach (string arg in args)
+            {
+                if (arg.Contains('=')) return true;
+            }
+            return false;
+        }
+
+        public static string? ResolveIniPath(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path)) return null;
+
+            // 1. 优先直接判断（支持绝对路径或相对于当前工作目录）
+            if (File.Exists(path))
+            {
+                return Path.GetFullPath(path);
+            }
+
+            // 2. 如果不是绝对路径，尝试相对于可执行程序所在目录
+            if (!Path.IsPathRooted(path))
+            {
+                string baseDir = AppContext.BaseDirectory;
+                string candidate = Path.Combine(baseDir, path);
+                if (File.Exists(candidate))
+                {
+                    return Path.GetFullPath(candidate);
+                }
+            }
+
+            return null;
+        }
+
+        private static bool ParseIniFile(string path, AppConfig cfg)
+        {
+            var lines = new List<string>();
+            try
+            {
+                using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                using var reader = new StreamReader(fs, Encoding.UTF8);
+                string? l;
+                while ((l = reader.ReadLine()) != null)
+                {
+                    lines.Add(l);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Error($"[Config] Failed to read configuration file '{path}': {ex.Message}");
+                return false;
+            }
+
             string currentServer = "";
             int currentMtu = Constants.DefaultMtu;
             int currentRegInterval = Constants.DefaultRegInterval;
@@ -100,18 +206,19 @@ namespace UDRoute
             int currentTunnelReuseInterval = cfg.TunnelReuseInterval;
             bool currentAllowRelay = true;
             int currentKeepAlive = cfg.KeepAlive;
+            byte[]? currentAccessPassword = null;
             bool missingDevId = !lines.Any(l => l.TrimStart().StartsWith("devid", StringComparison.OrdinalIgnoreCase));
             bool configModified = missingDevId;
             ServerRecord? sRec = null;
 
-            for (int i = 0; i < lines.Length; i++)
+            for (int i = 0; i < lines.Count; i++)
             {
                 string line = lines[i].Trim();
                 if (string.IsNullOrEmpty(line) || line.StartsWith(";")) continue;
 
-                // 移除行末尾的注释（因为本应用场景没有包含 ; 的复杂字符串配置，直接截断即可）
-                int commentIdx = line.IndexOf(';');
-                if (commentIdx >= 0) line = line.Substring(0, commentIdx).Trim();
+                // 移除行末尾的注释（针对 target 配置行的 ;/file 做特殊保留处理）
+                line = StripComment(line);
+                if (string.IsNullOrEmpty(line)) continue;
 
                 if (line.Length > 2 && line.StartsWith("[") && line.EndsWith("]"))
                 {
@@ -134,7 +241,8 @@ namespace UDRoute
                         TunnelReuseInterval = currentTunnelReuseInterval,
                         AllowRelay = currentAllowRelay,
                         KcpConfig = currentKcpConfig.Clone(),
-                        KeepAlive = currentKeepAlive
+                        KeepAlive = currentKeepAlive,
+                        AccessPassword = currentAccessPassword
                     });
                     continue;
                 }
@@ -223,7 +331,7 @@ namespace UDRoute
                         case "maxunauthnamestotal" or "maxtotalunauthnames": cfg.MaxUnauthNamesTotal = int.Parse(val); break;
                         case "username": case "user": cfg.Username = val; break;
                         case "password": case "pwd": case "pass":
-                            if (!val.StartsWith("$HWHash$"))
+                            if (!val.StartsWith("_HWHash_", StringComparison.OrdinalIgnoreCase))
                             {
                                 string protectedVal = ConfigProtector.ComputeHWHash(val);
                                 lines[i] = lines[i].Replace(val, protectedVal);
@@ -238,6 +346,28 @@ namespace UDRoute
                             {
                                 Log.Warn($"[Config] Global password Base64 format error");
                                 cfg.Password = null;
+                            }
+                            break;
+                        case "accesspassword" or "accesspwd" or "accesspass":
+                            if (val.StartsWith("_HASH256_", StringComparison.OrdinalIgnoreCase))
+                            {
+                                try
+                                {
+                                    cfg.AccessPassword = currentAccessPassword = Convert.FromBase64String(val.Substring(9));
+                                }
+                                catch
+                                {
+                                    Log.Warn($"[Config] Global access password Base64 format error");
+                                    cfg.AccessPassword = currentAccessPassword = null;
+                                }
+                            }
+                            else
+                            {
+                                byte[] hashBytes = ManagedSHA256.ComputeHashBytes(Encoding.UTF8.GetBytes(val));
+                                string protectedVal = "_HASH256_" + Convert.ToBase64String(hashBytes);
+                                lines[i] = lines[i].Replace(val, protectedVal);
+                                configModified = true;
+                                cfg.AccessPassword = currentAccessPassword = hashBytes;
                             }
                             break;
                         case "kcp": currentKcpConfig.SetProfile(val); break;
@@ -290,22 +420,33 @@ namespace UDRoute
                         case "kcpsndwnd": sRec.KcpConfig.SndWnd = int.Parse(val); break;
                         case "kcprcvwnd": sRec.KcpConfig.RcvWnd = int.Parse(val); break;
                         case "target":
+                            if (val.StartsWith("\"") && val.EndsWith("\"") && val.Length >= 2)
+                            {
+                                val = val.Substring(1, val.Length - 2).Trim();
+                            }
                             if (val.EndsWith(";/file", StringComparison.OrdinalIgnoreCase))
                             {
                                 sRec.IsFile = true;
-                                sRec.BaseDir = val.Substring(0, val.Length - 6);
+                                sRec.BaseDir = val.Substring(0, val.Length - 6).TrimEnd('\\', '/');
                             }
                             else
                             {
                                 var parts = val.Split(new[] { ':', '/' });
-                                sRec.TargetIp = parts[0];
-                                sRec.TargetPort = int.Parse(parts[1]);
-                                sRec.IsTcp = parts.Length < 3 || parts[2].ToLower() == "tcp";
+                                if (parts.Length >= 2 && int.TryParse(parts[1], out int port))
+                                {
+                                    sRec.TargetIp = parts[0];
+                                    sRec.TargetPort = port;
+                                    sRec.IsTcp = parts.Length < 3 || parts[2].ToLower() == "tcp";
+                                }
+                                else
+                                {
+                                    Log.Error($"[Config] Invalid target format '{val}' in section '[{sRec.Name}]'. Expected 'ip:port[/tcp|udp]' or 'path;/file'.");
+                                }
                             }
                             break;
                         case "username": case "user": sRec.Username = val; break;
                         case "password": case "pwd": case "pass":
-                            if (!val.StartsWith("$HWHash$"))
+                            if (!val.StartsWith("_HWHash_", StringComparison.OrdinalIgnoreCase))
                             {
                                 string protectedVal = ConfigProtector.ComputeHWHash(val);
                                 lines[i] = lines[i].Replace(val, protectedVal);
@@ -320,6 +461,28 @@ namespace UDRoute
                             {
                                 Log.Warn($"[Config] Server '{sRec.Name}' password Base64 format error");
                                 sRec.Password = null;
+                            }
+                            break;
+                        case "accesspassword" or "accesspwd" or "accesspass":
+                            if (val.StartsWith("_HASH256_", StringComparison.OrdinalIgnoreCase))
+                            {
+                                try
+                                {
+                                    sRec.AccessPassword = Convert.FromBase64String(val.Substring(9));
+                                }
+                                catch
+                                {
+                                    Log.Warn($"[Config] Server '{sRec.Name}' access password Base64 format error");
+                                    sRec.AccessPassword = null;
+                                }
+                            }
+                            else
+                            {
+                                byte[] hashBytes = ManagedSHA256.ComputeHashBytes(Encoding.UTF8.GetBytes(val));
+                                string protectedVal = "_HASH256_" + Convert.ToBase64String(hashBytes);
+                                lines[i] = lines[i].Replace(val, protectedVal);
+                                configModified = true;
+                                sRec.AccessPassword = hashBytes;
                             }
                             break;
                     }
@@ -366,8 +529,13 @@ namespace UDRoute
                         File.WriteAllLines(path, lines, Encoding.UTF8);
                     }
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    Log.Warn($"[Config] Could not update configuration file '{path}': {ex.Message}");
+                }
             }
+
+            return true;
         }
 
         private static string? ParseClientRecord(string key, string val, AppConfig cfg, string defaultServer = "", int defaultMtu = Constants.DefaultMtu)
@@ -398,14 +566,14 @@ namespace UDRoute
             {
                 rec.TargetName = namePart.Substring(0, colonIdx);
                 string passPart = namePart.Substring(colonIdx + 1);
-                if (passPart.StartsWith("$HASH256$"))
+                if (passPart.StartsWith("_HASH256_", StringComparison.OrdinalIgnoreCase))
                 {
                     rec.Password = Convert.FromBase64String(passPart.Substring(9));
                 }
                 else
                 {
                     rec.Password = ManagedSHA256.ComputeHashBytes(System.Text.Encoding.UTF8.GetBytes(passPart));
-                    string newPassPart = "$HASH256$" + Convert.ToBase64String(rec.Password);
+                    string newPassPart = "_HASH256_" + Convert.ToBase64String(rec.Password);
                     newVal = val.Replace(namePart, rec.TargetName + ":" + newPassPart);
                 }
             }
@@ -472,17 +640,32 @@ namespace UDRoute
                             KeepAlive = cfg.KeepAlive
                         };
 
+                        if (valParts[0].StartsWith("\"") && valParts[0].EndsWith("\"") && valParts[0].Length >= 2)
+                        {
+                            valParts[0] = valParts[0].Substring(1, valParts[0].Length - 2).Trim();
+                        }
                         if (valParts[0].EndsWith(";/file", StringComparison.OrdinalIgnoreCase))
                         {
                             sRec.IsFile = true;
-                            sRec.BaseDir = valParts[0].Substring(0, valParts[0].Length - 6);
+                            sRec.BaseDir = valParts[0].Substring(0, valParts[0].Length - 6).TrimEnd('\\', '/');
+                            if (!sRec.Name.EndsWith("/file", StringComparison.OrdinalIgnoreCase))
+                            {
+                                sRec.Name += "/file";
+                            }
                         }
                         else
                         {
                             var targetParts = valParts[0].Split(new[] { ':', '/' });
-                            sRec.TargetIp = targetParts[0];
-                            sRec.TargetPort = int.Parse(targetParts[1]);
-                            sRec.IsTcp = targetParts.Length < 3 || targetParts[2].ToLower() == "tcp";
+                            if (targetParts.Length >= 2 && int.TryParse(targetParts[1], out int port))
+                            {
+                                sRec.TargetIp = targetParts[0];
+                                sRec.TargetPort = port;
+                                sRec.IsTcp = targetParts.Length < 3 || targetParts[2].ToLower() == "tcp";
+                            }
+                            else
+                            {
+                                Console.WriteLine($"[Config] Error: Invalid target format '{valParts[0]}'. Expected 'ip:port[/tcp|udp]' or 'path;/file'.");
+                            }
                         }
                         cfg.ServerRecords.Add(sRec);
                     }
@@ -494,6 +677,8 @@ namespace UDRoute
         {
             try
             {
+                if (File.Exists(path)) throw new Exception($"Configuration file {path} already exists!");
+
                 bool isZh = System.Globalization.CultureInfo.CurrentUICulture.TwoLetterISOLanguageName == "zh";
                 string resName = isZh ? "UDRoute.udroute_template_zh.ini" : "UDRoute.udroute_template_en.ini";
 
@@ -516,6 +701,59 @@ namespace UDRoute
             {
                 Console.WriteLine($"Error writing template: {ex.Message}");
             }
+        }
+
+        private static string StripComment(string line)
+        {
+            string trimmed = line.TrimStart();
+            bool isTargetLine = false;
+            int eqIdx = trimmed.IndexOf('=');
+            if (eqIdx > 0)
+            {
+                string key = trimmed.Substring(0, eqIdx).Trim();
+                if (key.Equals("target", StringComparison.OrdinalIgnoreCase))
+                {
+                    isTargetLine = true;
+                }
+            }
+
+            bool inQuotes = false;
+            bool foundProtocol = false;
+
+            for (int i = 0; i < line.Length; i++)
+            {
+                char c = line[i];
+                if (c == '"')
+                {
+                    inQuotes = !inQuotes;
+                    continue;
+                }
+
+                if (!inQuotes && c == ';')
+                {
+                    if (isTargetLine && !foundProtocol)
+                    {
+                        if (i + 6 <= line.Length && line.Substring(i, 6).Equals(";/file", StringComparison.OrdinalIgnoreCase))
+                        {
+                            string prefix = line.Substring(0, i);
+                            bool hasProtoBefore = prefix.Contains("/tcp", StringComparison.OrdinalIgnoreCase)
+                                               || prefix.Contains("/udp", StringComparison.OrdinalIgnoreCase)
+                                               || prefix.Contains("/file", StringComparison.OrdinalIgnoreCase);
+
+                            if (!hasProtoBefore)
+                            {
+                                foundProtocol = true;
+                                i += 5;
+                                continue;
+                            }
+                        }
+                    }
+
+                    return line.Substring(0, i).Trim();
+                }
+            }
+
+            return line.Trim();
         }
     }
 }

@@ -13,17 +13,27 @@ namespace UDRoute
     {
         public static async Task RunServerAsync(TcpListener listener, string baseDir, bool isReadOnly, CancellationToken ct)
         {
-            while (!ct.IsCancellationRequested)
+            try
             {
-                try
+                using var reg = ct.Register(() => { try { listener.Stop(); } catch { } });
+                while (!ct.IsCancellationRequested)
                 {
-                    var client = await listener.AcceptTcpClientAsync();
-                    _ = Task.Run(() => HandleClientAsync(client, baseDir, isReadOnly, ct), ct);
+                    try
+                    {
+                        var client = await listener.AcceptTcpClientAsync(ct);
+                        _ = Task.Run(() => HandleClientAsync(client, baseDir, isReadOnly, ct), ct);
+                    }
+                    catch (OperationCanceledException) { break; }
+                    catch (Exception ex)
+                    {
+                        if (ct.IsCancellationRequested) break;
+                        Log.Debug($"[FileServer] Accept error: {ex.Message}");
+                    }
                 }
-                catch (Exception ex) when (!(ex is OperationCanceledException))
-                {
-                    Log.Debug($"[FileServer] Accept error: {ex.Message}");
-                }
+            }
+            finally
+            {
+                try { listener.Stop(); } catch { }
             }
         }
 
@@ -71,7 +81,29 @@ namespace UDRoute
                         {
                             Log.Warn($"[FileServer] PUSH rejected (ReadOnly mode): {reqPath}");
                             stream.WriteByte(0xFF);
+                            await stream.FlushAsync(ct);
                             return;
+                        }
+
+                        // 检查目标文件是否已存在
+                        if (File.Exists(fullPath))
+                        {
+                            // 告知客户端目标文件已存在，等待客户端确认覆盖 (0x01: 确认, 0x02: 取消)
+                            stream.WriteByte(0x01);
+                            await stream.FlushAsync(ct);
+
+                            int confirm = stream.ReadByte();
+                            if (confirm != 0x01)
+                            {
+                                Log.Info($"[FileServer] PUSH cancelled by client (file already exists): {fullPath}");
+                                return;
+                            }
+                        }
+                        else
+                        {
+                            // 目标文件不存在，直接就绪
+                            stream.WriteByte(0x00);
+                            await stream.FlushAsync(ct);
                         }
 
                         byte[] sizeBuf = new byte[8];

@@ -30,8 +30,9 @@ UDRoute - 基于 UDP 穿透的高性能端口转发/内网穿透工具
 
 文件传输 (File Transfer):
   基于内置的 File 协议，可以直接传输文件：
-  上传文件: udroute -push name[:password]@PAddress SFilePath LocalFilePath/con:
-  下载文件: udroute -pull name[:password]@PAddress SFilePath LocalFilePath/con:
+  上传文件: udroute -push [-y] name[:password]@PAddress SFilePath LocalFilePath/con:
+  下载文件: udroute -pull [-y] name[:password]@PAddress SFilePath LocalFilePath/con:
+  若目标文件已存在，默认会在控制台询问确认 (y/N)；添加 -y 参数可跳过确认直接覆盖。
 
 常见使用示例:
   1. 生成一份带有注释说明的配置文件:

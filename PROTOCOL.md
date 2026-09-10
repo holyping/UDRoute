@@ -136,3 +136,39 @@ UDRoute 是一个 P2P/中继 隧道系统。该系统包含三种基本角色：
 - **Disconnect (6)**: 携带 `[SessionId]` 即可，用于终止整个会话。
 - **RelayEnd (13)**: 携带 `[SessionId]`。当 C 与 S 打洞成功并建立直连通讯后，发送给 P，告知 P 端不再需要中继，释放服务器内存资源。
 
+## 4. 文件传输子协议 (File Transfer Protocol: /file)
+
+UDRoute 内置了基于隧道流式传输的轻量级文件传输子协议（由 TCP/KCP 可靠通道承载）。S 端可通过 `/file` 语法暴露指定基础目录，C 端使用 `-push` 或 `-pull` 进行文件上传与下载。
+
+### 4.1. 请求头部 (Client -> Server)
+连接建立后，Client 首先发送请求头部：
+- `[Command] (1 byte)`:
+  - `0x01`: PUSH (上传文件至 S 端)
+  - `0x02`: PULL (从 S 端下载文件)
+- `[PathLen] (2 bytes LE)`: 目标相对路径长度
+- `[Path] (PathLen bytes)`: UTF-8 编码的相对文件路径
+
+### 4.2. PUSH 上传流程 (包含覆盖保护握手)
+1. **Client -> Server**: 发送 `0x01` + `[PathLen]` + `[Path]`。
+2. **Server 路径预检与响应 (1 byte)**:
+   - `0x00`: 路径合法且目标文件不存在，准备就绪。
+   - `0x01`: 目标文件已存在，等待 Client 确认是否覆盖。
+   - `0xFF`: 越界访问、服务端处于只读模式 (`isReadOnly`) 或路径非法。
+3. **Client 覆盖确认 (若 Server 返回 0x01)**:
+   - **Client -> Server (1 byte)**:
+     - `0x01`: 确认覆盖 (用户控制台输入 `y` 或命令行指定了 `-y`)。
+     - `0x02`: 取消传输并断开。
+4. **数据传输**:
+   - **Client -> Server**: `[FileSize] (8 bytes LE)` + `[Payload (FileSize bytes)]`。
+   - **Server -> Client (1 byte)**: `0x00` 表示保存完成。
+
+### 4.3. PULL 下载流程
+1. **Client 本地预检**: Client 在连接前检查本地目标文件，若已存在且未带 `-y` 则在控制台交互提示 `(y/N)`。
+2. **Client -> Server**: 发送 `0x02` + `[PathLen]` + `[Path]`。
+3. **Server 检查与响应**:
+   - 若文件不存在或越界，返回 `0xFF` (1 byte) 并断开。
+   - 若存在且可读，返回 `0x00` (1 byte)。
+4. **数据传输**:
+   - **Server -> Client**: `[FileSize] (8 bytes LE)` + `[Payload (FileSize bytes)]`。
+   - Client 将数据流式写入本地文件或标准输出 (`con:`)。
+

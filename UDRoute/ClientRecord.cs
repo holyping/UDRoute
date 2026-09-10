@@ -7,11 +7,11 @@ namespace UDRoute
         public bool IsThis { get; set; }
         public string TargetName { get; set; } = "";
         public string TargetServer { get; set; } = "";
-        public string? Username { get; set; }
         public byte[]? Password { get; set; }
         public int Mtu { get; set; } = Constants.DefaultMtu;
         public bool ForceRelay { get; set; }
         public int Timeout { get; set; } = 0;
         public int KeepAlive { get; set; } = Constants.DefaultKeepAlive;
+        public bool IsConsolePipe { get; set; }
     }
 }

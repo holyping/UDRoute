@@ -39,6 +39,7 @@ namespace UDRoute
         public int MaxUnauthNamesTotal { get; set; } = Constants.DefaultMaxUnauthNamesTotal;
         public string Username { get; set; } = "";
         public byte[]? Password { get; set; }
+        public byte[]? AccessPassword { get; set; }
         public bool ForceRelay { get; set; }
         public int TunnelReuseInterval { get; set; } = Constants.DefaultTunnelReuseInterval;
         public int IdleThreshold { get; set; } = Constants.DefaultIdleThreshold;

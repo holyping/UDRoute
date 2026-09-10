@@ -625,5 +625,124 @@ public class ProxyHealthProbeTests
         Assert.Equal(contextId, BinaryPrimitives.ReadUInt16LittleEndian(ackBuf.AsSpan(1, 2)));
         Assert.Equal(1, ackBuf[3]); // Status 1 = Success
     }
+
+    [Fact]
+    public async Task KeepAlive_WithDevId_ReturnsCorrectRegistrationStatus()
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        using var dummyUdp = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+        int pPort = ((IPEndPoint)dummyUdp.Client.LocalEndPoint!).Port;
+        dummyUdp.Close();
+
+        var pCfg = new AppConfig
+        {
+            Port = pPort,
+            EnableProxy = true,
+            ConfigPath = "dummy.ini"
+        };
+        var pEngine = new RouteEngine(pCfg);
+        _ = pEngine.StartAsync(cts.Token);
+        await Task.Delay(150, cts.Token);
+
+        var pEp = new IPEndPoint(IPAddress.Loopback, pPort);
+        using var sSocket = new ZeroCopyUdpSocket(0);
+
+        Guid devId = Guid.NewGuid();
+
+        // 1. 未注册时发送 33 字节 KeepAlive (EchoReq + devId)
+        byte[] pingBuf = new byte[33];
+        pingBuf[0] = (byte)MsgType.EchoReq;
+        Guid.NewGuid().TryWriteBytes(pingBuf.AsSpan(1, 16));
+        devId.TryWriteBytes(pingBuf.AsSpan(17, 16));
+
+        await sSocket.SendAsync(pingBuf, pEp, cts.Token);
+
+        byte[] respBuf = new byte[64];
+        var (respLen, _) = await sSocket.ReceiveAsync(respBuf, cts.Token);
+
+        Assert.Equal((byte)MsgType.EchoResp, respBuf[0]);
+        var (ep, epLen) = ProtocolHelper.ReadIPEndPoint(respBuf.AsSpan(17));
+        int statusPos = 17 + epLen;
+        Assert.True(respLen > statusPos);
+        Assert.Equal(0, respBuf[statusPos]); // 未注册 -> Status 0 (NeedRegister)
+
+        // 2. 发起注册
+        byte[] regPkt = CreateRegisterPacket(devId, "keepalive_test_svc", contextId: 101);
+        await sSocket.SendAsync(regPkt, pEp, cts.Token);
+        var (ackLen, _) = await sSocket.ReceiveAsync(respBuf, cts.Token);
+        Assert.Equal((byte)MsgType.RegisterAck, respBuf[0]);
+        Assert.Equal(1, respBuf[3]);
+
+        // 3. 注册成功后再次发送 33 字节 KeepAlive
+        Guid.NewGuid().TryWriteBytes(pingBuf.AsSpan(1, 16));
+        await sSocket.SendAsync(pingBuf, pEp, cts.Token);
+        var (respLen2, _) = await sSocket.ReceiveAsync(respBuf, cts.Token);
+
+        Assert.Equal((byte)MsgType.EchoResp, respBuf[0]);
+        var (ep2, epLen2) = ProtocolHelper.ReadIPEndPoint(respBuf.AsSpan(17));
+        int statusPos2 = 17 + epLen2;
+        Assert.True(respLen2 > statusPos2);
+        Assert.Equal(1, respBuf[statusPos2]); // 已注册 -> Status 1 (OK)
+    }
+
+    [Fact]
+    public async Task ServerMode_WhenKeepAliveStatus0Received_TriggersImmediateReRegistration()
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var dummyUdp = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+        int pPort = ((IPEndPoint)dummyUdp.Client.LocalEndPoint!).Port;
+        dummyUdp.Close();
+
+        var pCfg = new AppConfig
+        {
+            Port = pPort,
+            EnableProxy = true,
+            ConfigPath = "dummy.ini"
+        };
+        var pEngine = new RouteEngine(pCfg);
+        _ = pEngine.StartAsync(cts.Token);
+        await Task.Delay(150, cts.Token);
+
+        Guid devId = Guid.NewGuid();
+        var sCfg = new AppConfig
+        {
+            DevId = devId,
+            Port = 0,
+            ConfigPath = "dummy.ini",
+            KeepAlive = 1
+        };
+        sCfg.ServerRecords.Add(new ServerRecord
+        {
+            Name = "fast_recovery_svc",
+            TargetServer = $"127.0.0.1:{pPort}",
+            TargetIp = "127.0.0.1",
+            TargetPort = 12345,
+            RegInterval = 300, // 正常周期为 300 秒
+            KeepAlive = 1
+        });
+
+        var sEngine = new RouteEngine(sCfg);
+        _ = sEngine.StartAsync(cts.Token);
+
+        // 1. 等待 S 初始注册完成 (最多等待 2 秒)
+        for (int i = 0; i < 20 && !pEngine.Proxy!.HasRegisteredServices(devId); i++)
+        {
+            await Task.Delay(100, cts.Token);
+        }
+        Assert.True(pEngine.Proxy!.HasRegisteredServices(devId));
+
+        // 2. 模拟 P 重启：清空 P 端路由表
+        pEngine.Proxy.ClearRoutingTablesForTest();
+        Assert.False(pEngine.Proxy.HasRegisteredServices(devId));
+
+        // 3. 验证在 1 秒保活触发后，S 端收到 status 0 立即补登，而不是苦等 300 秒
+        for (int i = 0; i < 30 && !pEngine.Proxy.HasRegisteredServices(devId); i++)
+        {
+            await Task.Delay(100, cts.Token);
+        }
+
+        // 证明无需等待 300 秒，通过 KeepAlive 回包驱动在极短时间内完成重新注册
+        Assert.True(pEngine.Proxy.HasRegisteredServices(devId));
+    }
 }
 

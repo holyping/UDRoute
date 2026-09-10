@@ -75,6 +75,27 @@ namespace UDRoute
             return list;
         }
 
+        public bool HasRegisteredServices(Guid devId)
+        {
+            if (devId == Guid.Empty) return false;
+            foreach (var info in _authRoutingTable.Values)
+            {
+                if (info.DevId == devId) return true;
+            }
+            foreach (var info in _unauthRoutingTable.Values)
+            {
+                if (info.DevId == devId) return true;
+            }
+            return false;
+        }
+
+        public void ClearRoutingTablesForTest()
+        {
+            _authRoutingTable.Clear();
+            _unauthRoutingTable.Clear();
+            _unauthDevServices.Clear();
+        }
+
         public ServerRecordInfo? DirectQuery(string name)
         {
             // 流程上完全让鉴权用户的注册凌驾于非鉴权用户之上：优先查鉴权用户，再查非鉴权用户
@@ -720,6 +741,7 @@ namespace UDRoute
                         {
                             _recentQueryResponses[queryKey] = punchCopy;
                         }
+                        UDRoute.Logging.Log.Warn($"[DEBUG] P sending PunchResp to {remoteEp}");
                         await _udp.SendAsync(punchCopy, remoteEp, ct);
                     }
                     finally

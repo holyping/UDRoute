@@ -30,8 +30,9 @@ Quick Setup:
 
 File Transfer:
   Directly transfer files via the built-in File protocol:
-  Push file: udroute -push name[:password]@PAddress SFilePath LocalFilePath/con:
-  Pull file: udroute -pull name[:password]@PAddress SFilePath LocalFilePath/con:
+  Push file: udroute -push [-y] name[:password]@PAddress SFilePath LocalFilePath/con:
+  Pull file: udroute -pull [-y] name[:password]@PAddress SFilePath LocalFilePath/con:
+  If the destination file already exists, prompt for confirmation (y/N); use -y to overwrite directly.
 
 Common Examples:
   1. Generate a commented configuration template:

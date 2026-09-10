@@ -2,7 +2,7 @@
   "profiles": {
     "UDRoute": {
       "commandName": "Project",
-      "commandLineArgs": "-c cli.ini"
+      "commandLineArgs": "-push kpxt@www.qzsoft.top a.upk \"E:\\mydocs\\Visual Studio 18\\Projects\\BOSKPXT\\dist\\def\\update.upk\""
     }
   }
 }

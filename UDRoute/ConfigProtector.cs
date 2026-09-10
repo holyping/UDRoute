@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Text;
 using System.Runtime.InteropServices;
+using System.Buffers.Binary;
 
 namespace UDRoute
 {
@@ -41,19 +42,32 @@ namespace UDRoute
             return Convert.ToBase64String(hashedIdBytes);
         }
 
+        public static byte[] ComputeFastAuthHash(byte[] passwordHash, long timestamp, long pRecvTicks)
+        {
+            byte[] buffer = new byte[32 + 8 + 8];
+            passwordHash.CopyTo(buffer.AsSpan(0, 32));
+            BinaryPrimitives.WriteInt64LittleEndian(buffer.AsSpan(32, 8), timestamp);
+            BinaryPrimitives.WriteInt64LittleEndian(buffer.AsSpan(40, 8), pRecvTicks);
+            return ManagedSHA256.ComputeHashBytes(buffer);
+        }
+
         public static string ComputeHWHash(string plainPassword)
         {
-            if (string.IsNullOrEmpty(plainPassword) || plainPassword.StartsWith("$HWHash$")) 
+            if (string.IsNullOrEmpty(plainPassword) 
+                || plainPassword.StartsWith("_HWHash_", StringComparison.OrdinalIgnoreCase)) 
                 return plainPassword;
             
-            // P端保存的 hash1
-            string hash1 = "$SHA256$" + ManagedSHA256.ComputeHash(plainPassword);
+            // 密码B: 密码A以HASH256加密成密码B
+            byte[] bBytes = ManagedSHA256.ComputeHashBytes(Encoding.UTF8.GetBytes(plainPassword));
+            string B = "_HASH256_" + Convert.ToBase64String(bBytes);
+
+            // t1: 机器特征码的HASH256
             string t1 = GetMachineId();
             
-            // S端保存的 hash2 = HashBytes(hash1 + t1) 存为 Base64
-            byte[] hash2Bytes = ManagedSHA256.ComputeHashBytes(Encoding.UTF8.GetBytes(hash1 + t1));
+            // 密码C (HWHash): t1 + B 存为 Base64
+            byte[] cBytes = ManagedSHA256.ComputeHashBytes(Encoding.UTF8.GetBytes(t1 + B));
             
-            return "$HWHash$" + Convert.ToBase64String(hash2Bytes);
+            return "_HWHash_" + Convert.ToBase64String(cBytes);
         }
     }
 }

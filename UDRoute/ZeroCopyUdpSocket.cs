@@ -10,6 +10,7 @@ namespace UDRoute
     public class ZeroCopyUdpSocket : IDisposable
     {
         private readonly Socket _socket;
+        private readonly SemaphoreSlim _sendLock = new(1, 1);
         public EndPoint LocalEndPoint => _socket.LocalEndPoint!;
 
         public ZeroCopyUdpSocket(int port)
@@ -44,9 +45,21 @@ namespace UDRoute
 
         public async ValueTask SendAsync(ReadOnlyMemory<byte> buffer, EndPoint remoteEP, CancellationToken ct)
         {
-            await _socket.SendToAsync(buffer, SocketFlags.None, remoteEP, ct);
+            await _sendLock.WaitAsync(ct);
+            try
+            {
+                await _socket.SendToAsync(buffer, SocketFlags.None, remoteEP, ct);
+            }
+            finally
+            {
+                _sendLock.Release();
+            }
         }
 
-        public void Dispose() => _socket.Dispose();
+        public void Dispose()
+        {
+            _socket.Dispose();
+            _sendLock.Dispose();
+        }
     }
 }

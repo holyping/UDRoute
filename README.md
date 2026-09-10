@@ -108,13 +108,33 @@ kcp=fast                   ; 可选：针对远程桌面的低延迟 KCP 预设�
 ```
 
 ### 3. 部署访问 Client (C端)
-创建一个名为 `client.ini` 的文件，将 S 端暴露的服务映射到本地。
+创建一份名为 `client.ini` 的文件，将 S 端暴露的服务映射到本地。
 客户端端口映射属于全局规则，直接写在文件开头，语法为 `本地端口/协议 = 目标服务名@代理服务器地址`：
 ```ini
 ;; 将本地的 13389 端口转发到远程的 RemoteDesktop 服务
 13389/tcp = RemoteDesktop@p.example.com
 ```
 运行后，客户端用户只需连接本地的 `127.0.0.1:13389`，即可穿透访问到远端的 3389 端口。
+
+### 4. 文件服务与传输 (File Transfer)
+除了 TCP/UDP 端口转发外，udroute 还内置了轻量级的文件点对点传输能力：
+- **S 端发布文件目录**：
+  在配置文件中指定 `target=D:\Data\Shared;/file`，或通过命令行快捷发布：
+  ```bash
+  udroute my_files=D:\Data\Shared;/file@p.example.com
+  ```
+  *(可选：添加 `;readonly` 将目录设为只读，如 `target=D:\Data\Shared;/file;readonly`)*
+- **C 端上传文件 (-push)**：
+  ```bash
+  udroute -push [-y] my_files[:password]@p.example.com remote_path/file.zip local_file.zip
+  ```
+- **C 端下载文件 (-pull)**：
+  ```bash
+  udroute -pull [-y] my_files[:password]@p.example.com remote_path/file.zip local_file.zip
+  ```
+- **覆盖保护与管道支持**：
+  - 若目标文件已存在，程序默认会在控制台询问确认 `(y/N)`；使用 `-y` 参数可跳过确认直接覆盖。
+  - 支持使用 `con:` 作为本地文件路径，实现标准输入/输出的管道重定向传输（流式管道模式若远端文件已存在需配合 `-y` 强制覆盖）。
 
 ## 🛠️ 守护进程与服务管理 (Service Management)
 

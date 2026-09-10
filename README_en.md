@@ -108,6 +108,26 @@ Client port mappings are global rules written directly at the top of the file. S
 ```
 After running, the client user simply connects to `127.0.0.1:13389` locally to tunnel through and access the remote 3389 port.
 
+### 4. File Service & Direct Transfer
+In addition to TCP/UDP port forwarding, udroute features a built-in lightweight file transfer sub-protocol:
+- **Server File Sharing**:
+  Expose a directory by specifying `target=C:\Data\Shared;/file` in the configuration file, or directly via command-line quick setup:
+  ```bash
+  udroute my_files=C:\Data\Shared;/file@p.example.com
+  ```
+  *(Optional: append `;readonly` to prevent modifications, e.g., `target=C:\Data\Shared;/file;readonly`)*
+- **Client Push (Upload)**:
+  ```bash
+  udroute -push [-y] my_files[:password]@p.example.com remote_path/file.zip local_file.zip
+  ```
+- **Client Pull (Download)**:
+  ```bash
+  udroute -pull [-y] my_files[:password]@p.example.com remote_path/file.zip local_file.zip
+  ```
+- **Overwrite Protection & Pipe Mode**:
+  - If the destination file already exists, udroute prompts for interactive confirmation `(y/N)`; add `-y` to overwrite directly without confirmation.
+  - Supports using `con:` as the local file path to pipe data to/from `stdin` or `stdout` (in pipe mode, `-y` is required if overwriting an existing remote file).
+
 ## 🛠️ Service Management (Daemon)
 
 udroute features cross-platform automatic registration for system background services. Whether you use the Windows Service Controller (`sc`) or Linux `systemd`, background daemonization and auto-start on boot are just one command away.

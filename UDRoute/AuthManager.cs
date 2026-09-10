@@ -24,7 +24,7 @@ namespace UDRoute
         private readonly object _processLock = new object();
         
         // 区分明文与密文的特殊前缀
-        private const string HashPrefix = "$SHA256$";
+        private const string HashPrefix = "_HASH256_";
 
         /// <summary>
         /// 初始化认证管理器
@@ -142,11 +142,12 @@ namespace UDRoute
                     string secret = parts[1].Trim();
                     string finalHash = secret;
 
-                    // 检查是否为明文
-                    if (!secret.StartsWith(HashPrefix))
+                    // 检查是否为明文：只要不以 _HASH256_ 开头，就属于明文密码
+                    if (!secret.StartsWith(HashPrefix, StringComparison.OrdinalIgnoreCase))
                     {
-                        // 计算 Hash
-                        finalHash = HashPrefix + ComputeSha256(secret);
+                        // 计算 Hash (密码B) 并自动回写
+                        byte[] bBytes = ManagedSHA256.ComputeHashBytes(Encoding.UTF8.GetBytes(secret));
+                        finalHash = HashPrefix + Convert.ToBase64String(bBytes);
                         newLines.Add($"{username}:{finalHash}"); // 替换为哈希行
                         needsRewrite = true;
                     }
@@ -155,7 +156,7 @@ namespace UDRoute
                         newLines.Add(line); // 已是哈希，直接加入
                     }
 
-                    // 无论是否明文，存入内存的必定是 Hash
+                    // 存入内存字典
                     newUsersDict[username] = finalHash;
                 }
 
@@ -172,7 +173,7 @@ namespace UDRoute
                         try
                         {
                             File.WriteAllLines(_pwdFilePath, newLines, Encoding.UTF8);
-                            Log.Info($"[Auth] 已自动将 {_pwdFilePath} 中的明文密码转化为 Hash 存储。");
+                            Log.Info($"[Auth] 已自动将 {_pwdFilePath} 中的明文密码转化为 HASH256 存储。");
                             break;
                         }
                         catch (UnauthorizedAccessException)
@@ -212,47 +213,52 @@ namespace UDRoute
             {
                 if (storedHash == null) return (false, "User hash is null");
 
-                if (inputPassword.StartsWith("$HW$"))
+                if (inputPassword.StartsWith("_HW_"))
                 {
                     var parts = inputPassword.Substring(4).Split('|');
                     if (parts.Length == 3 && long.TryParse(parts[0], out long ts))
                     {
-                        // 30秒抗重放攻击验证
+                        // 300秒抗重放攻击验证（允许5分钟时钟偏差与网络延迟）
                         long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-                        if (Math.Abs(now - ts) > 30)
+                        if (Math.Abs(now - ts) > 300)
                         {
                             Log.Warn($"[Auth] 检测到重放攻击或时间偏移过大: 用户 {username}");
-                            return (false, "Time drift > 30s or replay attack");
+                            return (false, "Time drift > 300s or replay attack");
                         }
 
                         string t1 = parts[1];
-                        string hash3 = parts[2];
-
-                        // storedHash 就是 hash1
-                        byte[] expectedHash2Bytes = ManagedSHA256.ComputeHashBytes(Encoding.UTF8.GetBytes(storedHash + t1));
-                        
+                        string dReceived = parts[2];
                         byte[] tsBytes = Encoding.UTF8.GetBytes(ts.ToString());
-                        byte[] bufferToHash = new byte[32 + tsBytes.Length];
-                        Buffer.BlockCopy(expectedHash2Bytes, 0, bufferToHash, 0, 32);
-                        Buffer.BlockCopy(tsBytes, 0, bufferToHash, 32, tsBytes.Length);
-                        
-                        byte[] expectedHash4Bytes = ManagedSHA256.ComputeHashBytes(bufferToHash);
-                        string expectedHash3Base64 = Convert.ToBase64String(expectedHash4Bytes);
 
-                        if (string.Equals(hash3, expectedHash3Base64, StringComparison.OrdinalIgnoreCase))
+                        // 算法：t1 + B = C, ts + C = D
+                        // storedHash 即为密码 B (_HASH256_...)
+                        byte[] cBytes = ManagedSHA256.ComputeHashBytes(Encoding.UTF8.GetBytes(t1 + storedHash));
+                        byte[] tsAndC = new byte[tsBytes.Length + 32];
+                        Buffer.BlockCopy(tsBytes, 0, tsAndC, 0, tsBytes.Length);
+                        Buffer.BlockCopy(cBytes, 0, tsAndC, tsBytes.Length, 32);
+                        byte[] dBytes = ManagedSHA256.ComputeHashBytes(tsAndC);
+                        string expectedD = Convert.ToBase64String(dBytes);
+
+                        if (string.Equals(dReceived, expectedD, StringComparison.OrdinalIgnoreCase))
                             return (true, "OK");
                         else
                             return (false, "Hash mismatch");
                     }
-                    return (false, "Invalid $HW$ payload format");
+                    return (false, "Invalid _HW_ payload format");
                 }
 
-                // 将用户传入的明文密码也计算成 Hash，进行比对（向下兼容）
-                string inputHash = HashPrefix + ComputeSha256(inputPassword);
+                // 将用户传入的明文密码计算为 HASH256 进行比对
+                byte[] inputBBytes = ManagedSHA256.ComputeHashBytes(Encoding.UTF8.GetBytes(inputPassword));
+                string inputHash = HashPrefix + Convert.ToBase64String(inputBBytes);
+
                 if (string.Equals(storedHash, inputHash, StringComparison.OrdinalIgnoreCase))
+                {
                     return (true, "OK");
+                }
                 else
+                {
                     return (false, "Plaintext hash mismatch");
+                }
             }
             return (false, "User not found");
         }

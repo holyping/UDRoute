@@ -13,18 +13,42 @@ namespace UDRoute
     {
         public static async Task RunAsync(string[] args)
         {
-            if (args.Length < 4)
+            bool autoOverwrite = args.Any(a => a.Equals("-y", StringComparison.OrdinalIgnoreCase) || a.Equals("--yes", StringComparison.OrdinalIgnoreCase));
+            var positional = args.Where(a => !a.Equals("-y", StringComparison.OrdinalIgnoreCase) && !a.Equals("--yes", StringComparison.OrdinalIgnoreCase)).ToArray();
+
+            if (positional.Length < 4)
             {
-                Console.WriteLine("Usage: udroute -push/-pull name@PAddress SFilePath LocalFilePath/con:");
+                Console.WriteLine("Usage: udroute -push/-pull [-y] name@PAddress SFilePath LocalFilePath/con:");
                 return;
             }
 
-            bool isPush = args[0].ToLower() == "-push";
-            string targetArg = args[1]; // name@PAddress
-            string sFilePath = args[2];
-            string localFilePath = args[3];
+            bool isPush = positional[0].Equals("-push", StringComparison.OrdinalIgnoreCase);
+            string targetArg = positional[1]; // name@PAddress
+            string sFilePath = positional[2];
+            string localFilePath = positional[3];
 
             bool isConsole = localFilePath.Equals("con:", StringComparison.OrdinalIgnoreCase);
+
+            if (!isPush && !isConsole && File.Exists(localFilePath))
+            {
+                if (!autoOverwrite)
+                {
+                    Console.Write($"Local file '{localFilePath}' already exists. Overwrite? (y/N): ");
+                    string? answer = Console.ReadLine();
+                    if (!string.Equals(answer?.Trim(), "y", StringComparison.OrdinalIgnoreCase) &&
+                        !string.Equals(answer?.Trim(), "yes", StringComparison.OrdinalIgnoreCase))
+                    {
+                        Console.WriteLine("Operation cancelled.");
+                        return;
+                    }
+                }
+            }
+
+            if (isPush && !isConsole && !File.Exists(localFilePath))
+            {
+                Console.WriteLine($"Error: Local source file '{localFilePath}' does not exist.");
+                return;
+            }
 
             var valParts = targetArg.Split('@');
             string namePart = valParts[0];
@@ -37,7 +61,7 @@ namespace UDRoute
             {
                 targetName = namePart.Substring(0, colonIdx);
                 string passPart = namePart.Substring(colonIdx + 1);
-                if (passPart.StartsWith("$HASH256$"))
+                if (passPart.StartsWith("_HASH256_", StringComparison.OrdinalIgnoreCase))
                 {
                     passwordHash = Convert.FromBase64String(passPart.Substring(9));
                 }
@@ -61,16 +85,17 @@ namespace UDRoute
                 TargetServer = targetServer,
                 IsTcp = true,
                 Password = passwordHash,
-                IsThis = string.IsNullOrEmpty(targetServer) || targetServer.Equals("this", StringComparison.OrdinalIgnoreCase)
+                IsThis = string.IsNullOrEmpty(targetServer) || targetServer.Equals("this", StringComparison.OrdinalIgnoreCase),
+                IsConsolePipe = isConsole
             });
             if (config.ClientRecords[0].IsThis) config.EnableProxy = true;
             if (isConsole)
             {
-                config.LogLevel = LogLevel.None;
+                // Log.SetLogger(new NullLogger());
             }
             else
             {
-                config.LogLevel = LogLevel.Error;
+                // config.LogLevel = LogLevel.Error;
             }
             Log.Init(config, false);
 
@@ -80,16 +105,8 @@ namespace UDRoute
             }
 
             using var cts = new CancellationTokenSource();
-            using var udp = new ZeroCopyUdpSocket(0);
-            ProxyMode? proxy = null;
-            if (config.EnableProxy)
-            {
-                proxy = new ProxyMode(config, udp);
-                _ = proxy.RunAsync(cts.Token);
-            }
-
-            var clientMode = new ClientMode(config, udp, proxy);
-            var runTask = clientMode.RunAsync(cts.Token);
+            var routeEngine = new RouteEngine(config);
+            var runTask = routeEngine.StartAsync(cts.Token);
 
             // Wait a little bit for ClientMode to start listening
             await Task.Delay(500);
@@ -106,11 +123,58 @@ namespace UDRoute
                 header[1] = (byte)(pathBytes.Length & 0xFF);
                 header[2] = (byte)((pathBytes.Length >> 8) & 0xFF);
 
-                await stream.WriteAsync(header, 0, 3);
-                await stream.WriteAsync(pathBytes, 0, pathBytes.Length);
+                await stream.WriteAsync(header, 0, 3, cts.Token);
+                await stream.WriteAsync(pathBytes, 0, pathBytes.Length, cts.Token);
 
                 if (isPush)
                 {
+                    // 服务端前置预检反馈
+                    int status = stream.ReadByte();
+                    if (status == 0xFF)
+                    {
+                        Console.WriteLine("Push failed: Access denied, invalid path, or server is in read-only mode.");
+                        return;
+                    }
+                    if (status == 0x01) // 服务端目标文件已存在
+                    {
+                        if (autoOverwrite)
+                        {
+                            stream.WriteByte(0x01); // 自动确认覆盖
+                            await stream.FlushAsync(cts.Token);
+                        }
+                        else
+                        {
+                            if (isConsole)
+                            {
+                                Console.WriteLine($"Target file '{sFilePath}' already exists on server. In pipe mode, please specify -y to overwrite.");
+                                stream.WriteByte(0x02); // 取消
+                                await stream.FlushAsync(cts.Token);
+                                return;
+                            }
+
+                            Console.Write($"Target file '{sFilePath}' already exists on server. Overwrite? (y/N): ");
+                            string? answer = Console.ReadLine();
+                            if (string.Equals(answer?.Trim(), "y", StringComparison.OrdinalIgnoreCase) ||
+                                string.Equals(answer?.Trim(), "yes", StringComparison.OrdinalIgnoreCase))
+                            {
+                                stream.WriteByte(0x01); // 确认覆盖
+                                await stream.FlushAsync(cts.Token);
+                            }
+                            else
+                            {
+                                Console.WriteLine("Operation cancelled.");
+                                stream.WriteByte(0x02); // 取消
+                                await stream.FlushAsync(cts.Token);
+                                return;
+                            }
+                        }
+                    }
+                    else if (status != 0x00)
+                    {
+                        Console.WriteLine($"Push failed: Unexpected server response ({status}).");
+                        return;
+                    }
+
                     long fileSize = 0;
                     Stream srcStream;
                     if (isConsole)
@@ -132,7 +196,7 @@ namespace UDRoute
                     }
 
                     byte[] sizeBuf = BitConverter.GetBytes(fileSize);
-                    await stream.WriteAsync(sizeBuf, 0, 8);
+                    await stream.WriteAsync(sizeBuf, 0, 8, cts.Token);
 
                     using (srcStream)
                     {

@@ -18,6 +18,7 @@ namespace UDRoute
         public bool AllowRelay { get; set; } = true;
         public string? Username { get; set; }
         public byte[]? Password { get; set; }
+        public byte[]? AccessPassword { get; set; }
         public KcpConfig KcpConfig { get; set; } = new();
         public int KeepAlive { get; set; } = Constants.DefaultKeepAlive;
     }

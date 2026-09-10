@@ -179,7 +179,7 @@ namespace UDRoute
                                     _server?.TryUpdatePeerEndpoint(echoSessionId, remoteEp);
                                     _client?.TryUpdatePeerEndpoint(echoSessionId, remoteEp);
                                 }
-                                _server?.TryHandleEchoResp(span);
+                                _server?.TryHandleEchoResp(span, remoteEp);
                                 _client?.TryHandleEchoResp(span);
                                 break;
 
@@ -232,7 +232,7 @@ namespace UDRoute
 
         private async ValueTask HandleEchoReqAsync(ReadOnlyMemory<byte> mem, EndPoint remoteEp, CancellationToken ct)
         {
-            // [MsgType 1][SessionId 16]
+            // [MsgType 1][SessionId 16] (optional [DevId 16])
             if (mem.Length < 17) return;
             var span = mem.Span;
             byte[] respBuf = System.Buffers.ArrayPool<byte>.Shared.Rent(64);
@@ -242,6 +242,19 @@ namespace UDRoute
                 span.Slice(1, 16).CopyTo(respBuf.AsSpan(1));
                 int offset = 17;
                 offset += ProtocolHelper.WriteIPEndPoint(respBuf.AsSpan(offset), remoteEp);
+
+                // 如果携带有 DevId 且本机启用了 Proxy 模式，检查该 DevId 是否已注册服务
+                if (span.Length >= 33 && _proxy != null)
+                {
+                    Guid devId = new Guid(span.Slice(17, 16));
+                    bool isRegistered = _proxy.HasRegisteredServices(devId);
+                    respBuf[offset++] = (byte)(isRegistered ? 1 : 0);
+                    if (!isRegistered)
+                    {
+                        Log.Info($"[P] Received KeepAlive from unregistered DevId {devId} ({remoteEp}). Replying with NeedRegister signal.");
+                    }
+                }
+
                 await _udp!.SendAsync(respBuf.AsMemory(0, offset), remoteEp, ct);
             }
             finally

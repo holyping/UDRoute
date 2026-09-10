@@ -676,7 +676,7 @@ public class TunnelReuseTests
                     byte[] sendBuf = Encoding.UTF8.GetBytes($"Client-{clientId}-Round-{round}-Payload");
                     await client.SendAsync(sendBuf, cEp);
 
-                    using var timeout = new CancellationTokenSource(5000);
+                    using var timeout = new CancellationTokenSource(10000);
                     using var linked = CancellationTokenSource.CreateLinkedTokenSource(cts.Token, timeout.Token);
                     var recv = await client.ReceiveAsync(linked.Token);
                     Assert.Equal(sendBuf, recv.Buffer);

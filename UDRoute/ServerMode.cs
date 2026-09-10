@@ -76,18 +76,24 @@ namespace UDRoute
 
         public async Task RunAsync(CancellationToken ct)
         {
-
             foreach (var rec in _config.ServerRecords)
             {
                 if (rec.IsFile)
                 {
-                    var listener = new TcpListener(IPAddress.Loopback, 0);
-                    listener.Start();
-                    rec.TargetIp = "127.0.0.1";
-                    rec.TargetPort = ((IPEndPoint)listener.LocalEndpoint).Port;
-                    rec.IsTcp = true;
-                    _ = FileProtocolHelper.RunServerAsync(listener, rec.BaseDir, rec.ReadOnly, ct);
-                    Log.Info($"[S] Started internal File Protocol server on 127.0.0.1:{rec.TargetPort} for base dir {rec.BaseDir}");
+                    try
+                    {
+                        var listener = new TcpListener(IPAddress.Loopback, 0);
+                        listener.Start();
+                        rec.TargetIp = "127.0.0.1";
+                        rec.TargetPort = ((IPEndPoint)listener.LocalEndpoint).Port;
+                        rec.IsTcp = true;
+                        _ = FileProtocolHelper.RunServerAsync(listener, rec.BaseDir, rec.ReadOnly, ct);
+                        Log.Info($"[S] Started internal File Protocol server on 127.0.0.1:{rec.TargetPort} for base dir {rec.BaseDir}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error($"[S] Failed to start File Protocol server for '{rec.Name}': {ex.Message}");
+                    }
                 }
             }
 
@@ -108,7 +114,14 @@ namespace UDRoute
                 Log.Info("[S] Network address change detected. Triggering immediate re-registration with P...");
                 try { _reRegisterSignal.Release(); } catch { }
             };
-            NetworkChange.NetworkAddressChanged += netHandler;
+            try
+            {
+                NetworkChange.NetworkAddressChanged += netHandler;
+            }
+            catch (Exception ex)
+            {
+                Log.Debug($"[S] NetworkAddressChanged registration failed: {ex.Message}");
+            }
 
             try
             {
@@ -137,8 +150,6 @@ namespace UDRoute
                         // Start STUN Echo requests to all resolved endpoints to gather public IPs
                         var localEps = orilocalEps.ToList();
                         var echoTasks = new List<Task<(IPEndPoint Target, IPEndPoint? Result)>>();
-                        byte[] echoReq = new byte[17];
-                        echoReq[0] = (byte)MsgType.EchoReq;
 
                         foreach (var pEp in pEndPoints)
                         {
@@ -149,11 +160,22 @@ namespace UDRoute
 
                             echoTasks.Add(Task.Run(async () =>
                             {
+                                byte[] echoReq = new byte[17];
+                                echoReq[0] = (byte)MsgType.EchoReq;
                                 var echoId = Guid.NewGuid();
                                 echoId.TryWriteBytes(echoReq.AsSpan(1, 16));
                                 var tcs = new TaskCompletionSource<IPEndPoint>(TaskCreationOptions.RunContinuationsAsynchronously);
                                 _pendingEchoes[echoId] = tcs;
-                                await _udp.SendAsync(echoReq, pEp, ct);
+
+                                try
+                                {
+                                    await _udp.SendAsync(echoReq, pEp, ct);
+                                }
+                                catch
+                                {
+                                    _pendingEchoes.TryRemove(echoId, out _);
+                                    return (pEp, (IPEndPoint?)null);
+                                }
                                 
                                 // 1 second timeout for echo (fast fail for bad IPv6 routes)
                                 using var timeout = new CancellationTokenSource(1000);
@@ -191,11 +213,22 @@ namespace UDRoute
                             {
                                 retryTasks.Add(Task.Run(async () =>
                                 {
+                                    byte[] retryReq = new byte[17];
+                                    retryReq[0] = (byte)MsgType.EchoReq;
                                     var echoId = Guid.NewGuid();
-                                    echoId.TryWriteBytes(echoReq.AsSpan(1, 16));
+                                    echoId.TryWriteBytes(retryReq.AsSpan(1, 16));
                                     var tcs = new TaskCompletionSource<IPEndPoint>(TaskCreationOptions.RunContinuationsAsynchronously);
                                     _pendingEchoes[echoId] = tcs;
-                                    await _udp.SendAsync(echoReq, pEp, ct);
+
+                                    try
+                                    {
+                                        await _udp.SendAsync(retryReq, pEp, ct);
+                                    }
+                                    catch
+                                    {
+                                        _pendingEchoes.TryRemove(echoId, out _);
+                                        return (pEp, (IPEndPoint?)null);
+                                    }
 
                                     using var timeout = new CancellationTokenSource(2000); // 稍微加长等待
                                     using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeout.Token);
@@ -230,7 +263,7 @@ namespace UDRoute
                         buffer[23] = (byte)(rec.IsTcp ? 1 : 0);
                         BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(24, 4), rec.Timeout);
                         BinaryPrimitives.WriteInt64LittleEndian(buffer.AsSpan(28, 8), DateTime.UtcNow.Ticks);
-                        bool reqPass = rec.Password != null && rec.Password.Length > 0;
+                        bool reqPass = rec.AccessPassword != null && rec.AccessPassword.Length > 0;
                         buffer[36] = (byte)(reqPass ? 1 : 0);
                         int offset = 37;
                         offset += ProtocolHelper.WriteKcpConfig(buffer.AsSpan(offset), rec.KcpConfig);
@@ -257,15 +290,16 @@ namespace UDRoute
                             string t1 = ConfigProtector.GetMachineId(); // Base64
                             long ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
                             
+                            // ts + C: ts 在前，C 在后
                             byte[] tsBytes = Encoding.UTF8.GetBytes(ts.ToString());
-                            byte[] bufferToHash = new byte[32 + tsBytes.Length];
-                            Buffer.BlockCopy(hash2Bytes, 0, bufferToHash, 0, 32);
-                            Buffer.BlockCopy(tsBytes, 0, bufferToHash, 32, tsBytes.Length);
+                            byte[] bufferToHash = new byte[tsBytes.Length + 32];
+                            Buffer.BlockCopy(tsBytes, 0, bufferToHash, 0, tsBytes.Length);
+                            Buffer.BlockCopy(hash2Bytes, 0, bufferToHash, tsBytes.Length, 32);
                             
-                            byte[] hash3Bytes = ManagedSHA256.ComputeHashBytes(bufferToHash);
-                            string hash3 = Convert.ToBase64String(hash3Bytes);
+                            byte[] dBytes = ManagedSHA256.ComputeHashBytes(bufferToHash);
+                            string dStr = Convert.ToBase64String(dBytes);
                             
-                            finalPassPayload = $"$HW${ts}|{t1}|{hash3}";
+                            finalPassPayload = $"_HW_{ts}|{t1}|{dStr}";
                         }
                         
                         offset += ProtocolHelper.WriteString(buffer.AsSpan(offset), finalPassPayload);
@@ -341,7 +375,7 @@ namespace UDRoute
             }
         }
 
-        public void TryHandleEchoResp(ReadOnlySpan<byte> data)
+        public void TryHandleEchoResp(ReadOnlySpan<byte> data, EndPoint remoteEp)
         {
             if (data.Length < 17) return;
             Guid sessionId = new Guid(data.Slice(1, 16));
@@ -349,6 +383,20 @@ namespace UDRoute
             {
                 var (ep, _) = ProtocolHelper.ReadIPEndPoint(data.Slice(17));
                 tcs.TrySetResult(ep);
+                return;
+            }
+
+            // 检查尾部是否包含 P 端的注册状态标识 (0: 需重新注册，1: 正常)
+            var (_, epLen) = ProtocolHelper.ReadIPEndPoint(data.Slice(17));
+            int statusPos = 17 + epLen;
+            if (data.Length > statusPos)
+            {
+                byte status = data[statusPos];
+                if (status == 0)
+                {
+                    Log.Info($"[S] KeepAlive response from P ({remoteEp}) indicates registration missing (P restarted). Triggering immediate re-registration...");
+                    try { _reRegisterSignal.Release(); } catch { }
+                }
             }
         }
 
@@ -461,9 +509,9 @@ namespace UDRoute
                         {
                             session = new TunnelSession(_udp, cPublicEp, sessionId, mtu, rec.IsTcp, rec.KcpConfig, rec.Timeout, rec.TunnelReuseInterval, rec.KeepAlive);
                             session.ChannelDesc = $"{rec.TargetIp}:{rec.TargetPort}";
-                            session.PasswordHash = rec.Password;
+                            session.PasswordHash = rec.AccessPassword;
                             session.ForceRelay = false;
-                            if (rec.Password == null || rec.Password.Length == 0) session.AuthTcs.TrySetResult(true);
+                            if (rec.AccessPassword == null || rec.AccessPassword.Length == 0) session.AuthTcs.TrySetResult(true);
                             _sessions[sessionId] = session;
                         }
                     }
@@ -483,10 +531,21 @@ namespace UDRoute
                             }
 
                             Log.Info($"[S] UDP punch succeeded without P relay! Connecting to backend target {rec.TargetIp}:{rec.TargetPort} for Session {sessionId}");
-                            bool authOk = await runSession.AuthTcs.Task;
+                            using var authTimeoutCts = new CancellationTokenSource(15000);
+                            using var linkedAuthCts = CancellationTokenSource.CreateLinkedTokenSource(ct, authTimeoutCts.Token);
+                            bool authOk = false;
+                            try
+                            {
+                                authOk = await runSession.AuthTcs.Task.WaitAsync(linkedAuthCts.Token);
+                            }
+                            catch
+                            {
+                                authOk = false;
+                            }
+
                             if (!authOk)
                             {
-                                Log.Warn($"[S] Auth failed for session {sessionId}, aborting bridge.");
+                                Log.Warn($"[S] Auth failed or timed out for session {sessionId}, aborting bridge.");
                                 return;
                             }
 
@@ -544,10 +603,10 @@ namespace UDRoute
                             {
                                 var session = new TunnelSession(_udp, remoteEp, sessionId, mtu, rec.IsTcp, rec.KcpConfig, rec.Timeout, rec.TunnelReuseInterval, rec.KeepAlive);
                                 session.ChannelDesc = $"{rec.TargetIp}:{rec.TargetPort}";
-                                session.PasswordHash = rec.Password;
+                                session.PasswordHash = rec.AccessPassword;
                                 session.ProxyEp = remoteEp;
                                 session.ForceRelay = clientForceRelay;
-                                if (rec.Password == null || rec.Password.Length == 0) session.AuthTcs.TrySetResult(true);
+                                if (rec.AccessPassword == null || rec.AccessPassword.Length == 0) session.AuthTcs.TrySetResult(true);
                                 _sessions[sessionId] = session;
                                 sessionToRun = session;
                             }
@@ -589,10 +648,21 @@ namespace UDRoute
                         {
                             try
                             {
-                                bool authOk = await runSession.AuthTcs.Task;
+                                using var authTimeoutCts = new CancellationTokenSource(15000);
+                                using var linkedAuthCts = CancellationTokenSource.CreateLinkedTokenSource(ct, authTimeoutCts.Token);
+                                bool authOk = false;
+                                try
+                                {
+                                    authOk = await runSession.AuthTcs.Task.WaitAsync(linkedAuthCts.Token);
+                                }
+                                catch
+                                {
+                                    authOk = false;
+                                }
+
                                 if (!authOk)
                                 {
-                                    Log.Warn($"[S] Auth failed for session {sessionId}, aborting bridge.");
+                                    Log.Warn($"[S] Auth failed or timed out for session {sessionId}, aborting bridge.");
                                     return;
                                 }
 
@@ -810,7 +880,15 @@ namespace UDRoute
                 }
                 else if (status == 3)
                 {
-                    // 收到对方打洞确认，双向直连打通，通知 P 端释放临时中继
+                    // 收到对方打洞确认，双向直连打通，回送一次确认以便 C 端获知双向确认并通知 P 端释放临时中继
+                    byte[] ackBuf = new byte[36];
+                    ackBuf[0] = (byte)MsgType.Punch;
+                    BinaryPrimitives.WriteUInt16LittleEndian(ackBuf.AsSpan(1, 2), 0);
+                    sessionId.TryWriteBytes(ackBuf.AsSpan(3, 16));
+                    _config.DevId.TryWriteBytes(ackBuf.AsSpan(19, 16));
+                    ackBuf[35] = 3; // Punch ACK
+                    try { await _udp.SendAsync(ackBuf, remoteEp, ct); } catch { }
+
                     session.NotifyDirectCommunicationEstablished();
                 }
                 return true;
@@ -841,9 +919,9 @@ namespace UDRoute
                 long tAuth = BinaryPrimitives.ReadInt64LittleEndian(span.Slice(17, 8));
                 byte[] clientHash = span.Slice(25, 32).ToArray();
 
-                // Validate timestamp (within 15 seconds)
+                // Validate timestamp (within 60 seconds to allow for network latency and minor clock drift)
                 long nowTicks = DateTime.UtcNow.Ticks;
-                if (Math.Abs(nowTicks - tAuth) > 15 * 10000000L)
+                if (Math.Abs(nowTicks - tAuth) > 60 * 10000000L)
                 {
                     Log.Warn($"[S] AuthReq timestamp out of bounds for session {sessionId}");
                     SendAuthRes(sessionId, remoteEp, false);
@@ -865,7 +943,9 @@ namespace UDRoute
                 BinaryPrimitives.WriteInt64LittleEndian(hashInput.AsSpan(session.PasswordHash.Length, 8), tAuth);
                 byte[] expectedHash = ManagedSHA256.ComputeHashBytes(hashInput);
 
-                if (clientHash.SequenceEqual(expectedHash))
+                bool match = clientHash.SequenceEqual(expectedHash);
+
+                if (match)
                 {
                     Log.Info($"[S] Auth succeeded for session {sessionId}");
                     SendAuthRes(sessionId, remoteEp, true);
@@ -941,15 +1021,15 @@ namespace UDRoute
 
             var candidates = new List<IPEndPoint> { cPublicEp };
 
-            Log.Info($"[S] Session {session.SessionId} starting UDP punch to targets: {string.Join(", ", candidates)}");
+            Log.Info($"[S] Session {session.SessionId} starting UDP punch to targets: {string.Join(", ", candidates)} (duration: {Constants.DefaultPunchRetries * Constants.DefaultPunchIntervalMs / 1000}s, interval: {Constants.DefaultPunchIntervalMs}ms)");
 
-            for (int i = 0; i < 8 && !session.IsDirect && !ct.IsCancellationRequested; i++)
+            for (int i = 0; i < Constants.DefaultPunchRetries && !session.IsDirect && !ct.IsCancellationRequested; i++)
             {
                 foreach (var ep in candidates)
                 {
                     await _udp.SendAsync(punchBuf, ep, ct);
                 }
-                await Task.Delay(100, ct);
+                await Task.Delay(Constants.DefaultPunchIntervalMs, ct);
             }
 
             if (session.IsDirect)
@@ -967,9 +1047,10 @@ namespace UDRoute
         private async Task RunPKeepAliveAsync(string pServer, int intervalSec, CancellationToken ct)
         {
             Log.Info($"[S] Started NAT KeepAlive to P server '{pServer}' (interval: {intervalSec}s)");
-            byte[] pingBuf = new byte[17];
+            byte[] pingBuf = new byte[33];
             pingBuf[0] = (byte)MsgType.EchoReq;
             Guid.NewGuid().TryWriteBytes(pingBuf.AsSpan(1, 16));
+            _config.DevId.TryWriteBytes(pingBuf.AsSpan(17, 16));
 
             IPEndPoint? cachedEp = null;
             DateTime lastResolve = DateTime.MinValue;

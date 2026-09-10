@@ -8,6 +8,8 @@ namespace UDRoute.Logging
 
         public static Logger Instance => _instance;
 
+        public static void DisposeInstance() => _instance.Dispose();
+
         public static void Init(AppConfig config, bool isServiceMode = false)
         {
             _instance.Dispose();

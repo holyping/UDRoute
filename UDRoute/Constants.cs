@@ -18,6 +18,8 @@ namespace UDRoute
         public const int MinMaxSize = MinMaxRecentRequests;
         public const int DefaultRetryIntervalMs = 500;
         public const int DefaultKeepAlive = 25;
+        public const int DefaultPunchRetries = 20;
+        public const int DefaultPunchIntervalMs = 250;
     }
 }
 

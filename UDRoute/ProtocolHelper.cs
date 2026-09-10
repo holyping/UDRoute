@@ -140,7 +140,8 @@ namespace UDRoute
 
             try
             {
-                var addresses = await Dns.GetHostAddressesAsync(host);
+                using var timeoutCts = new CancellationTokenSource(3000);
+                var addresses = await Dns.GetHostAddressesAsync(host, timeoutCts.Token);
                 if (addresses.Length > 0)
                 {
                     return new IPEndPoint(addresses[0], port);
@@ -182,7 +183,8 @@ namespace UDRoute
 
             try
             {
-                var addresses = await Dns.GetHostAddressesAsync(host);
+                using var timeoutCts = new CancellationTokenSource(3000);
+                var addresses = await Dns.GetHostAddressesAsync(host, timeoutCts.Token);
                 var eps = new List<IPEndPoint>();
                 foreach (var a in addresses)
                 {
