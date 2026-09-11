@@ -222,6 +222,30 @@ namespace UDRoute
             return list;
         }
 
+        // 获取本机所有网卡已分配的单播 IP 地址集合（不包含回环）
+        public static HashSet<IPAddress> GetLocalIPAddresses()
+        {
+            var set = new HashSet<IPAddress>();
+            try
+            {
+                foreach (var ni in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.OperationalStatus != System.Net.NetworkInformation.OperationalStatus.Up) continue;
+                    if (ni.NetworkInterfaceType == System.Net.NetworkInformation.NetworkInterfaceType.Loopback) continue;
+
+                    foreach (var ip in ni.GetIPProperties().UnicastAddresses)
+                    {
+                        if (!IPAddress.IsLoopback(ip.Address))
+                        {
+                            set.Add(ip.Address);
+                        }
+                    }
+                }
+            }
+            catch { }
+            return set;
+        }
+
         // IPv6 故障黑名单 (针对特定的 Proxy IPV6 地址)
         public static readonly System.Collections.Concurrent.ConcurrentDictionary<IPAddress, bool> UnavailableIPv6 = new();
 

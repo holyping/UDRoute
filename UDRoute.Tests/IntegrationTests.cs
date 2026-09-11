@@ -250,4 +250,41 @@ public class IntegrationTests
         echoListener.Stop();
         try { await Task.WhenAll(pTask, sTask, cTask, echoTask); } catch { }
     }
+
+    [Fact]
+    public async Task Punch_LoopbackProtection_DropsSelfInstanceId_AcceptsDifferentInstanceId()
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+
+        var cCfg = new AppConfig
+        {
+            DevId = Guid.NewGuid(),
+            Port = 0,
+            ConfigPath = "dummy.ini"
+        };
+        var dummySocket = new ZeroCopyUdpSocket(0);
+        var cClient = new ClientMode(cCfg, dummySocket, null);
+
+        // Manually create a session on Client
+        var sessionId = Guid.NewGuid();
+        var dummyRemote = new IPEndPoint(IPAddress.Loopback, 9999);
+        var session = new TunnelSession(dummySocket, dummyRemote, sessionId, 1400, false, null, 10, 10, 10);
+        cClient.AddSession(session);
+
+        // 1. Send Punch packet with self InstanceId -> MUST be dropped, IsDirect must stay false
+        bool handledSelf = await cClient.TryHandlePunchAsync(sessionId, cCfg.InstanceId, dummyRemote, 2, cts.Token);
+        Assert.True(handledSelf);
+        Assert.False(session.IsDirect);
+
+        // 2. Send Punch packet with different InstanceId (peer) -> MUST be accepted, IsDirect becomes true
+        var peerInstanceId = Guid.NewGuid();
+        bool handledPeer = await cClient.TryHandlePunchAsync(sessionId, peerInstanceId, dummyRemote, 2, cts.Token);
+        Assert.True(handledPeer);
+        Assert.True(session.IsDirect);
+        Assert.Equal(peerInstanceId, session.PeerInstanceId);
+
+        session.Dispose();
+        dummySocket.Dispose();
+    }
 }
+

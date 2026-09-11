@@ -70,6 +70,7 @@ namespace UDRoute
         public bool ForceRelay { get; set; }
         public int ReuseInterval { get; set; }
         public EndPoint? ProxyEp { get; set; }
+        public Guid PeerInstanceId { get; set; } = Guid.Empty; // 打洞对端运行实例唯一标识
         public int ActiveChannelCount => Volatile.Read(ref _activeChannelCount);
         public uint AllocateChannelId() => Interlocked.Increment(ref _nextChannelId);
         public Task SessionClosedTask => _sessionClosedTcs.Task;

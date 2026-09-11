@@ -24,6 +24,7 @@ namespace UDRoute
         public int RegTimeout { get; set; } = Constants.DefaultRegTimeout;
         public string DevName { get; set; } = Environment.MachineName;
         public Guid DevId { get; set; }
+        public Guid InstanceId { get; } = Guid.NewGuid(); // 实例运行时唯一随机ID (防止复制ini导致的DevId重复，用于打洞防自环)
 
         public bool EnableProxy { get; set; }
 

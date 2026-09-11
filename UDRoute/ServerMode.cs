@@ -850,8 +850,15 @@ namespace UDRoute
             }
         }
 
-        public async ValueTask<bool> TryHandlePunchAsync(Guid sessionId, Guid peerDevId, EndPoint remoteEp, byte status, CancellationToken ct)
+        public async ValueTask<bool> TryHandlePunchAsync(Guid sessionId, Guid peerInstanceId, EndPoint remoteEp, byte status, CancellationToken ct)
         {
+            // 1. 拦截本实例发出的自环打洞包（防止同一内网IP+端口或单机环回导致误判直连）
+            if (peerInstanceId == _config.InstanceId)
+            {
+                Log.Warn($"[S] Dropping loopback punch packet for session {sessionId} from {remoteEp}: InstanceId matches local instance ({peerInstanceId}).");
+                return true;
+            }
+
             TunnelSession? session;
             lock (_sessionLock)
             {
@@ -865,6 +872,14 @@ namespace UDRoute
                     return true;
                 }
 
+                // 2. 校验并绑定会话的对端实例唯一标识
+                if (session.PeerInstanceId != Guid.Empty && session.PeerInstanceId != peerInstanceId)
+                {
+                    Log.Warn($"[S] Dropping punch packet for session {sessionId} from {remoteEp}: PeerInstanceId mismatch (expected {session.PeerInstanceId}, got {peerInstanceId}).");
+                    return true;
+                }
+                session.PeerInstanceId = peerInstanceId;
+
                 session.SwitchToDirect(remoteEp);
 
                 if (status == 2)
@@ -874,7 +889,7 @@ namespace UDRoute
                     ackBuf[0] = (byte)MsgType.Punch;
                     BinaryPrimitives.WriteUInt16LittleEndian(ackBuf.AsSpan(1, 2), 0);
                     sessionId.TryWriteBytes(ackBuf.AsSpan(3, 16));
-                    _config.DevId.TryWriteBytes(ackBuf.AsSpan(19, 16));
+                    _config.InstanceId.TryWriteBytes(ackBuf.AsSpan(19, 16));
                     ackBuf[35] = 3; // Punch ACK
                     await _udp.SendAsync(ackBuf, remoteEp, ct);
                 }
@@ -885,7 +900,7 @@ namespace UDRoute
                     ackBuf[0] = (byte)MsgType.Punch;
                     BinaryPrimitives.WriteUInt16LittleEndian(ackBuf.AsSpan(1, 2), 0);
                     sessionId.TryWriteBytes(ackBuf.AsSpan(3, 16));
-                    _config.DevId.TryWriteBytes(ackBuf.AsSpan(19, 16));
+                    _config.InstanceId.TryWriteBytes(ackBuf.AsSpan(19, 16));
                     ackBuf[35] = 3; // Punch ACK
                     try { await _udp.SendAsync(ackBuf, remoteEp, ct); } catch { }
 
@@ -1016,10 +1031,23 @@ namespace UDRoute
             punchBuf[0] = (byte)MsgType.Punch;
             BinaryPrimitives.WriteUInt16LittleEndian(punchBuf.AsSpan(1, 2), 0);
             session.SessionId.TryWriteBytes(punchBuf.AsSpan(3, 16));
-            _config.DevId.TryWriteBytes(punchBuf.AsSpan(19, 16));
+            _config.InstanceId.TryWriteBytes(punchBuf.AsSpan(19, 16));
             punchBuf[35] = 2; // Direct Punch
 
-            var candidates = new List<IPEndPoint> { cPublicEp };
+            var localIps = ProtocolHelper.GetLocalIPAddresses();
+            int myLocalPort = _udp.LocalEndPoint is IPEndPoint myLp ? myLp.Port : 0;
+
+            var candidates = new List<IPEndPoint>();
+            if (cPublicEp != null && !(myLocalPort > 0 && cPublicEp.Port == myLocalPort && (localIps.Contains(cPublicEp.Address) || IPAddress.IsLoopback(cPublicEp.Address))))
+            {
+                candidates.Add(cPublicEp);
+            }
+
+            if (candidates.Count == 0)
+            {
+                Log.Info($"[S] Session {session.SessionId}: All candidate endpoints were filtered out (no remote targets). Skipping UDP punch and continuing with Proxy relay.");
+                return false;
+            }
 
             Log.Info($"[S] Session {session.SessionId} starting UDP punch to targets: {string.Join(", ", candidates)} (duration: {Constants.DefaultPunchRetries * Constants.DefaultPunchIntervalMs / 1000}s, interval: {Constants.DefaultPunchIntervalMs}ms)");
 

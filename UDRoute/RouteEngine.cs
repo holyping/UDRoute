@@ -270,7 +270,7 @@ namespace UDRoute
 
             ushort contextId = BinaryPrimitives.ReadUInt16LittleEndian(span.Slice(1, 2));
             Guid sessionId = new Guid(span.Slice(3, 16));
-            Guid devId = new Guid(span.Slice(19, 16));
+            Guid peerInstanceId = new Guid(span.Slice(19, 16));
             byte status = span[35];
 
             // 非打洞请求/确认包 -> 统一属于 Client 端的查询响应 (Success, NotFound, SUnresponsive, StaleSession 等)
@@ -284,13 +284,13 @@ namespace UDRoute
             else // 直接打洞包(PunchReq=2) 或 打洞确认包(PunchAck=3)
             {
                 // 1. 尝试匹配 ClientMode 活动会话
-                if (_client != null && await _client.TryHandlePunchAsync(sessionId, devId, remoteEp, status, ct))
+                if (_client != null && await _client.TryHandlePunchAsync(sessionId, peerInstanceId, remoteEp, status, ct))
                 {
                     return;
                 }
 
                 // 2. 尝试匹配 ServerMode 活动会话
-                if (_server != null && await _server.TryHandlePunchAsync(sessionId, devId, remoteEp, status, ct))
+                if (_server != null && await _server.TryHandlePunchAsync(sessionId, peerInstanceId, remoteEp, status, ct))
                 {
                     return;
                 }

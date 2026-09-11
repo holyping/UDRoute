@@ -98,7 +98,7 @@ UDRoute 是一个 P2P/中继 隧道系统。该系统包含三种基本角色：
 - `[MsgType = 3] (1 byte)`
 - `[ContextId] (2 bytes)` (ACK时常为0)
 - `[SessionId] (16 bytes)`
-- `[DevId] (16 bytes)`
+- `[InstanceId] (16 bytes, Guid)` (运行实例唯一随机标识，防止复制 ini 导致的 DevId 重复以及防止自环打洞误判)
 - `[Status] (1 byte)` (2 = 打洞探测 PunchReq, 3 = 打洞确认 PunchAck)
 
 ### 3.4. 鉴权握手 (AuthReq / AuthRes)
