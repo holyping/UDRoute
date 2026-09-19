@@ -11,6 +11,7 @@ Options:
 
 Commands:
   -h, -?, -help, --help Show this help message
+  -v, -version          Show version message
   -status               Connect to all running udroute processes on this machine and show their operational status and active data channels
   -hash [password]      Generate a secure hash for a password (interactive mode if no password provided)
   -init, -create [file] Generate a well-commented default configuration template file

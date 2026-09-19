@@ -14,6 +14,8 @@ namespace UDRoute
     // ==========================================
     class Program
     {
+        const string Version = "1.3";
+
         static async Task Main(string[] args)
         {
             // 全局异常陷阱，防止任何后台线程或异步任务中的未捕获异常导致静默崩溃
@@ -106,6 +108,12 @@ namespace UDRoute
             if (cmd == "-h" || cmd == "-?" || cmd == "-help" || cmd == "--help")
             {
                 PrintHelp();
+                return true;
+            }
+
+            if (cmd == "-v" || cmd == "-version" || cmd == "--version")
+            {
+                Console.WriteLine(string.Format("UDRoute v{0} by holyping", Version));
                 return true;
             }
 
