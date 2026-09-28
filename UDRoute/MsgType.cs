@@ -17,7 +17,15 @@ namespace UDRoute
         AuthReq = 11,
         AuthRes = 12,
         RelayEnd = 13,
-        RelayStartAck = 14
+        RelayStartAck = 14,
+        NatTestReq = 15,
+        NatTestResp = 16
+    }
+
+    public static class NatTestFlags
+    {
+        public const byte None = 0;
+        public const byte ReqSendFromAltPort = 1; // 要求服务器从辅助测试端口响应 (探测 Full Cone NAT)
     }
 
     public static class PunchStatus

@@ -34,6 +34,8 @@ UDRoute 是一个 P2P/中继 隧道系统。该系统包含三种基本角色：
 - `AuthRes = 12`：S -> C (鉴权结果响应)
 - `RelayEnd = 13`：C/S -> P (打洞成功后，通知 P 端释放中继资源)
 - `RelayStartAck = 14`：S -> P (响应中继建立请求)
+- `NatTestReq = 15`：S/C -> P (NAT 诊断探测请求)
+- `NatTestResp = 16`：P -> S/C (NAT 诊断探测响应)
 
 ## 3. 核心数据包结构解析 (Packet Formats)
 
@@ -56,11 +58,13 @@ UDRoute 是一个 P2P/中继 隧道系统。该系统包含三种基本角色：
 - `[PasswordPayload] (String)`
 - `[TunnelReuseInterval] (4 bytes)`
 - `[AllowRelay] (1 byte)`
+- `[InstanceId] (16 bytes, Guid, 可选/推荐，用于同机进程检测以自适应启用内存直通)`
 
 **RegisterAck (9)**
 - `[MsgType = 9] (1 byte)`
 - `[ContextId] (2 bytes)`
 - `[Status] (1 byte)` (1 = 成功，0 = 失败)
+- `[InstanceId] (16 bytes, Guid, P 节点运行实例唯一标识)`
 - `[Reason] (String, 可选)`
 
 ### 3.2. 服务查询与中继初始化 (C <-> P <-> S)
@@ -70,10 +74,27 @@ UDRoute 是一个 P2P/中继 隧道系统。该系统包含三种基本角色：
 - `[SessionId] (16 bytes, Guid)`
 - `[TargetName] (String)`
 - `[Flags] (1 byte)` (Bit0: ForceRelay, Bit1: IsReuse)
+- `[InstanceId] (16 bytes, Guid, C 节点运行实例唯一标识)`
 
-**Query Response (隐含，复用相关结构或作为 P 对 C 的直接回复)**
-- 如果成功 (Status = 1): 返回 S 端的公网/内网地址、鉴权要求等信息。
-- 如果失败 (Status != 1): 返回失败原因。(`PunchStatus.NotFound`, `SUnresponsive` 等)
+**Query Response (复用 Punch 结构作为 P 对 C 的直接回复)**
+- 如果成功 (Status = 1):
+  - `[MsgType = 3 (Punch)] (1 byte)`
+  - `[ContextId] (2 bytes)`
+  - `[SessionId] (16 bytes, Guid)`
+  - `[DevId] (16 bytes, Guid)`
+  - `[Status = 1] (1 byte)`
+  - `[ServerPublicEp] (EndPoint)`
+  - `[ServerWanPort] (4 bytes)`
+  - `[Timeout] (4 bytes)`
+  - `[Timestamp] (8 bytes)`
+  - `[ReqPass] (1 byte)`
+  - `[KcpConfig] (21 bytes)`
+  - `[EpCount] (1 byte)` + `[LocalEps...]`
+  - `[AllowRelay] (1 byte)`
+  - `[TunnelReuseInterval] (4 bytes)`
+  - `[PInstanceId] (16 bytes, Guid, P 节点运行实例标识)`
+  - `[SInstanceId] (16 bytes, Guid, S 节点运行实例标识)`
+- 如果失败 (Status != 1): 返回失败原因 (`PunchStatus.NotFound`, `SUnresponsive`, `StaleSession` 等)，并在 offset 19 携带 P 的 `InstanceId`。
 
 **RelayStart (4)** (请求开启中继)
 - `[MsgType = 4] (1 byte)`
@@ -93,6 +114,10 @@ UDRoute 是一个 P2P/中继 隧道系统。该系统包含三种基本角色：
 **EchoReq (7) / EchoResp (8)** (简单的 STUN 机制)
 - Request: `[MsgType = 7 (1 byte)] + [EchoId/SessionId (16 bytes)]`
 - Response: `[MsgType = 8 (1 byte)] + [EchoId (16 bytes)] + [PublicEp (EndPoint)]`
+
+**NatTestReq (15) / NatTestResp (16)** (NAT 类型与端口映射诊断)
+- Request: `[MsgType = 15 (1 byte)] + [TestId (16 bytes)] + [Flags (1 byte)]` (Flags: Bit0=ReqSendFromAltPort 请求从辅助端口回送以探测 Full Cone)
+- Response: `[MsgType = 16 (1 byte)] + [TestId (16 bytes)] + [PublicEp (EndPoint)] + [AltPort (4 bytes LE)]` (AltPort 为 P 端辅助测试端口，0 表示未开放)
 
 **Punch (3)**
 - `[MsgType = 3] (1 byte)`

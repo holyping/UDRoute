@@ -39,6 +39,24 @@ namespace UDRoute
         private readonly object _queryLock = new();
 
         public int Port => (_udp.LocalEndPoint is IPEndPoint ip) ? ip.Port : (_config.Port > 0 ? _config.Port : Constants.DefaultProxyPort);
+        public Func<ReadOnlyMemory<byte>, EndPoint, CancellationToken, ValueTask>? LocalServerRelayStartHandler { get; set; }
+
+        public void RegisterLocalRelaySession(Guid sessionId, EndPoint clientEp, EndPoint serverEp, int timeout, long serverTimestamp, string targetName)
+        {
+            lock (_relayLock)
+            {
+                _closedRelaySessions.Remove(sessionId);
+                _relaySessions[sessionId] = new RelaySession
+                {
+                    ClientEp = clientEp,
+                    ServerEp = serverEp,
+                    LastSeen = DateTime.UtcNow,
+                    TimeoutSeconds = timeout > 0 ? timeout : Constants.DefaultTimeout,
+                    ServerTimestamp = serverTimestamp,
+                    TargetName = targetName
+                };
+            }
+        }
 
         public ProxyMode(AppConfig config, ZeroCopyUdpSocket udp)
         {
@@ -107,6 +125,18 @@ namespace UDRoute
             {
                 return unauthInfo;
             }
+
+            if (!name.EndsWith("/tcp", StringComparison.OrdinalIgnoreCase) && !name.EndsWith("/udp", StringComparison.OrdinalIgnoreCase))
+            {
+                string tcpName = $"{name}/tcp";
+                if (_authRoutingTable.TryGetValue(tcpName, out authInfo)) return authInfo;
+                if (_unauthRoutingTable.TryGetValue(tcpName, out unauthInfo)) return unauthInfo;
+
+                string udpName = $"{name}/udp";
+                if (_authRoutingTable.TryGetValue(udpName, out authInfo)) return authInfo;
+                if (_unauthRoutingTable.TryGetValue(udpName, out unauthInfo)) return unauthInfo;
+            }
+
             return null;
         }
 
@@ -175,6 +205,19 @@ namespace UDRoute
                 sAllowRelay = data[offset++] != 0;
             }
 
+            Guid sInstanceId = Guid.Empty;
+            if (offset + 16 <= data.Length)
+            {
+                sInstanceId = new Guid(data.Slice(offset, 16));
+                offset += 16;
+            }
+
+            bool isLocalServer = (_config.InstanceId != Guid.Empty && sInstanceId == _config.InstanceId);
+            if (isLocalServer)
+            {
+                Log.Info($"[P] S-node '{name}' InstanceId matches local process. Auto-upgraded to memory direct pass (IsLocalServer = true).");
+            }
+
             bool isAuthenticated = false;
             bool providedAuth = !string.IsNullOrEmpty(username) || !string.IsNullOrEmpty(password);
             
@@ -229,8 +272,12 @@ namespace UDRoute
             var info = new ServerRecordInfo
             {
                 DevId = devId,
+                InstanceId = sInstanceId,
+                IsLocalServer = isLocalServer,
                 ServiceName = name,
-                PublicEp = remoteEp,
+                PublicEp = isLocalServer
+                    ? new IPEndPoint(IPAddress.Loopback, _udp.LocalEndPoint is IPEndPoint lep ? lep.Port : _config.Port)
+                    : remoteEp,
                 WanPort = wanPort,
                 IsTcp = isTcp,
                 KcpConfig = kcpConfig,
@@ -360,11 +407,12 @@ namespace UDRoute
         {
             if (contextId == 0) return;
             int reasonBytes = string.IsNullOrEmpty(reason) ? 0 : Encoding.UTF8.GetByteCount(reason);
-            byte[] ackBuf = new byte[4 + 4 + reasonBytes];
+            byte[] ackBuf = new byte[4 + 16 + 4 + reasonBytes];
             ackBuf[0] = (byte)MsgType.RegisterAck;
             BinaryPrimitives.WriteUInt16LittleEndian(ackBuf.AsSpan(1, 2), contextId);
             ackBuf[3] = status;
-            int offset = 4;
+            _config.InstanceId.TryWriteBytes(ackBuf.AsSpan(4, 16));
+            int offset = 20;
             if (status != 1 && !string.IsNullOrEmpty(reason))
             {
                 offset += ProtocolHelper.WriteString(ackBuf.AsSpan(offset), reason);
@@ -375,11 +423,13 @@ namespace UDRoute
         public void ProcessRegisterDirect(ServerRecord rec, Guid devId, int wanPort, string devName)
         {
             string proto = rec.IsTcp ? "tcp" : "udp";
+            int localPort = _udp.LocalEndPoint is IPEndPoint lep ? lep.Port : _config.Port;
             var info = new ServerRecordInfo
             {
                 DevId = devId,
+                InstanceId = _config.InstanceId,
                 ServiceName = rec.Name,
-                PublicEp = _udp.LocalEndPoint,
+                PublicEp = new IPEndPoint(IPAddress.Loopback, localPort),
                 WanPort = wanPort,
                 IsTcp = rec.IsTcp,
                 KcpConfig = rec.KcpConfig,
@@ -390,7 +440,10 @@ namespace UDRoute
                 STimestamp = DateTime.UtcNow.Ticks,
                 PRecvTimeTicks = DateTime.UtcNow.Ticks,
                 RequiresPassword = rec.Password != null && rec.Password.Length > 0,
-                TunnelReuseInterval = rec.TunnelReuseInterval
+                TunnelReuseInterval = rec.TunnelReuseInterval,
+                AllowRelay = rec.AllowRelay,
+                IsLocalServer = true,
+                LocalEps = ProtocolHelper.GetLocalEndPoints(wanPort > 0 ? wanPort : localPort)
             };
 
             string key1 = $"{rec.Name}/{proto}";
@@ -424,6 +477,18 @@ namespace UDRoute
                 byte qFlags = data[qOffset++];
                 clientForceRelay = (qFlags & 1) != 0;
                 isReuse = (qFlags & 2) != 0;
+            }
+
+            Guid cInstanceId = Guid.Empty;
+            if (qOffset + 16 <= data.Length)
+            {
+                cInstanceId = new Guid(data.Slice(qOffset, 16));
+                qOffset += 16;
+            }
+            bool isClientLocal = (_config.InstanceId != Guid.Empty && cInstanceId == _config.InstanceId);
+            if (isClientLocal)
+            {
+                Log.Info($"[P] Client for session {sessionId} InstanceId matches local process. Enabling local handling.");
             }
 
             var queryKey = (sessionId, contextId);
@@ -506,7 +571,7 @@ namespace UDRoute
                                 failBuf[0] = (byte)MsgType.Punch;
                                 BinaryPrimitives.WriteUInt16LittleEndian(failBuf.AsSpan(1, 2), contextId);
                                 sessionId.TryWriteBytes(failBuf.AsSpan(3, 16));
-                                Guid.Empty.TryWriteBytes(failBuf.AsSpan(19, 16));
+                                _config.InstanceId.TryWriteBytes(failBuf.AsSpan(19, 16));
                                 failBuf[35] = PunchStatus.StaleSession; // S restarted
                                 int failLen = 36 + ProtocolHelper.WriteString(failBuf.AsSpan(36), $"Target '{targetName}' restarted since session was created");
 
@@ -532,99 +597,19 @@ namespace UDRoute
                         Log.Info($"[P] AllowRelay is false for '{targetName}', ignoring client ForceRelay.");
                     }
 
-                    // 健康判断规则：当有新的握手请求时，若该通路已经超过 T1 秒没有成功通讯过，
-                    // 那么这个握手请求超过 T2 秒没有被响应，则判断为通道死亡。
-                    bool isIdle = (DateTime.UtcNow - sInfo.LastSeen) > TimeSpan.FromSeconds(_config.IdleThreshold);
-                    if (isIdle)
+                    EndPoint sEpToSend = sInfo.PublicEp;
+                    if (sInfo.IsLocalServer)
                     {
-                        Log.Info($"[P] Path to S for '{targetName}' idle > {_config.IdleThreshold}s (LastSeen: {sInfo.LastSeen:HH:mm:ss}). Probing S at {sInfo.PublicEp} (Timeout: {_config.ProbeTimeout}s)...");
-
-                        ushort probeContextId = (ushort)Interlocked.Increment(ref _contextCounter);
-                        if (probeContextId == 0) probeContextId = (ushort)Interlocked.Increment(ref _contextCounter);
-
-                        var probeTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-                        _pendingProbes[probeContextId] = probeTcs;
-
-                        // 通知 S 端发起准备与打洞 (RelayStart，带 ContextId 连发3次)
-                        byte[] probeBuf = ArrayPool<byte>.Shared.Rent(512);
-                        try
-                        {
-                            probeBuf[0] = (byte)MsgType.RelayStart;
-                            BinaryPrimitives.WriteUInt16LittleEndian(probeBuf.AsSpan(1, 2), probeContextId);
-                            sessionId.TryWriteBytes(probeBuf.AsSpan(3, 16));
-                            int offset = 19;
-                            offset += ProtocolHelper.WriteString(probeBuf.AsSpan(offset), targetName);
-                            offset += ProtocolHelper.WriteIPEndPoint(probeBuf.AsSpan(offset), remoteEp);
-                            probeBuf[offset++] = (byte)((allowRelay ? 1 : 0) | (effectiveForceRelay ? 2 : 0) | (isReuse ? 4 : 0));
-
-                            byte[] probeCopy = probeBuf.AsSpan(0, offset).ToArray();
-                            _ = ProtocolHelper.SendWithRetryAsync(_udp, probeCopy, sInfo.PublicEp, probeTcs.Task, ct);
-                        }
-                        finally
-                        {
-                            ArrayPool<byte>.Shared.Return(probeBuf);
-                        }
-
-                        bool probeSuccess = false;
-                        using (var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(_config.ProbeTimeout)))
-                        using (var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token))
-                        {
-                            try
-                            {
-                                probeSuccess = await probeTcs.Task.WaitAsync(linkedCts.Token);
-                            }
-                            catch
-                            {
-                                probeSuccess = false;
-                            }
-                            finally
-                            {
-                                _pendingProbes.TryRemove(probeContextId, out _);
-                            }
-                        }
-
-                        if (!probeSuccess)
-                        {
-                            Log.Warn($"[P] Health probe timed out after {_config.ProbeTimeout}s for '{targetName}' at {sInfo.PublicEp}. Declaring channel dead.");
-
-                            byte[] failBuf = ArrayPool<byte>.Shared.Rent(256);
-                            try
-                            {
-                                failBuf[0] = (byte)MsgType.Punch;
-                                BinaryPrimitives.WriteUInt16LittleEndian(failBuf.AsSpan(1, 2), contextId);
-                                sessionId.TryWriteBytes(failBuf.AsSpan(3, 16));
-                                Guid.Empty.TryWriteBytes(failBuf.AsSpan(19, 16));
-                                failBuf[35] = PunchStatus.SUnresponsive; // Health probe timed out / KeepAlive failed
-                                int failLen = 36 + ProtocolHelper.WriteString(failBuf.AsSpan(36), $"Target '{targetName}' is unresponsive (health probe timed out / keepalive failed)");
-
-                                byte[] failCopy = failBuf.AsSpan(0, failLen).ToArray();
-                                lock (_queryLock)
-                                {
-                                    _recentQueryResponses[queryKey] = failCopy;
-                                }
-                                await _udp.SendAsync(failCopy, remoteEp, ct);
-                            }
-                            finally
-                            {
-                                ArrayPool<byte>.Shared.Return(failBuf);
-                            }
-                            return;
-                        }
-
+                        int pPort = _config.WanPort > 0 ? _config.WanPort : (_udp.LocalEndPoint is IPEndPoint myIp ? myIp.Port : _config.Port);
+                        sEpToSend = ProtocolHelper.GetReachableLocalEndPoint(remoteEp, _config.WanPort, pPort);
                         sInfo.LastSeen = DateTime.UtcNow;
-                        Log.Info($"[P] Health probe succeeded for '{targetName}' at {sInfo.PublicEp}.");
-                    }
-                    else
-                    {
-                        // 活跃通路：通知 S 端 (RelayStart 连发3次)
+
+                        // 本地 S 模式通过委托直接进行内存级分发通知 (ContextId 为 0，无需 ACK)
                         byte[] relayStartBuf = ArrayPool<byte>.Shared.Rent(512);
                         try
                         {
-                            ushort relayContextId = (ushort)Interlocked.Increment(ref _contextCounter);
-                            if (relayContextId == 0) relayContextId = (ushort)Interlocked.Increment(ref _contextCounter);
-
                             relayStartBuf[0] = (byte)MsgType.RelayStart;
-                            BinaryPrimitives.WriteUInt16LittleEndian(relayStartBuf.AsSpan(1, 2), relayContextId);
+                            BinaryPrimitives.WriteUInt16LittleEndian(relayStartBuf.AsSpan(1, 2), 0);
                             sessionId.TryWriteBytes(relayStartBuf.AsSpan(3, 16));
                             int offset = 19;
                             offset += ProtocolHelper.WriteString(relayStartBuf.AsSpan(offset), targetName);
@@ -632,23 +617,136 @@ namespace UDRoute
                             relayStartBuf[offset++] = (byte)((allowRelay ? 1 : 0) | (effectiveForceRelay ? 2 : 0) | (isReuse ? 4 : 0));
 
                             byte[] relayCopy = relayStartBuf.AsSpan(0, offset).ToArray();
-                            var relayTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-                            _pendingProbes[relayContextId] = relayTcs;
-                            _ = Task.Run(async () =>
+                            if (LocalServerRelayStartHandler != null)
                             {
-                                try
-                                {
-                                    await ProtocolHelper.SendWithRetryAsync(_udp, relayCopy, sInfo.PublicEp, relayTcs.Task, ct);
-                                }
-                                finally
-                                {
-                                    _pendingProbes.TryRemove(relayContextId, out _);
-                                }
-                            });
+                                _ = LocalServerRelayStartHandler(relayCopy, remoteEp, ct);
+                            }
                         }
                         finally
                         {
                             ArrayPool<byte>.Shared.Return(relayStartBuf);
+                        }
+                    }
+                    else
+                    {
+                        // 健康判断规则：当有新的握手请求时，若该通路已经超过 T1 秒没有成功通讯过，
+                        // 那么这个握手请求超过 T2 秒没有被响应，则判断为通道死亡。
+                        bool isIdle = (DateTime.UtcNow - sInfo.LastSeen) > TimeSpan.FromSeconds(_config.IdleThreshold);
+                        if (isIdle)
+                        {
+                            Log.Info($"[P] Path to S for '{targetName}' idle > {_config.IdleThreshold}s (LastSeen: {sInfo.LastSeen:HH:mm:ss}). Probing S at {sInfo.PublicEp} (Timeout: {_config.ProbeTimeout}s)...");
+
+                            ushort probeContextId = (ushort)Interlocked.Increment(ref _contextCounter);
+                            if (probeContextId == 0) probeContextId = (ushort)Interlocked.Increment(ref _contextCounter);
+
+                            var probeTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                            _pendingProbes[probeContextId] = probeTcs;
+
+                            // 通知 S 端发起准备与打洞 (RelayStart，带 ContextId 连发3次)
+                            byte[] probeBuf = ArrayPool<byte>.Shared.Rent(512);
+                            try
+                            {
+                                probeBuf[0] = (byte)MsgType.RelayStart;
+                                BinaryPrimitives.WriteUInt16LittleEndian(probeBuf.AsSpan(1, 2), probeContextId);
+                                sessionId.TryWriteBytes(probeBuf.AsSpan(3, 16));
+                                int offset = 19;
+                                offset += ProtocolHelper.WriteString(probeBuf.AsSpan(offset), targetName);
+                                offset += ProtocolHelper.WriteIPEndPoint(probeBuf.AsSpan(offset), remoteEp);
+                                probeBuf[offset++] = (byte)((allowRelay ? 1 : 0) | (effectiveForceRelay ? 2 : 0) | (isReuse ? 4 : 0));
+
+                                byte[] probeCopy = probeBuf.AsSpan(0, offset).ToArray();
+                                _ = ProtocolHelper.SendWithRetryAsync(_udp, probeCopy, sInfo.PublicEp, probeTcs.Task, ct);
+                            }
+                            finally
+                            {
+                                ArrayPool<byte>.Shared.Return(probeBuf);
+                            }
+
+                            bool probeSuccess = false;
+                            using (var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(_config.ProbeTimeout)))
+                            using (var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token))
+                            {
+                                try
+                                {
+                                    probeSuccess = await probeTcs.Task.WaitAsync(linkedCts.Token);
+                                }
+                                catch
+                                {
+                                    probeSuccess = false;
+                                }
+                                finally
+                                {
+                                    _pendingProbes.TryRemove(probeContextId, out _);
+                                }
+                            }
+
+                            if (!probeSuccess)
+                            {
+                                Log.Warn($"[P] Health probe timed out after {_config.ProbeTimeout}s for '{targetName}' at {sInfo.PublicEp}. Declaring channel dead.");
+
+                                byte[] failBuf = ArrayPool<byte>.Shared.Rent(256);
+                                try
+                                {
+                                    failBuf[0] = (byte)MsgType.Punch;
+                                    BinaryPrimitives.WriteUInt16LittleEndian(failBuf.AsSpan(1, 2), contextId);
+                                    sessionId.TryWriteBytes(failBuf.AsSpan(3, 16));
+                                    _config.InstanceId.TryWriteBytes(failBuf.AsSpan(19, 16));
+                                    failBuf[35] = PunchStatus.SUnresponsive; // Health probe timed out / KeepAlive failed
+                                    int failLen = 36 + ProtocolHelper.WriteString(failBuf.AsSpan(36), $"Target '{targetName}' is unresponsive (health probe timed out / keepalive failed)");
+
+                                    byte[] failCopy = failBuf.AsSpan(0, failLen).ToArray();
+                                    lock (_queryLock)
+                                    {
+                                        _recentQueryResponses[queryKey] = failCopy;
+                                    }
+                                    await _udp.SendAsync(failCopy, remoteEp, ct);
+                                }
+                                finally
+                                {
+                                    ArrayPool<byte>.Shared.Return(failBuf);
+                                }
+                                return;
+                            }
+
+                            sInfo.LastSeen = DateTime.UtcNow;
+                            Log.Info($"[P] Health probe succeeded for '{targetName}' at {sInfo.PublicEp}.");
+                        }
+                        else
+                        {
+                            // 活跃通路：通知 S 端 (RelayStart 连发3次)
+                            byte[] relayStartBuf = ArrayPool<byte>.Shared.Rent(512);
+                            try
+                            {
+                                ushort relayContextId = (ushort)Interlocked.Increment(ref _contextCounter);
+                                if (relayContextId == 0) relayContextId = (ushort)Interlocked.Increment(ref _contextCounter);
+
+                                relayStartBuf[0] = (byte)MsgType.RelayStart;
+                                BinaryPrimitives.WriteUInt16LittleEndian(relayStartBuf.AsSpan(1, 2), relayContextId);
+                                sessionId.TryWriteBytes(relayStartBuf.AsSpan(3, 16));
+                                int offset = 19;
+                                offset += ProtocolHelper.WriteString(relayStartBuf.AsSpan(offset), targetName);
+                                offset += ProtocolHelper.WriteIPEndPoint(relayStartBuf.AsSpan(offset), remoteEp);
+                                relayStartBuf[offset++] = (byte)((allowRelay ? 1 : 0) | (effectiveForceRelay ? 2 : 0) | (isReuse ? 4 : 0));
+
+                                byte[] relayCopy = relayStartBuf.AsSpan(0, offset).ToArray();
+                                var relayTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                                _pendingProbes[relayContextId] = relayTcs;
+                                _ = Task.Run(async () =>
+                                {
+                                    try
+                                    {
+                                        await ProtocolHelper.SendWithRetryAsync(_udp, relayCopy, sInfo.PublicEp, relayTcs.Task, ct);
+                                    }
+                                    finally
+                                    {
+                                        _pendingProbes.TryRemove(relayContextId, out _);
+                                    }
+                                });
+                            }
+                            finally
+                            {
+                                ArrayPool<byte>.Shared.Return(relayStartBuf);
+                            }
                         }
                     }
 
@@ -688,7 +786,7 @@ namespace UDRoute
                             _relaySessions[sessionId] = new RelaySession
                             {
                                 ClientEp = remoteEp,
-                                ServerEp = sInfo.PublicEp,
+                                ServerEp = sEpToSend,
                                 LastSeen = DateTime.UtcNow,
                                 TimeoutSeconds = sInfo.Timeout > 0 ? sInfo.Timeout : Constants.DefaultTimeout,
                                 ServerTimestamp = sInfo.STimestamp,
@@ -708,7 +806,7 @@ namespace UDRoute
                         sInfo.DevId.TryWriteBytes(punchRespBuf.AsSpan(19, 16));
                         punchRespBuf[35] = 1; // Success
                         int offset = 36;
-                        offset += ProtocolHelper.WriteIPEndPoint(punchRespBuf.AsSpan(offset), sInfo.PublicEp);
+                        offset += ProtocolHelper.WriteIPEndPoint(punchRespBuf.AsSpan(offset), sEpToSend);
                         BinaryPrimitives.WriteInt32LittleEndian(punchRespBuf.AsSpan(offset, 4), sInfo.WanPort);
                         offset += 4;
                         BinaryPrimitives.WriteInt32LittleEndian(punchRespBuf.AsSpan(offset, 4), sInfo.Timeout);
@@ -735,6 +833,10 @@ namespace UDRoute
                         punchRespBuf[offset++] = (byte)(allowRelay ? 1 : 0);
                         BinaryPrimitives.WriteInt32LittleEndian(punchRespBuf.AsSpan(offset, 4), sInfo.TunnelReuseInterval);
                         offset += 4;
+                        _config.InstanceId.TryWriteBytes(punchRespBuf.AsSpan(offset, 16));
+                        offset += 16;
+                        sInfo.InstanceId.TryWriteBytes(punchRespBuf.AsSpan(offset, 16));
+                        offset += 16;
 
                         byte[] punchCopy = punchRespBuf.AsSpan(0, offset).ToArray();
                         lock (_queryLock)
@@ -761,7 +863,7 @@ namespace UDRoute
                         failBuf[0] = (byte)MsgType.Punch;
                         BinaryPrimitives.WriteUInt16LittleEndian(failBuf.AsSpan(1, 2), contextId);
                         sessionId.TryWriteBytes(failBuf.AsSpan(3, 16));
-                        Guid.Empty.TryWriteBytes(failBuf.AsSpan(19, 16));
+                        _config.InstanceId.TryWriteBytes(failBuf.AsSpan(19, 16));
                         failBuf[35] = PunchStatus.NotFound; // NotFound
                         int failLen = 36 + ProtocolHelper.WriteString(failBuf.AsSpan(36), $"Service '{targetName}' is not registered on P");
 

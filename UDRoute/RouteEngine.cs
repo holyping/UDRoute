@@ -15,6 +15,7 @@ namespace UDRoute
     {
         private readonly AppConfig _config;
         private ZeroCopyUdpSocket? _udp;
+        private ZeroCopyUdpSocket? _testUdp;
         private ProxyMode? _proxy;
         private ServerMode? _server;
         private ClientMode? _client;
@@ -41,6 +42,20 @@ namespace UDRoute
                 _proxy = new ProxyMode(_config, _udp);
                 tasks.Add(_proxy.RunAsync(ct));
                 Log.Info($"[P] Proxy running on UDP {_proxy.Port}");
+
+                if (boundEp is IPEndPoint ipEp && ipEp.Port > 0)
+                {
+                    try
+                    {
+                        _testUdp = new ZeroCopyUdpSocket(ipEp.Port + 1);
+                        tasks.Add(ReceiveTestUdpLoopAsync(ct));
+                        Log.Info($"[P] Auxiliary NAT test socket bound to UDP {_testUdp.LocalEndPoint}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Warn($"[P] Could not bind auxiliary NAT test port {ipEp.Port + 1}: {ex.Message}");
+                    }
+                }
             }
 
             if (_config.ServerRecords.Count > 0)
@@ -55,6 +70,11 @@ namespace UDRoute
                 _client = new ClientMode(_config, _udp, _proxy);
                 tasks.Add(_client.RunAsync(ct));
                 Log.Info($"[C] Client mode active.");
+            }
+
+            if (_proxy != null && _server != null)
+            {
+                _proxy.LocalServerRelayStartHandler = (mem, ep, ct) => _server.ProcessRelayStartAsync(mem, ep, ct);
             }
 
             // 核心 UDP 接收与分发循环
@@ -188,12 +208,12 @@ namespace UDRoute
                                 break;
 
                             case MsgType.AuthReq:
-                                if (_server != null) _server.TryHandleAuthReq(span, remoteEp);
+                                if (_server != null && _server.TryHandleAuthReq(span, remoteEp)) break;
                                 if (_proxy != null && span.Length >= 17) await _proxy.TryRelayDataAsync(new Guid(span.Slice(1, 16)), mem, remoteEp, ct);
                                 break;
 
                             case MsgType.AuthRes:
-                                if (_client != null) _client.TryHandleAuthRes(span, remoteEp);
+                                if (_client != null && _client.TryHandleAuthRes(span, remoteEp)) break;
                                 if (_proxy != null && span.Length >= 17) await _proxy.TryRelayDataAsync(new Guid(span.Slice(1, 16)), mem, remoteEp, ct);
                                 break;
 
@@ -202,6 +222,10 @@ namespace UDRoute
                                 {
                                     _proxy.HandleRelayEnd(new Guid(span.Slice(1, 16)), remoteEp);
                                 }
+                                break;
+
+                            case MsgType.NatTestReq:
+                                await HandleNatTestReqAsync(mem, remoteEp, fromPrimary: true, ct);
                                 break;
 
                             default:
@@ -260,6 +284,109 @@ namespace UDRoute
             finally
             {
                 System.Buffers.ArrayPool<byte>.Shared.Return(respBuf);
+            }
+        }
+
+        private async Task ReceiveTestUdpLoopAsync(CancellationToken ct)
+        {
+            byte[] poolBuf = ArrayPool<byte>.Shared.Rent(65535);
+            try
+            {
+                while (!ct.IsCancellationRequested && _testUdp != null)
+                {
+                    try
+                    {
+                        var (len, remoteEp) = await _testUdp.ReceiveAsync(poolBuf, ct);
+                        if (len < 1) continue;
+
+                        var mem = poolBuf.AsMemory(0, len);
+                        var span = mem.Span;
+                        MsgType type = (MsgType)span[0];
+
+                        switch (type)
+                        {
+                            case MsgType.EchoReq:
+                                await HandleEchoReqOnTestUdpAsync(mem, remoteEp, ct);
+                                break;
+                            case MsgType.NatTestReq:
+                                await HandleNatTestReqAsync(mem, remoteEp, fromPrimary: false, ct);
+                                break;
+                        }
+                    }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                    {
+                        break;
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error($"[RouteEngine] Auxiliary test UDP loop error: {ex.Message}");
+                        await Task.Delay(100, ct);
+                    }
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(poolBuf);
+            }
+        }
+
+        private async ValueTask HandleEchoReqOnTestUdpAsync(ReadOnlyMemory<byte> mem, EndPoint remoteEp, CancellationToken ct)
+        {
+            if (mem.Length < 17 || _testUdp == null) return;
+            var span = mem.Span;
+            byte[] respBuf = ArrayPool<byte>.Shared.Rent(64);
+            try
+            {
+                respBuf[0] = (byte)MsgType.EchoResp;
+                span.Slice(1, 16).CopyTo(respBuf.AsSpan(1));
+                int offset = 17;
+                offset += ProtocolHelper.WriteIPEndPoint(respBuf.AsSpan(offset), remoteEp);
+                await _testUdp.SendAsync(respBuf.AsMemory(0, offset), remoteEp, ct);
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(respBuf);
+            }
+        }
+
+        private async ValueTask HandleNatTestReqAsync(ReadOnlyMemory<byte> mem, EndPoint remoteEp, bool fromPrimary, CancellationToken ct)
+        {
+            // NatTestReq: [MsgType 1][TestId 16][Flags 1]
+            if (mem.Length < 18) return;
+            var span = mem.Span;
+            Guid testId = new Guid(span.Slice(1, 16));
+            byte flags = span[17];
+
+            byte[] respBuf = ArrayPool<byte>.Shared.Rent(64);
+            try
+            {
+                respBuf[0] = (byte)MsgType.NatTestResp;
+                testId.TryWriteBytes(respBuf.AsSpan(1, 16));
+                int offset = 17;
+                offset += ProtocolHelper.WriteIPEndPoint(respBuf.AsSpan(offset), remoteEp);
+
+                int altPort = (_testUdp != null && _testUdp.LocalEndPoint is IPEndPoint tip) ? tip.Port : 0;
+                BinaryPrimitives.WriteInt32LittleEndian(respBuf.AsSpan(offset, 4), altPort);
+                offset += 4;
+
+                bool sendFromAlt = (flags & NatTestFlags.ReqSendFromAltPort) != 0;
+                if (sendFromAlt && _testUdp != null)
+                {
+                    await _testUdp.SendAsync(respBuf.AsMemory(0, offset), remoteEp, ct);
+                }
+                else
+                {
+                    var socketToSend = fromPrimary ? _udp! : (_testUdp ?? _udp!);
+                    await socketToSend.SendAsync(respBuf.AsMemory(0, offset), remoteEp, ct);
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(respBuf);
             }
         }
 
@@ -393,6 +520,7 @@ namespace UDRoute
         public void Dispose()
         {
             _udp?.Dispose();
+            _testUdp?.Dispose();
         }
     }
 

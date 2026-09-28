@@ -23,5 +23,7 @@ namespace UDRoute
         public bool RequiresPassword { get; set; }
         public int TunnelReuseInterval { get; set; }
         public bool AllowRelay { get; set; } = true;
+        public bool IsLocalServer { get; set; }
+        public Guid InstanceId { get; set; } = Guid.Empty;
     }
 }

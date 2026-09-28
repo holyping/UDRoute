@@ -222,6 +222,34 @@ namespace UDRoute
             return list;
         }
 
+        // 根据远端目标地址类型获取本机可达的本地端点（优先局域网/公网IP，若对端为回环则返回回环）
+        public static IPEndPoint GetReachableLocalEndPoint(EndPoint targetEp, int wanPort, int localPort)
+        {
+            int portToUse = wanPort > 0 ? wanPort : localPort;
+            if (targetEp is IPEndPoint tip)
+            {
+                if (IPAddress.IsLoopback(tip.Address))
+                {
+                    return new IPEndPoint(tip.Address, portToUse);
+                }
+                if (tip.AddressFamily == AddressFamily.InterNetworkV6)
+                {
+                    var localEps = GetLocalEndPoints(portToUse);
+                    var v6 = localEps.FirstOrDefault(ep => ep.AddressFamily == AddressFamily.InterNetworkV6 && !ep.Address.IsIPv6LinkLocal);
+                    if (v6 != null) return v6;
+                    return new IPEndPoint(IPAddress.IPv6Loopback, portToUse);
+                }
+                else
+                {
+                    var localEps = GetLocalEndPoints(portToUse);
+                    var v4 = localEps.FirstOrDefault(ep => ep.AddressFamily == AddressFamily.InterNetwork);
+                    if (v4 != null) return v4;
+                    return new IPEndPoint(IPAddress.Loopback, portToUse);
+                }
+            }
+            return new IPEndPoint(IPAddress.Loopback, portToUse);
+        }
+
         // 获取本机所有网卡已分配的单播 IP 地址集合（不包含回环）
         public static HashSet<IPAddress> GetLocalIPAddresses()
         {

@@ -32,7 +32,7 @@ namespace UDRoute
         }
         private readonly ConcurrentDictionary<Guid, TaskCompletionSource<IPEndPoint>> _pendingEchoes = new();
         private int _contextCounter;
-        private readonly ConcurrentDictionary<ushort, TaskCompletionSource<(bool Success, string Reason)>> _pendingRegistrations = new();
+        private readonly ConcurrentDictionary<ushort, TaskCompletionSource<(bool Success, string Reason, bool IsLocal)>> _pendingRegistrations = new();
         private readonly TemporyDictionary<Guid, (ushort ContextId, byte Status)> _recentRelayStarts;
         private readonly object _recentRelayStartsLock = new();
 
@@ -306,12 +306,14 @@ namespace UDRoute
                         BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(offset, 4), rec.TunnelReuseInterval);
                         offset += 4;
                         buffer[offset++] = (byte)(rec.AllowRelay ? 1 : 0);
+                        _config.InstanceId.TryWriteBytes(buffer.AsSpan(offset, 16));
+                        offset += 16;
 
                         string proto = rec.IsTcp ? "tcp" : "udp";
                         var primaryPEp = pEndPoints[0];
                         byte[] regCopy = buffer.AsSpan(0, offset).ToArray();
 
-                        var regTcs = new TaskCompletionSource<(bool Success, string Reason)>(TaskCreationOptions.RunContinuationsAsynchronously);
+                        var regTcs = new TaskCompletionSource<(bool Success, string Reason, bool IsLocal)>(TaskCreationOptions.RunContinuationsAsynchronously);
                         _pendingRegistrations[regContextId] = regTcs;
 
                         _ = ProtocolHelper.SendWithRetryAsync(_udp, regCopy, primaryPEp, regTcs.Task, ct);
@@ -321,11 +323,13 @@ namespace UDRoute
 
                         bool regSuccess = false;
                         string regReason = "";
+                        bool isLocalP = false;
                         try
                         {
-                            var (success, reason) = await regTcs.Task.WaitAsync(linkedWaitCts.Token);
+                            var (success, reason, isLocal) = await regTcs.Task.WaitAsync(linkedWaitCts.Token);
                             regSuccess = success;
                             regReason = reason;
+                            isLocalP = isLocal;
                         }
                         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
                         {
@@ -338,6 +342,15 @@ namespace UDRoute
 
                         if (regSuccess)
                         {
+                            if (isLocalP)
+                            {
+                                rec.IsThis = true;
+                                Log.Info($"[S] P-node InstanceId matches local process for service '{rec.Name}'. Auto-upgraded to memory direct pass (IsThis = true).");
+                                if (_localProxy != null)
+                                {
+                                    _localProxy.ProcessRegisterDirect(rec, _config.DevId, _config.WanPort, _config.DevName);
+                                }
+                            }
                             Log.Info($"[S] Registered service '{rec.Name}/{proto}' with P ({primaryPEp}) + {epCount} IPs");
                         }
                         else
@@ -415,19 +428,27 @@ namespace UDRoute
 
         public void ProcessRegisterAck(ReadOnlySpan<byte> data, EndPoint remoteEp)
         {
-            // [MsgType 1 = 9][ContextId 2][Status 1][Reason string (optional)]
+            // [MsgType 1 = 9][ContextId 2][Status 1][InstanceId 16 (optional)][Reason string (optional)]
             if (data.Length < 4) return;
             ushort contextId = BinaryPrimitives.ReadUInt16LittleEndian(data.Slice(1, 2));
             byte status = data[3];
-            string reason = "";
-            if (data.Length > 4)
+            Guid pInstanceId = Guid.Empty;
+            int offset = 4;
+            if (data.Length >= offset + 16)
             {
-                (reason, _) = ProtocolHelper.ReadString(data.Slice(4));
+                pInstanceId = new Guid(data.Slice(offset, 16));
+                offset += 16;
+            }
+            string reason = "";
+            if (data.Length > offset)
+            {
+                (reason, _) = ProtocolHelper.ReadString(data.Slice(offset));
             }
 
+            bool isLocal = (_config.InstanceId != Guid.Empty && pInstanceId == _config.InstanceId);
             if (_pendingRegistrations.TryRemove(contextId, out var tcs))
             {
-                tcs.TrySetResult((status == 1, reason));
+                tcs.TrySetResult((status == 1, reason, isLocal));
             }
         }
 
@@ -911,9 +932,9 @@ namespace UDRoute
             return false;
         }
 
-        public void TryHandleAuthReq(ReadOnlySpan<byte> span, EndPoint remoteEp)
+        public bool TryHandleAuthReq(ReadOnlySpan<byte> span, EndPoint remoteEp)
         {
-            if (span.Length < 57) return;
+            if (span.Length < 57) return false;
             Guid sessionId = new Guid(span.Slice(1, 16));
             TunnelSession? session;
             lock (_sessionLock)
@@ -928,7 +949,7 @@ namespace UDRoute
                     // S doesn't require password, just ack success
                     SendAuthRes(sessionId, remoteEp, true);
                     session.AuthTcs.TrySetResult(true);
-                    return;
+                    return true;
                 }
 
                 long tAuth = BinaryPrimitives.ReadInt64LittleEndian(span.Slice(17, 8));
@@ -941,7 +962,7 @@ namespace UDRoute
                     Log.Warn($"[S] AuthReq timestamp out of bounds for session {sessionId}");
                     SendAuthRes(sessionId, remoteEp, false);
                     session.AuthTcs.TrySetResult(false);
-                    return;
+                    return true;
                 }
 
                 bool isChallenge = true;
@@ -950,7 +971,7 @@ namespace UDRoute
                 if (isChallenge)
                 {
                     SendAuthRes(sessionId, remoteEp, false, ConfigProtector.GetMachineId());
-                    return;
+                    return true;
                 }
 
                 byte[] hashInput = new byte[session.PasswordHash.Length + 8];
@@ -972,7 +993,9 @@ namespace UDRoute
                     SendAuthRes(sessionId, remoteEp, false);
                     session.AuthTcs.TrySetResult(false);
                 }
+                return true;
             }
+            return false;
         }
 
         private void SendAuthRes(Guid sessionId, EndPoint remoteEp, bool success, string? t1 = null)
@@ -1088,6 +1111,12 @@ namespace UDRoute
                 try
                 {
                     await Task.Delay(TimeSpan.FromSeconds(intervalSec), ct);
+
+                    if (_config.ServerRecords.Where(r => string.Equals(r.TargetServer, pServer, StringComparison.OrdinalIgnoreCase)).All(r => r.IsThis))
+                    {
+                        Log.Info($"[S] All services for P server '{pServer}' are now using memory direct pass. Stopping NAT KeepAlive.");
+                        break;
+                    }
 
                     if (cachedEp == null || (DateTime.UtcNow - lastResolve).TotalMinutes > 5)
                     {

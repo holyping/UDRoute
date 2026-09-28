@@ -154,6 +154,16 @@ Since the service runs silently in the background, how do you check its operatio
 ```
 This will pull a real-time status report from all running udroute instances, including registered services, currently active hole-punching/relay tunnels, public IPs of both endpoints, and real-time RTT latency data.
 
+### Network and NAT Diagnostics (-test)
+To verify whether the current network environment supports direct P2P hole-punching, run the following command on node S or C:
+```bash
+./udroute -test [P_server_address_or_ini]
+```
+The program will initiate a network and NAT diagnostic test towards the specified P server and display 3 core results:
+1. **Whether local machine and P have an IPv4 direct connection**: Tests whether the local machine has a public IPv4 address (no NAT) or is behind a NAT router.
+2. **Whether local machine possesses IPv6 direct connection capability**: Tests whether the local machine has a valid public IPv6 address and direct routing capability.
+3. **Whether local machine is behind a Cone NAT**: Probes port mapping behavior via RFC standards to determine whether the router is a Cone NAT (Full Cone / Restricted Cone, supporting P2P hole-punching) or Symmetric NAT (requiring relay).
+
 ## 🤝 Contributing
 
 Issues and Pull Requests are always welcome!

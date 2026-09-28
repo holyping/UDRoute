@@ -4,4 +4,5 @@
     <Platform Name="x64" />
   </Configurations>
   <Project Path="UDRoute/UDRoute.csproj" />
+  <Project Path="UDRoute.Tests/UDRoute.Tests.csproj" />
 </Solution>

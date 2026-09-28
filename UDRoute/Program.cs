@@ -68,6 +68,14 @@ namespace UDRoute
                 await FileClientHelper.RunAsync(args);
                 return;
             }
+            if (args.Any(a => a.Equals("-test", StringComparison.OrdinalIgnoreCase) ||
+                              a.Equals("-check", StringComparison.OrdinalIgnoreCase) ||
+                              a.Equals("-diag", StringComparison.OrdinalIgnoreCase) ||
+                              a.Equals("--test", StringComparison.OrdinalIgnoreCase)))
+            {
+                await NatDiagnosticHelper.RunAsync(args);
+                return;
+            }
             else if (HandleServiceCommands(args)) return;
 
             bool isServiceMode = args.Any(a =>
