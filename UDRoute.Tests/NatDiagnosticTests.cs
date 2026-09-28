@@ -187,41 +187,86 @@ target=127.0.0.1:80/tcp
             testId.TryWriteBytes(req.AsSpan(1, 16));
             req[17] = NatTestFlags.None;
 
+            // ==========================================
+            // 测试 1：阶段 1 探测 (NAT 1/2 无邀约入站与单次应答)
+            // ==========================================
+            // 客户端向 P 发送测试请求
             await clientUdp.SendAsync(req, pEp, cts.Token);
 
-            // Wait for NatTestResp from P
+            // P 作为主动方，从临时端口向客户端发送 Stage1Probe
             byte[] buf = new byte[1024];
             int altPort = 0;
             var (len, remoteEp) = await clientUdp.ReceiveAsync(buf, cts.Token);
-            Assert.True(len >= 17);
+            Assert.True(len >= 18);
             Assert.Equal((byte)MsgType.NatTestResp, buf[0]);
-            var (pubEp, epLen) = ProtocolHelper.ReadIPEndPoint(buf.AsSpan(17));
-            if (len >= 17 + epLen + 4)
+            Assert.Equal(NatTestFlags.Stage1Probe, buf[17]);
+            var (pubEp, epLen) = ProtocolHelper.ReadIPEndPoint(buf.AsSpan(18));
+            if (len >= 18 + epLen + 4)
             {
-                altPort = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(17 + epLen, 4));
+                altPort = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(18 + epLen, 4));
             }
 
             Assert.True(altPort > 0);
             Assert.NotEqual(proxyPort, altPort);
+            Assert.Equal(altPort, ((IPEndPoint)remoteEp).Port);
 
-            // Client now probes P's ephemeral port
-            var altPEp = new IPEndPoint(IPAddress.Loopback, altPort);
-            await clientUdp.SendAsync(req, altPEp, cts.Token);
+            // 客户端作为回复方：单次回送 Stage1Ack
+            byte[] ack = new byte[18];
+            ack[0] = (byte)MsgType.NatTestResp;
+            testId.TryWriteBytes(ack.AsSpan(1, 16));
+            ack[17] = NatTestFlags.Stage1Ack;
+            await clientUdp.SendAsync(ack, remoteEp, cts.Token);
 
-            // Client receives response from P's ephemeral port (draining any duplicate initial packet on loopback)
-            IPEndPoint? respEp = null;
+            // ==========================================
+            // 测试 2：阶段 2 探测 (阶段 1 超时后转由客户端主动发包，P 端临时端口回复)
+            // ==========================================
+            Guid testId2 = Guid.NewGuid();
+            byte[] req2 = new byte[18];
+            req2[0] = (byte)MsgType.NatTestReq;
+            testId2.TryWriteBytes(req2.AsSpan(1, 16));
+            req2[17] = NatTestFlags.None;
+
+            await clientUdp.SendAsync(req2, pEp, cts.Token);
+
+            // 客户端忽略阶段 1 的 Stage1Probe (不回复)，等待 P 端在阶段 1 超时后通过主端口发送 Stage2Notify
+            int altPort2 = 0;
             while (!cts.IsCancellationRequested)
             {
                 var (rLen, rEp) = await clientUdp.ReceiveAsync(buf, cts.Token);
-                if (rEp is IPEndPoint rep && rep.Port == altPort)
+                if (rLen >= 18 && (MsgType)buf[0] == MsgType.NatTestResp && new Guid(buf.AsSpan(1, 16)) == testId2)
                 {
-                    respEp = rep;
-                    break;
+                    if (buf[17] == NatTestFlags.Stage2Notify && ((IPEndPoint)rEp).Port == proxyPort)
+                    {
+                        var (_, pLen) = ProtocolHelper.ReadIPEndPoint(buf.AsSpan(18));
+                        altPort2 = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(18 + pLen, 4));
+                        break;
+                    }
                 }
             }
 
-            Assert.NotNull(respEp);
-            Assert.Equal(altPort, respEp.Port);
+            Assert.True(altPort2 > 0);
+
+            // 客户端作为主动方，向 P 端临时端口 altPort2 发包探测
+            var altPEp2 = new IPEndPoint(IPAddress.Loopback, altPort2);
+            await clientUdp.SendAsync(req2, altPEp2, cts.Token);
+
+            // P 端临时端口作为回复方，单次向客户端回复映射地址
+            IPEndPoint? respEp2 = null;
+            while (!cts.IsCancellationRequested)
+            {
+                var (rLen, rEp) = await clientUdp.ReceiveAsync(buf, cts.Token);
+                if (rLen >= 18 && (MsgType)buf[0] == MsgType.NatTestResp && new Guid(buf.AsSpan(1, 16)) == testId2)
+                {
+                    if (((IPEndPoint)rEp).Port == altPort2)
+                    {
+                        respEp2 = (IPEndPoint)rEp;
+                        break;
+                    }
+                }
+            }
+
+            Assert.NotNull(respEp2);
+            Assert.Equal(altPort2, respEp2.Port);
 
             cts.Cancel();
             try { await pTask; } catch { }

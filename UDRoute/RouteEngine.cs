@@ -279,7 +279,7 @@ namespace UDRoute
 
         private async Task HandleEphemeralNatTestAsync(Guid testId, byte flags, EndPoint remoteEp, CancellationToken ct)
         {
-            // P端动态创建随机端口临时 Socket，与 S/C 端进行双向 NAT 诊断握手
+            // P端动态创建随机端口临时 Socket，与 S/C 端进行两阶段 NAT 诊断握手
             ZeroCopyUdpSocket? tempUdp = null;
             try
             {
@@ -287,51 +287,115 @@ namespace UDRoute
                 int tempPort = (tempUdp.LocalEndPoint is IPEndPoint tip) ? tip.Port : 0;
                 if (tempPort == 0) return;
 
-                byte[] respBuf = ArrayPool<byte>.Shared.Rent(64);
-                int respLen;
+                // =========================================================================
+                // 阶段 1：测试无邀约入站放行能力 (判别 NAT 1/2)
+                // P 端为主动方：从临时端口向客户端发包，带重发 (3次，间隔 150ms)
+                // 客户端为回复方：收到即回，不主动重发
+                // =========================================================================
+                byte[] stage1ProbeBuf = ArrayPool<byte>.Shared.Rent(64);
+                int stage1ProbeLen;
                 try
                 {
-                    respBuf[0] = (byte)MsgType.NatTestResp;
-                    testId.TryWriteBytes(respBuf.AsSpan(1, 16));
-                    int offset = 17;
-                    offset += ProtocolHelper.WriteIPEndPoint(respBuf.AsSpan(offset), remoteEp);
-                    BinaryPrimitives.WriteInt32LittleEndian(respBuf.AsSpan(offset, 4), tempPort);
+                    stage1ProbeBuf[0] = (byte)MsgType.NatTestResp;
+                    testId.TryWriteBytes(stage1ProbeBuf.AsSpan(1, 16));
+                    stage1ProbeBuf[17] = NatTestFlags.Stage1Probe;
+                    int offset = 18;
+                    offset += ProtocolHelper.WriteIPEndPoint(stage1ProbeBuf.AsSpan(offset), remoteEp);
+                    BinaryPrimitives.WriteInt32LittleEndian(stage1ProbeBuf.AsSpan(offset, 4), tempPort);
                     offset += 4;
-                    respLen = offset;
-
-                    // 1. 先用随机端口发 UDP 给 S/C 端
-                    // 若 S/C 处于全锥型路由 (Full Cone)，可直接收到此包；
-                    // 即使非全锥型被客户端防火墙丢弃，P 端的云服务器出站连接状态此时也已建立
-                    try
-                    {
-                        await tempUdp.SendAsync(respBuf.AsMemory(0, respLen), remoteEp, ct);
-                    }
-                    catch (Exception ex)
-                    {
-                        Log.Debug($"[P] Outbound packet from ephemeral port {tempPort} failed: {ex.Message}");
-                    }
-
-                    // 2. P 端把新端口通过原主端口发给 S/C 端
-                    if (_udp != null)
-                    {
-                        await _udp.SendAsync(respBuf.AsMemory(0, respLen), remoteEp, ct);
-                    }
+                    stage1ProbeLen = offset;
                 }
-                finally
+                catch
                 {
-                    ArrayPool<byte>.Shared.Return(respBuf);
+                    ArrayPool<byte>.Shared.Return(stage1ProbeBuf);
+                    throw;
                 }
 
-                // 3. 临时端口等待 S/C 向新端口发包探测，同时允许新端口向 S/C 回包
-                using var testCts = new CancellationTokenSource(TimeSpan.FromSeconds(2.5));
-                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, testCts.Token);
+                using var stage1Cts = new CancellationTokenSource(800);
+                using var linkedStage1 = CancellationTokenSource.CreateLinkedTokenSource(ct, stage1Cts.Token);
+                bool stage1Success = false;
 
+                // P 端主动方发包任务 (重发 3 次防丢包)
+                var sendTask = Task.Run(async () =>
+                {
+                    for (int i = 0; i < 3; i++)
+                    {
+                        if (linkedStage1.IsCancellationRequested || stage1Success) break;
+                        try
+                        {
+                            await tempUdp.SendAsync(stage1ProbeBuf.AsMemory(0, stage1ProbeLen), remoteEp, linkedStage1.Token);
+                        }
+                        catch { }
+                        try { await Task.Delay(150, linkedStage1.Token); } catch { break; }
+                    }
+                });
+
+                // P 端在临时端口等待客户端的单次回包 (Stage1Ack)
                 byte[] recvBuf = ArrayPool<byte>.Shared.Rent(1024);
                 try
                 {
-                    while (!linkedCts.IsCancellationRequested)
+                    while (!linkedStage1.IsCancellationRequested)
                     {
-                        var (len, probeRemoteEp) = await tempUdp.ReceiveAsync(recvBuf, linkedCts.Token);
+                        var (len, fromEp) = await tempUdp.ReceiveAsync(recvBuf, linkedStage1.Token);
+                        if (len >= 17 && ((MsgType)recvBuf[0] == MsgType.NatTestResp || (MsgType)recvBuf[0] == MsgType.NatTestReq))
+                        {
+                            Guid recvId = new Guid(recvBuf.AsSpan(1, 16));
+                            if (recvId == testId)
+                            {
+                                stage1Success = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                catch (OperationCanceledException) { }
+
+                ArrayPool<byte>.Shared.Return(stage1ProbeBuf);
+
+                if (stage1Success)
+                {
+                    // 阶段 1 成功：客户端确认为 NAT 1/2，直接结束，省去阶段 2 开销
+                    return;
+                }
+
+                // =========================================================================
+                // 阶段 2：阶段 1 超时，P 端通过主端口通知客户端临时端口号
+                // 客户端转为主动方：向 P 端临时端口发包探测 (客户端负责重发)
+                // P 端转为回复方：收到即回，不主动重发 (单次回送客户端映射端口)
+                // =========================================================================
+                if (_udp != null)
+                {
+                    byte[] stage2NotifyBuf = ArrayPool<byte>.Shared.Rent(64);
+                    try
+                    {
+                        stage2NotifyBuf[0] = (byte)MsgType.NatTestResp;
+                        testId.TryWriteBytes(stage2NotifyBuf.AsSpan(1, 16));
+                        stage2NotifyBuf[17] = NatTestFlags.Stage2Notify;
+                        int off = 18;
+                        off += ProtocolHelper.WriteIPEndPoint(stage2NotifyBuf.AsSpan(off), remoteEp);
+                        BinaryPrimitives.WriteInt32LittleEndian(stage2NotifyBuf.AsSpan(off, 4), tempPort);
+                        off += 4;
+                        // 主端口发送通知 (发 2 次防主端口单包偶发丢失)
+                        await _udp.SendAsync(stage2NotifyBuf.AsMemory(0, off), remoteEp, ct);
+                        await Task.Delay(50, ct);
+                        await _udp.SendAsync(stage2NotifyBuf.AsMemory(0, off), remoteEp, ct);
+                    }
+                    catch { }
+                    finally
+                    {
+                        ArrayPool<byte>.Shared.Return(stage2NotifyBuf);
+                    }
+                }
+
+                // P 端临时 Socket 作为回复方：等待客户端发包，收到每个探测包单次回送一次 (不重发)
+                using var stage2Cts = new CancellationTokenSource(TimeSpan.FromSeconds(2.5));
+                using var linkedStage2 = CancellationTokenSource.CreateLinkedTokenSource(ct, stage2Cts.Token);
+
+                try
+                {
+                    while (!linkedStage2.IsCancellationRequested)
+                    {
+                        var (len, probeRemoteEp) = await tempUdp.ReceiveAsync(recvBuf, linkedStage2.Token);
                         if (len < 17) continue;
 
                         var span = recvBuf.AsSpan(0, len);
@@ -340,22 +404,51 @@ namespace UDRoute
 
                         if ((type == MsgType.NatTestReq || type == MsgType.EchoReq) && probeTestId == testId)
                         {
-                            // 收到 S/C 端发给新端口的探测包，把 S/C 在新端口看到的映射公网地址回送给它
+                            // 收到客户端探测包，回复方单次回送 (不重发)：带上客户端在新端口上的映射公网地址
                             byte[] replyBuf = ArrayPool<byte>.Shared.Rent(64);
                             try
                             {
                                 replyBuf[0] = (byte)MsgType.NatTestResp;
                                 testId.TryWriteBytes(replyBuf.AsSpan(1, 16));
-                                int off = 17;
+                                replyBuf[17] = NatTestFlags.None;
+                                int off = 18;
                                 off += ProtocolHelper.WriteIPEndPoint(replyBuf.AsSpan(off), probeRemoteEp);
                                 BinaryPrimitives.WriteInt32LittleEndian(replyBuf.AsSpan(off, 4), tempPort);
                                 off += 4;
-                                await tempUdp.SendAsync(replyBuf.AsMemory(0, off), probeRemoteEp, linkedCts.Token);
+                                await tempUdp.SendAsync(replyBuf.AsMemory(0, off), probeRemoteEp, linkedStage2.Token);
                             }
                             finally
                             {
                                 ArrayPool<byte>.Shared.Return(replyBuf);
                             }
+
+                            // 简短等待 (200ms) 以便吸收客户端可能已经在途的重发包并应答，然后平稳退出
+                            using var drainCts = new CancellationTokenSource(200);
+                            using var linkedDrain = CancellationTokenSource.CreateLinkedTokenSource(linkedStage2.Token, drainCts.Token);
+                            try
+                            {
+                                while (!linkedDrain.IsCancellationRequested)
+                                {
+                                    var (dLen, dEp) = await tempUdp.ReceiveAsync(recvBuf, linkedDrain.Token);
+                                    if (dLen >= 17 && new Guid(recvBuf.AsSpan(1, 16)) == testId)
+                                    {
+                                        byte[] dReply = ArrayPool<byte>.Shared.Rent(64);
+                                        try
+                                        {
+                                            dReply[0] = (byte)MsgType.NatTestResp;
+                                            testId.TryWriteBytes(dReply.AsSpan(1, 16));
+                                            dReply[17] = NatTestFlags.None;
+                                            int dOff = 18;
+                                            dOff += ProtocolHelper.WriteIPEndPoint(dReply.AsSpan(dOff), dEp);
+                                            BinaryPrimitives.WriteInt32LittleEndian(dReply.AsSpan(dOff, 4), tempPort);
+                                            dOff += 4;
+                                            await tempUdp.SendAsync(dReply.AsMemory(0, dOff), dEp, linkedDrain.Token);
+                                        }
+                                        finally { ArrayPool<byte>.Shared.Return(dReply); }
+                                    }
+                                }
+                            }
+                            catch (OperationCanceledException) { }
                             break;
                         }
                     }

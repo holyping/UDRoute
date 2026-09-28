@@ -25,7 +25,9 @@ namespace UDRoute
     public static class NatTestFlags
     {
         public const byte None = 0;
-        public const byte ReqSendFromAltPort = 1; // 要求服务器从辅助测试端口响应 (探测 Full Cone NAT)
+        public const byte Stage1Probe = 1;     // 阶段1：P端临时端口发出的无邀约入站探测包 (主动方重发)
+        public const byte Stage1Ack = 2;       // 阶段1：C端收到无邀约包后的单次回包确认 (回复方不重发，收到即回)
+        public const byte Stage2Notify = 3;    // 阶段2：阶段1超时，P端通过主端口通知C端临时端口号，转入阶段2
     }
 
     public static class PunchStatus
