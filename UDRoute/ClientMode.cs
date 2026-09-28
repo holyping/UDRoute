@@ -1339,13 +1339,19 @@ namespace UDRoute
 
         private string PromptAndReadPassword(string queryName)
         {
+            string promptText = I18n.Text($"\r[C] 请输入服务 {queryName} 的密码: ", $"\r[C] Password for {queryName}: ");
             if (CustomPasswordPromptWriter != null)
-                CustomPasswordPromptWriter($"[C] Password for {queryName}: ");
+                CustomPasswordPromptWriter(promptText);
             else
-                Console.Write($"\r[C] Password for {queryName}: ");
+                Console.Write(promptText);
 
             if (CustomPasswordReader != null)
                 return CustomPasswordReader();
+
+            if (Console.IsInputRedirected)
+            {
+                return "";
+            }
 
             string pass = "";
             try

@@ -225,7 +225,7 @@ namespace UDRoute
                     string secName = line.Substring(1, line.Length - 2).Trim();
                     if (secName.Contains('/'))
                     {
-                        Console.WriteLine($"[Config] Error: Server name '{secName}' cannot contain '/'. Section ignored.");
+                        Console.WriteLine(I18n.Text($"[Config] 错误: 服务名 '{secName}' 不能包含 '/'，已忽略该配置段。", $"[Config] Error: Server name '{secName}' cannot contain '/'. Section ignored."));
                         sRec = null; // Ignore subsequent properties for this section
                         continue;
                     }
@@ -543,7 +543,7 @@ namespace UDRoute
             var parts = key.Split('/');
             if (parts.Length > 1 && parts[1].Equals("file", StringComparison.OrdinalIgnoreCase))
             {
-                Console.WriteLine($"[Config] Error: The 'file' protocol cannot be bound to a local port in C-mode. Use the -push/-pull CLI commands instead.");
+                Console.WriteLine(I18n.Text("[Config] 错误: C模式下 'file' 协议不能绑定到本地端口。请使用 -push/-pull 命令。", "[Config] Error: The 'file' protocol cannot be bound to a local port in C-mode. Use the -push/-pull CLI commands instead."));
                 return null;
             }
 
@@ -584,7 +584,7 @@ namespace UDRoute
 
             if (rec.TargetName.Contains('/'))
             {
-                Console.WriteLine($"[Config] Error: Target name '{rec.TargetName}' cannot contain '/'. Entry ignored.");
+                Console.WriteLine(I18n.Text($"[Config] 错误: 目标服务名 '{rec.TargetName}' 不能包含 '/'，已忽略该条目。", $"[Config] Error: Target name '{rec.TargetName}' cannot contain '/'. Entry ignored."));
                 return null;
             }
 
@@ -625,7 +625,7 @@ namespace UDRoute
                         string srvName = left.Split('.')[0];
                         if (srvName.Contains('/'))
                         {
-                            Console.WriteLine($"[Config] Error: Server name '{srvName}' in command line cannot contain '/'. Argument ignored.");
+                            Console.WriteLine(I18n.Text($"[Config] 错误: 命令行服务名 '{srvName}' 不能包含 '/'，已忽略该参数。", $"[Config] Error: Server name '{srvName}' in command line cannot contain '/'. Argument ignored."));
                             continue;
                         }
 
@@ -664,7 +664,7 @@ namespace UDRoute
                             }
                             else
                             {
-                                Console.WriteLine($"[Config] Error: Invalid target format '{valParts[0]}'. Expected 'ip:port[/tcp|udp]' or 'path;/file'.");
+                                Console.WriteLine(I18n.Text($"[Config] 错误: 目标格式 '{valParts[0]}' 无效。应为 'ip:port[/tcp|udp]' 或 'path;/file'。", $"[Config] Error: Invalid target format '{valParts[0]}'. Expected 'ip:port[/tcp|udp]' or 'path;/file'."));
                             }
                         }
                         cfg.ServerRecords.Add(sRec);
@@ -677,15 +677,15 @@ namespace UDRoute
         {
             try
             {
-                if (File.Exists(path)) throw new Exception($"Configuration file {path} already exists!");
+                if (File.Exists(path)) throw new Exception(I18n.Text($"配置文件 {path} 已存在！", $"Configuration file {path} already exists!"));
 
-                bool isZh = System.Globalization.CultureInfo.CurrentUICulture.TwoLetterISOLanguageName == "zh";
+                bool isZh = I18n.IsZh;
                 string resName = isZh ? "UDRoute.udroute_template_zh.ini" : "UDRoute.udroute_template_en.ini";
 
                 using var stream = System.Reflection.Assembly.GetExecutingAssembly().GetManifestResourceStream(resName);
                 if (stream == null)
                 {
-                    Console.WriteLine($"Error: Could not find the embedded template resource ({resName}).");
+                    Console.WriteLine(I18n.Text($"错误: 未找到内置模板资源 ({resName})。", $"Error: Could not find the embedded template resource ({resName})."));
                     return;
                 }
                 using var reader = new StreamReader(stream, Encoding.UTF8);
@@ -695,11 +695,11 @@ namespace UDRoute
                 template = template.Replace("{DevId}", Guid.NewGuid().ToString());
 
                 File.WriteAllText(path, template, Encoding.UTF8);
-                Console.WriteLine($"Configuration template successfully written to: {Path.GetFullPath(path)}");
+                Console.WriteLine(I18n.Text($"配置模板已成功写入: {Path.GetFullPath(path)}", $"Configuration template successfully written to: {Path.GetFullPath(path)}"));
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error writing template: {ex.Message}");
+                Console.WriteLine(I18n.Text($"写入模板出错: {ex.Message}", $"Error writing template: {ex.Message}"));
             }
         }
 

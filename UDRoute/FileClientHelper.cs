@@ -18,7 +18,7 @@ namespace UDRoute
 
             if (positional.Length < 4)
             {
-                Console.WriteLine("Usage: udroute -push/-pull [-y] name@PAddress SFilePath LocalFilePath/con:");
+                Console.WriteLine(I18n.Text("用法: udroute -push/-pull [-y] 节点名@P端地址 服务端路径 本地路径/con:", "Usage: udroute -push/-pull [-y] name@PAddress SFilePath LocalFilePath/con:"));
                 return;
             }
 
@@ -33,12 +33,12 @@ namespace UDRoute
             {
                 if (!autoOverwrite)
                 {
-                    Console.Write($"Local file '{localFilePath}' already exists. Overwrite? (y/N): ");
+                    Console.Write(I18n.Text($"本地文件 '{localFilePath}' 已存在。是否覆盖？(y/N): ", $"Local file '{localFilePath}' already exists. Overwrite? (y/N): "));
                     string? answer = Console.ReadLine();
                     if (!string.Equals(answer?.Trim(), "y", StringComparison.OrdinalIgnoreCase) &&
                         !string.Equals(answer?.Trim(), "yes", StringComparison.OrdinalIgnoreCase))
                     {
-                        Console.WriteLine("Operation cancelled.");
+                        Console.WriteLine(I18n.Text("操作已取消。", "Operation cancelled."));
                         return;
                     }
                 }
@@ -46,7 +46,7 @@ namespace UDRoute
 
             if (isPush && !isConsole && !File.Exists(localFilePath))
             {
-                Console.WriteLine($"Error: Local source file '{localFilePath}' does not exist.");
+                Console.WriteLine(I18n.Text($"错误: 本地源文件 '{localFilePath}' 不存在。", $"Error: Local source file '{localFilePath}' does not exist."));
                 return;
             }
 
@@ -132,7 +132,7 @@ namespace UDRoute
                     int status = stream.ReadByte();
                     if (status == 0xFF)
                     {
-                        Console.WriteLine("Push failed: Access denied, invalid path, or server is in read-only mode.");
+                        Console.WriteLine(I18n.Text("推送失败: 访问被拒绝、路径无效或服务端为只读模式。", "Push failed: Access denied, invalid path, or server is in read-only mode."));
                         return;
                     }
                     if (status == 0x01) // 服务端目标文件已存在
@@ -146,13 +146,13 @@ namespace UDRoute
                         {
                             if (isConsole)
                             {
-                                Console.WriteLine($"Target file '{sFilePath}' already exists on server. In pipe mode, please specify -y to overwrite.");
+                                Console.WriteLine(I18n.Text($"服务端目标文件 '{sFilePath}' 已存在。管道模式下请使用 -y 参数确认覆盖。", $"Target file '{sFilePath}' already exists on server. In pipe mode, please specify -y to overwrite."));
                                 stream.WriteByte(0x02); // 取消
                                 await stream.FlushAsync(cts.Token);
                                 return;
                             }
 
-                            Console.Write($"Target file '{sFilePath}' already exists on server. Overwrite? (y/N): ");
+                            Console.Write(I18n.Text($"服务端目标文件 '{sFilePath}' 已存在。是否覆盖？(y/N): ", $"Target file '{sFilePath}' already exists on server. Overwrite? (y/N): "));
                             string? answer = Console.ReadLine();
                             if (string.Equals(answer?.Trim(), "y", StringComparison.OrdinalIgnoreCase) ||
                                 string.Equals(answer?.Trim(), "yes", StringComparison.OrdinalIgnoreCase))
@@ -162,7 +162,7 @@ namespace UDRoute
                             }
                             else
                             {
-                                Console.WriteLine("Operation cancelled.");
+                                Console.WriteLine(I18n.Text("操作已取消。", "Operation cancelled."));
                                 stream.WriteByte(0x02); // 取消
                                 await stream.FlushAsync(cts.Token);
                                 return;
@@ -171,7 +171,7 @@ namespace UDRoute
                     }
                     else if (status != 0x00)
                     {
-                        Console.WriteLine($"Push failed: Unexpected server response ({status}).");
+                        Console.WriteLine(I18n.Text($"推送失败: 服务端返回异常状态码 ({status})。", $"Push failed: Unexpected server response ({status})."));
                         return;
                     }
 
@@ -204,15 +204,15 @@ namespace UDRoute
                     }
 
                     int res = stream.ReadByte();
-                    if (res == 0) Console.WriteLine("\nPush successful.");
-                    else Console.WriteLine("\nPush failed on server.");
+                    if (res == 0) Console.WriteLine(I18n.Text("\n推送成功。", "\nPush successful."));
+                    else Console.WriteLine(I18n.Text("\n服务端保存失败。", "\nPush failed on server."));
                 }
                 else
                 {
                     int res = stream.ReadByte();
                     if (res != 0)
                     {
-                        Console.WriteLine("Pull failed on server. File might not exist or access denied.");
+                        Console.WriteLine(I18n.Text("拉取失败: 服务端文件可能不存在或访问被拒绝。", "Pull failed on server. File might not exist or access denied."));
                         return;
                     }
 
@@ -236,12 +236,12 @@ namespace UDRoute
                     {
                         await CopyWithProgressAsync(stream, dstStream, fileSize, isConsole, cts.Token);
                     }
-                    if (!isConsole) Console.WriteLine("\nPull successful.");
+                    if (!isConsole) Console.WriteLine(I18n.Text("\n拉取成功。", "\nPull successful."));
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"\nError: {ex.Message}");
+                Console.WriteLine(I18n.Text($"\n错误: {ex.Message}", $"\nError: {ex.Message}"));
             }
             finally
             {

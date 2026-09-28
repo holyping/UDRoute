@@ -15,7 +15,6 @@ namespace UDRoute
     {
         private readonly AppConfig _config;
         private ZeroCopyUdpSocket? _udp;
-        private ZeroCopyUdpSocket? _testUdp;
         private ProxyMode? _proxy;
         private ServerMode? _server;
         private ClientMode? _client;
@@ -42,20 +41,6 @@ namespace UDRoute
                 _proxy = new ProxyMode(_config, _udp);
                 tasks.Add(_proxy.RunAsync(ct));
                 Log.Info($"[P] Proxy running on UDP {_proxy.Port}");
-
-                if (boundEp is IPEndPoint ipEp && ipEp.Port > 0)
-                {
-                    try
-                    {
-                        _testUdp = new ZeroCopyUdpSocket(ipEp.Port + 1);
-                        tasks.Add(ReceiveTestUdpLoopAsync(ct));
-                        Log.Info($"[P] Auxiliary NAT test socket bound to UDP {_testUdp.LocalEndPoint}");
-                    }
-                    catch (Exception ex)
-                    {
-                        Log.Warn($"[P] Could not bind auxiliary NAT test port {ipEp.Port + 1}: {ex.Message}");
-                    }
-                }
             }
 
             if (_config.ServerRecords.Count > 0)
@@ -225,7 +210,12 @@ namespace UDRoute
                                 break;
 
                             case MsgType.NatTestReq:
-                                await HandleNatTestReqAsync(mem, remoteEp, fromPrimary: true, ct);
+                                if (span.Length >= 17)
+                                {
+                                    Guid testId = new Guid(span.Slice(1, 16));
+                                    byte flags = span.Length > 17 ? span[17] : (byte)0;
+                                    _ = HandleEphemeralNatTestAsync(testId, flags, remoteEp, ct);
+                                }
                                 break;
 
                             default:
@@ -287,106 +277,102 @@ namespace UDRoute
             }
         }
 
-        private async Task ReceiveTestUdpLoopAsync(CancellationToken ct)
+        private async Task HandleEphemeralNatTestAsync(Guid testId, byte flags, EndPoint remoteEp, CancellationToken ct)
         {
-            byte[] poolBuf = ArrayPool<byte>.Shared.Rent(65535);
+            // P端动态创建随机端口临时 Socket，与 S/C 端进行双向 NAT 诊断握手
+            ZeroCopyUdpSocket? tempUdp = null;
             try
             {
-                while (!ct.IsCancellationRequested && _testUdp != null)
+                tempUdp = new ZeroCopyUdpSocket(0);
+                int tempPort = (tempUdp.LocalEndPoint is IPEndPoint tip) ? tip.Port : 0;
+                if (tempPort == 0) return;
+
+                byte[] respBuf = ArrayPool<byte>.Shared.Rent(64);
+                int respLen;
+                try
                 {
+                    respBuf[0] = (byte)MsgType.NatTestResp;
+                    testId.TryWriteBytes(respBuf.AsSpan(1, 16));
+                    int offset = 17;
+                    offset += ProtocolHelper.WriteIPEndPoint(respBuf.AsSpan(offset), remoteEp);
+                    BinaryPrimitives.WriteInt32LittleEndian(respBuf.AsSpan(offset, 4), tempPort);
+                    offset += 4;
+                    respLen = offset;
+
+                    // 1. 先用随机端口发 UDP 给 S/C 端
+                    // 若 S/C 处于全锥型路由 (Full Cone)，可直接收到此包；
+                    // 即使非全锥型被客户端防火墙丢弃，P 端的云服务器出站连接状态此时也已建立
                     try
                     {
-                        var (len, remoteEp) = await _testUdp.ReceiveAsync(poolBuf, ct);
-                        if (len < 1) continue;
-
-                        var mem = poolBuf.AsMemory(0, len);
-                        var span = mem.Span;
-                        MsgType type = (MsgType)span[0];
-
-                        switch (type)
-                        {
-                            case MsgType.EchoReq:
-                                await HandleEchoReqOnTestUdpAsync(mem, remoteEp, ct);
-                                break;
-                            case MsgType.NatTestReq:
-                                await HandleNatTestReqAsync(mem, remoteEp, fromPrimary: false, ct);
-                                break;
-                        }
-                    }
-                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
-                    {
-                        break;
-                    }
-                    catch (ObjectDisposedException)
-                    {
-                        break;
+                        await tempUdp.SendAsync(respBuf.AsMemory(0, respLen), remoteEp, ct);
                     }
                     catch (Exception ex)
                     {
-                        Log.Error($"[RouteEngine] Auxiliary test UDP loop error: {ex.Message}");
-                        await Task.Delay(100, ct);
+                        Log.Debug($"[P] Outbound packet from ephemeral port {tempPort} failed: {ex.Message}");
+                    }
+
+                    // 2. P 端把新端口通过原主端口发给 S/C 端
+                    if (_udp != null)
+                    {
+                        await _udp.SendAsync(respBuf.AsMemory(0, respLen), remoteEp, ct);
                     }
                 }
-            }
-            finally
-            {
-                ArrayPool<byte>.Shared.Return(poolBuf);
-            }
-        }
-
-        private async ValueTask HandleEchoReqOnTestUdpAsync(ReadOnlyMemory<byte> mem, EndPoint remoteEp, CancellationToken ct)
-        {
-            if (mem.Length < 17 || _testUdp == null) return;
-            var span = mem.Span;
-            byte[] respBuf = ArrayPool<byte>.Shared.Rent(64);
-            try
-            {
-                respBuf[0] = (byte)MsgType.EchoResp;
-                span.Slice(1, 16).CopyTo(respBuf.AsSpan(1));
-                int offset = 17;
-                offset += ProtocolHelper.WriteIPEndPoint(respBuf.AsSpan(offset), remoteEp);
-                await _testUdp.SendAsync(respBuf.AsMemory(0, offset), remoteEp, ct);
-            }
-            finally
-            {
-                ArrayPool<byte>.Shared.Return(respBuf);
-            }
-        }
-
-        private async ValueTask HandleNatTestReqAsync(ReadOnlyMemory<byte> mem, EndPoint remoteEp, bool fromPrimary, CancellationToken ct)
-        {
-            // NatTestReq: [MsgType 1][TestId 16][Flags 1]
-            if (mem.Length < 18) return;
-            var span = mem.Span;
-            Guid testId = new Guid(span.Slice(1, 16));
-            byte flags = span[17];
-
-            byte[] respBuf = ArrayPool<byte>.Shared.Rent(64);
-            try
-            {
-                respBuf[0] = (byte)MsgType.NatTestResp;
-                testId.TryWriteBytes(respBuf.AsSpan(1, 16));
-                int offset = 17;
-                offset += ProtocolHelper.WriteIPEndPoint(respBuf.AsSpan(offset), remoteEp);
-
-                int altPort = (_testUdp != null && _testUdp.LocalEndPoint is IPEndPoint tip) ? tip.Port : 0;
-                BinaryPrimitives.WriteInt32LittleEndian(respBuf.AsSpan(offset, 4), altPort);
-                offset += 4;
-
-                bool sendFromAlt = (flags & NatTestFlags.ReqSendFromAltPort) != 0;
-                if (sendFromAlt && _testUdp != null)
+                finally
                 {
-                    await _testUdp.SendAsync(respBuf.AsMemory(0, offset), remoteEp, ct);
+                    ArrayPool<byte>.Shared.Return(respBuf);
                 }
-                else
+
+                // 3. 临时端口等待 S/C 向新端口发包探测，同时允许新端口向 S/C 回包
+                using var testCts = new CancellationTokenSource(TimeSpan.FromSeconds(2.5));
+                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, testCts.Token);
+
+                byte[] recvBuf = ArrayPool<byte>.Shared.Rent(1024);
+                try
                 {
-                    var socketToSend = fromPrimary ? _udp! : (_testUdp ?? _udp!);
-                    await socketToSend.SendAsync(respBuf.AsMemory(0, offset), remoteEp, ct);
+                    while (!linkedCts.IsCancellationRequested)
+                    {
+                        var (len, probeRemoteEp) = await tempUdp.ReceiveAsync(recvBuf, linkedCts.Token);
+                        if (len < 17) continue;
+
+                        var span = recvBuf.AsSpan(0, len);
+                        MsgType type = (MsgType)span[0];
+                        Guid probeTestId = new Guid(span.Slice(1, 16));
+
+                        if ((type == MsgType.NatTestReq || type == MsgType.EchoReq) && probeTestId == testId)
+                        {
+                            // 收到 S/C 端发给新端口的探测包，把 S/C 在新端口看到的映射公网地址回送给它
+                            byte[] replyBuf = ArrayPool<byte>.Shared.Rent(64);
+                            try
+                            {
+                                replyBuf[0] = (byte)MsgType.NatTestResp;
+                                testId.TryWriteBytes(replyBuf.AsSpan(1, 16));
+                                int off = 17;
+                                off += ProtocolHelper.WriteIPEndPoint(replyBuf.AsSpan(off), probeRemoteEp);
+                                BinaryPrimitives.WriteInt32LittleEndian(replyBuf.AsSpan(off, 4), tempPort);
+                                off += 4;
+                                await tempUdp.SendAsync(replyBuf.AsMemory(0, off), probeRemoteEp, linkedCts.Token);
+                            }
+                            finally
+                            {
+                                ArrayPool<byte>.Shared.Return(replyBuf);
+                            }
+                            break;
+                        }
+                    }
+                }
+                catch (OperationCanceledException) { }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(recvBuf);
                 }
             }
+            catch (Exception ex)
+            {
+                Log.Debug($"[P] Ephemeral NAT test error: {ex.Message}");
+            }
             finally
             {
-                ArrayPool<byte>.Shared.Return(respBuf);
+                tempUdp?.Dispose();
             }
         }
 
@@ -520,7 +506,6 @@ namespace UDRoute
         public void Dispose()
         {
             _udp?.Dispose();
-            _testUdp?.Dispose();
         }
     }
 

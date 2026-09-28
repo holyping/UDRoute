@@ -73,7 +73,15 @@ namespace UDRoute
                               a.Equals("-diag", StringComparison.OrdinalIgnoreCase) ||
                               a.Equals("--test", StringComparison.OrdinalIgnoreCase)))
             {
-                await NatDiagnosticHelper.RunAsync(args);
+                try
+                {
+                    await NatDiagnosticHelper.RunAsync(args);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine(I18n.Text($"[!] 错误: {ex.Message}", $"[!] Error: {ex.Message}"));
+                    Environment.ExitCode = 1;
+                }
                 return;
             }
             else if (HandleServiceCommands(args)) return;
@@ -159,17 +167,17 @@ namespace UDRoute
                 }
                 else
                 {
-                    Console.Write("Enter Password: ");
+                    Console.Write(I18n.Text("输入密码: ", "Enter Password: "));
                     string pass1 = ReadPassword();
-                    Console.Write("Confirm Password: ");
+                    Console.Write(I18n.Text("确认密码: ", "Confirm Password: "));
                     string pass2 = ReadPassword();
                     if (pass1 != pass2)
                     {
-                        Console.WriteLine("Passwords do not match.");
+                        Console.WriteLine(I18n.Text("两次输入的密码不一致。", "Passwords do not match."));
                     }
                     else if (string.IsNullOrEmpty(pass1))
                     {
-                        Console.WriteLine("Password cannot be empty.");
+                        Console.WriteLine(I18n.Text("密码不能为空。", "Password cannot be empty."));
                     }
                     else
                     {
@@ -207,7 +215,7 @@ namespace UDRoute
         {
             try
             {
-                bool isZh = System.Globalization.CultureInfo.CurrentUICulture.TwoLetterISOLanguageName == "zh";
+                bool isZh = I18n.IsZh;
                 string resName = isZh ? "UDRoute.udroute_help_zh.txt" : "UDRoute.udroute_help_en.txt";
 
                 using var stream = System.Reflection.Assembly.GetExecutingAssembly().GetManifestResourceStream(resName);
@@ -219,7 +227,7 @@ namespace UDRoute
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error reading help: {ex.Message}");
+                Console.WriteLine(I18n.Text($"读取帮助信息出错: {ex.Message}", $"Error reading help: {ex.Message}"));
             }
         }
 
@@ -244,7 +252,7 @@ namespace UDRoute
                     if (!string.IsNullOrWhiteSpace(statusText))
                     {
                         found = true;
-                        Console.WriteLine($"=== Status for udroute Process {proc.Id} ===");
+                        Console.WriteLine(I18n.Text($"=== udroute 进程 {proc.Id} 运行状态 ===", $"=== Status for udroute Process {proc.Id} ==="));
                         Console.WriteLine(statusText);
                         Console.WriteLine("=====================================\n");
                     }
@@ -254,7 +262,7 @@ namespace UDRoute
 
             if (!found)
             {
-                Console.WriteLine("No running udroute processes found or they did not respond.");
+                Console.WriteLine(I18n.Text("未发现正在运行的 udroute 进程，或进程无响应。", "No running udroute processes found or they did not respond."));
             }
         }
 
@@ -274,7 +282,7 @@ namespace UDRoute
                 string binPath = $"\\\"{fullExe}\\\" -service -c \\\"{fullIni}\\\"";
                 Process.Start("sc", $"create {name} binPath= \"{binPath}\" start= auto").WaitForExit();
                 Process.Start("sc", $"start {name}").WaitForExit();
-                Console.WriteLine($"Windows Service {name} installed.");
+                Console.WriteLine(I18n.Text($"Windows 服务 {name} 安装成功。", $"Windows Service {name} installed."));
             }
             else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
             {
@@ -283,7 +291,7 @@ namespace UDRoute
                 Process.Start("systemctl", "daemon-reload").WaitForExit();
                 Process.Start("systemctl", $"enable {name.ToLower()}").WaitForExit();
                 Process.Start("systemctl", $"start {name.ToLower()}").WaitForExit();
-                Console.WriteLine($"Systemd Service {name} installed.");
+                Console.WriteLine(I18n.Text($"Systemd 服务 {name} 安装成功。", $"Systemd Service {name} installed."));
             }
         }
 
@@ -301,7 +309,7 @@ namespace UDRoute
                 File.Delete($"/etc/systemd/system/{name.ToLower()}.service");
                 Process.Start("systemctl", "daemon-reload").WaitForExit();
             }
-            Console.WriteLine($"Service {name} uninstalled.");
+            Console.WriteLine(I18n.Text($"服务 {name} 已卸载。", $"Service {name} uninstalled."));
         }
     }
 }

@@ -63,10 +63,9 @@ target=127.0.0.1:80/tcp
         }
 
         [Fact]
-        public void ResolveTargetServer_Default_ReturnsPublicTestServer()
+        public void ResolveTargetServer_NoTargetSpecified_ThrowsException()
         {
-            string target = NatDiagnosticHelper.ResolveTargetServer(new[] { "-test" });
-            Assert.Equal("www.qzsoft.top:9400", target);
+            Assert.Throws<InvalidOperationException>(() => NatDiagnosticHelper.ResolveTargetServer(new[] { "-test" }));
         }
 
         [Fact]
@@ -124,6 +123,105 @@ target=127.0.0.1:80/tcp
             Assert.Contains("1. 测试本机与 P 是否是 IPV4 直连", sw.ToString());
             Assert.Contains("2. 测试本机是否具备 IPV6 直连", sw.ToString());
             Assert.Contains("3. 测试本机是否处于圆锥路由下", sw.ToString());
+
+            cts.Cancel();
+            try { await pTask; } catch { }
+        }
+
+        [Fact]
+        public async Task Proxy_DoesNotBindPortPlusOne_OnlySinglePort()
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+
+            using var probeSocket = new System.Net.Sockets.UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+            int proxyPort = ((IPEndPoint)probeSocket.Client.LocalEndPoint!).Port;
+            probeSocket.Close();
+
+            var pCfg = new AppConfig
+            {
+                Port = proxyPort,
+                EnableProxy = true,
+                ConfigPath = Path.Combine(_testDir, "p_single.ini")
+            };
+
+            using var pEngine = new RouteEngine(pCfg);
+            var pTask = pEngine.StartAsync(cts.Token);
+            await Task.Delay(200, cts.Token);
+
+            // proxyPort + 1 MUST NOT be occupied by P! Another socket can freely bind it!
+            using var altSocket = new System.Net.Sockets.UdpClient(new IPEndPoint(IPAddress.Loopback, proxyPort + 1));
+            Assert.NotNull(altSocket.Client.LocalEndPoint);
+            altSocket.Close();
+
+            cts.Cancel();
+            try { await pTask; } catch { }
+        }
+
+        [Fact]
+        public async Task NatTestReq_EphemeralSocketExchange_Succeeds()
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+
+            using var probeSocket = new System.Net.Sockets.UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+            int proxyPort = ((IPEndPoint)probeSocket.Client.LocalEndPoint!).Port;
+            probeSocket.Close();
+
+            var pCfg = new AppConfig
+            {
+                Port = proxyPort,
+                EnableProxy = true,
+                ConfigPath = Path.Combine(_testDir, "p_ephem.ini")
+            };
+
+            using var pEngine = new RouteEngine(pCfg);
+            var pTask = pEngine.StartAsync(cts.Token);
+            await Task.Delay(200, cts.Token);
+
+            // Client sends NatTestReq to P
+            using var clientUdp = new ZeroCopyUdpSocket(0);
+            var pEp = new IPEndPoint(IPAddress.Loopback, proxyPort);
+
+            Guid testId = Guid.NewGuid();
+            byte[] req = new byte[18];
+            req[0] = (byte)MsgType.NatTestReq;
+            testId.TryWriteBytes(req.AsSpan(1, 16));
+            req[17] = NatTestFlags.None;
+
+            await clientUdp.SendAsync(req, pEp, cts.Token);
+
+            // Wait for NatTestResp from P
+            byte[] buf = new byte[1024];
+            int altPort = 0;
+            var (len, remoteEp) = await clientUdp.ReceiveAsync(buf, cts.Token);
+            Assert.True(len >= 17);
+            Assert.Equal((byte)MsgType.NatTestResp, buf[0]);
+            var (pubEp, epLen) = ProtocolHelper.ReadIPEndPoint(buf.AsSpan(17));
+            if (len >= 17 + epLen + 4)
+            {
+                altPort = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(17 + epLen, 4));
+            }
+
+            Assert.True(altPort > 0);
+            Assert.NotEqual(proxyPort, altPort);
+
+            // Client now probes P's ephemeral port
+            var altPEp = new IPEndPoint(IPAddress.Loopback, altPort);
+            await clientUdp.SendAsync(req, altPEp, cts.Token);
+
+            // Client receives response from P's ephemeral port (draining any duplicate initial packet on loopback)
+            IPEndPoint? respEp = null;
+            while (!cts.IsCancellationRequested)
+            {
+                var (rLen, rEp) = await clientUdp.ReceiveAsync(buf, cts.Token);
+                if (rEp is IPEndPoint rep && rep.Port == altPort)
+                {
+                    respEp = rep;
+                    break;
+                }
+            }
+
+            Assert.NotNull(respEp);
+            Assert.Equal(altPort, respEp.Port);
 
             cts.Cancel();
             try { await pTask; } catch { }

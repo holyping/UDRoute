@@ -116,8 +116,8 @@ UDRoute 是一个 P2P/中继 隧道系统。该系统包含三种基本角色：
 - Response: `[MsgType = 8 (1 byte)] + [EchoId (16 bytes)] + [PublicEp (EndPoint)]`
 
 **NatTestReq (15) / NatTestResp (16)** (NAT 类型与端口映射诊断)
-- Request: `[MsgType = 15 (1 byte)] + [TestId (16 bytes)] + [Flags (1 byte)]` (Flags: Bit0=ReqSendFromAltPort 请求从辅助端口回送以探测 Full Cone)
-- Response: `[MsgType = 16 (1 byte)] + [TestId (16 bytes)] + [PublicEp (EndPoint)] + [AltPort (4 bytes LE)]` (AltPort 为 P 端辅助测试端口，0 表示未开放)
+- Request: `[MsgType = 15 (1 byte)] + [TestId (16 bytes)] + [Flags (1 byte)]`
+- Response: `[MsgType = 16 (1 byte)] + [TestId (16 bytes)] + [PublicEp (EndPoint)] + [AltPort (4 bytes LE)]` (AltPort 为 P 端按需动态创建的临时随机测试端口。P 端收到请求后动态创建临时 Socket，先向 S/C 发包建立云服务器出站状态，同时在主端口返回包含 AltPort 的响应；S/C 随后向 AltPort 发包比对端口映射一致性以探测圆锥路由，P 测完后立即释放该临时 Socket)
 
 **Punch (3)**
 - `[MsgType = 3] (1 byte)`

@@ -526,7 +526,8 @@ public class AuthTests : IDisposable
             TargetName = "protected_echo",
             TargetServer = $"127.0.0.1:{pPort}",
             IsTcp = true,
-            Password = null // Unauthenticated!
+            Password = null, // Unauthenticated!
+            IsConsolePipe = true
         });
         var cEngineNoPass = new RouteEngine(cCfgNoPass);
         _ = cEngineNoPass.StartAsync(cts.Token);

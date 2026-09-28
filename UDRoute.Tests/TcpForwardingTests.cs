@@ -41,6 +41,14 @@ public class TcpForwardingTests : IDisposable
         return p;
     }
 
+    private static int GetFreeUdpPort()
+    {
+        using var c = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+        int p = ((IPEndPoint)c.Client.LocalEndPoint!).Port;
+        c.Close();
+        return p;
+    }
+
     private async Task<(RouteEngine p, RouteEngine s, RouteEngine c, TcpListener echoListener, int cPort)> SetupClusterAsync(bool forceRelay, string profile = "normal")
     {
         // 1. Echo server that accepts multiple connections concurrently
@@ -73,7 +81,7 @@ public class TcpForwardingTests : IDisposable
             catch { }
         });
 
-        int pPort = GetFreePort();
+        int pPort = GetFreeUdpPort();
         int cPort = GetFreePort();
 
         // 2. Proxy (P)
@@ -180,6 +188,9 @@ public class TcpForwardingTests : IDisposable
         finally
         {
             cluster.echoListener.Stop();
+            cluster.c.Dispose();
+            cluster.s.Dispose();
+            cluster.p.Dispose();
         }
     }
 
@@ -231,6 +242,9 @@ public class TcpForwardingTests : IDisposable
         finally
         {
             cluster.echoListener.Stop();
+            cluster.c.Dispose();
+            cluster.s.Dispose();
+            cluster.p.Dispose();
         }
     }
 
@@ -287,6 +301,9 @@ public class TcpForwardingTests : IDisposable
         finally
         {
             cluster.echoListener.Stop();
+            cluster.c.Dispose();
+            cluster.s.Dispose();
+            cluster.p.Dispose();
         }
     }
 
@@ -327,7 +344,7 @@ public class TcpForwardingTests : IDisposable
             catch { }
         });
 
-        int pPort = GetFreePort();
+        int pPort = GetFreeUdpPort();
         int cPort = GetFreePort();
 
         // 1. P 节点
@@ -390,6 +407,9 @@ public class TcpForwardingTests : IDisposable
         finally
         {
             echoListener.Stop();
+            cEngine.Dispose();
+            sEngine.Dispose();
+            pEngine.Dispose();
         }
     }
 }
