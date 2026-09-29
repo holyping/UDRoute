@@ -120,6 +120,9 @@ target=127.0.0.1:80/tcp
 
             Assert.True(res.IsIpv4Direct);
             Assert.True(res.IsConeNat);
+            Assert.Contains("正在解析目标服务器地址... 成功", sw.ToString());
+            Assert.Contains("正在测试本机与 P 端的 IPv4 直连状态... 成功", sw.ToString());
+            Assert.Contains("正在探测本机 NAT 路由类型... NAT 0", sw.ToString());
             Assert.Contains("1. 测试本机与 P 是否是 IPV4 直连", sw.ToString());
             Assert.Contains("2. 测试本机是否具备 IPV6 直连", sw.ToString());
             Assert.Contains("3. 测试本机是否处于圆锥路由下", sw.ToString());

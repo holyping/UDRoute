@@ -112,7 +112,7 @@ namespace UDRoute
             writer.WriteLine(I18n.Text("UDRoute 网络连通性与 NAT 路由诊断测试", "UDRoute Network Connectivity and NAT Diagnostic Test"));
             writer.WriteLine(I18n.Text($"目标 P 端: {targetServer}", $"Target Proxy: {targetServer}"));
             writer.WriteLine("==================================================");
-            writer.WriteLine(I18n.Text("[*] 正在解析目标服务器地址...", "[*] Resolving target server address..."));
+            PrintStepStart(writer, I18n.Text("正在解析目标服务器地址... ", "Resolving target server address... "));
 
             var allEps = await ProtocolHelper.ResolveAllEndPointsAsync(targetServer, Constants.DefaultProxyPort);
             var ipv4Eps = allEps.Where(ep => ep.AddressFamily == AddressFamily.InterNetwork).ToArray();
@@ -122,6 +122,7 @@ namespace UDRoute
 
             if (allEps.Length == 0)
             {
+                PrintStepResult(writer, I18n.Text("失败", "Failed"), ConsoleColor.Red);
                 writer.WriteLine(I18n.Text($"[!] 错误: 无法解析 P 端地址 '{targetServer}'。", $"[!] Error: Unable to resolve Proxy address '{targetServer}'."));
                 result.IsIpv4Direct = false;
                 result.Ipv4Detail = I18n.Text($"无法解析域名或地址: {targetServer}", $"Failed to resolve domain or address: {targetServer}");
@@ -132,6 +133,8 @@ namespace UDRoute
                 PrintSummary(result, writer);
                 return result;
             }
+
+            PrintStepResult(writer, I18n.Text("成功", "OK"), ConsoleColor.Green);
 
             using var udp = new ZeroCopyUdpSocket(0);
             var localBindEp = (IPEndPoint)udp.LocalEndPoint;
@@ -184,7 +187,7 @@ namespace UDRoute
                 // ==========================================
                 // 1. 测试本机与 P 是否是 IPV4 直连
                 // ==========================================
-                writer.WriteLine(I18n.Text("[*] 正在测试本机与 P 端的 IPv4 直连状态...", "[*] Testing IPv4 direct connectivity with Proxy..."));
+                PrintStepStart(writer, I18n.Text("正在测试本机与 P 端的 IPv4 直连状态... ", "Testing IPv4 direct connectivity with Proxy... "));
                 IPEndPoint? mappedIpv4Ep = null;
                 long ipv4Rtt = 0;
                 IPEndPoint? primaryPIpv4Ep = ipv4Eps.FirstOrDefault();
@@ -193,6 +196,7 @@ namespace UDRoute
                 {
                     result.IsIpv4Direct = false;
                     result.Ipv4Detail = I18n.Text("P 端未解析到有效的 IPv4 地址", "Proxy does not have a valid IPv4 address resolved");
+                    PrintStepResult(writer, I18n.Text("失败", "Failed"), ConsoleColor.Red);
                 }
                 else
                 {
@@ -214,6 +218,7 @@ namespace UDRoute
                             result.Ipv4Detail = I18n.Text(
                                 $"公网 IPV4 直连 (本机 IP: {mappedIpv4Ep.Address}, 延迟: {ipv4Rtt}ms, 无 NAT 转换)",
                                 $"Public IPv4 direct (Local IP: {mappedIpv4Ep.Address}, RTT: {ipv4Rtt}ms, no NAT translation)");
+                            PrintStepResult(writer, I18n.Text("成功", "OK"), ConsoleColor.Green);
                         }
                         else
                         {
@@ -223,6 +228,7 @@ namespace UDRoute
                             result.Ipv4Detail = I18n.Text(
                                 $"处于 NAT 路由后方 (本地内网 IP: {localIpStr}, P 端检测公网 IP: {mappedIpv4Ep}, 延迟: {ipv4Rtt}ms)",
                                 $"Behind NAT router (Local private IP: {localIpStr}, Proxy detected public IP: {mappedIpv4Ep}, RTT: {ipv4Rtt}ms)");
+                            PrintStepResult(writer, I18n.Text("失败", "Failed"), ConsoleColor.Red);
                         }
                     }
                     else
@@ -231,19 +237,21 @@ namespace UDRoute
                         result.Ipv4Detail = I18n.Text(
                             $"无法通过 IPv4 连接到 P 端 ({primaryPIpv4Ep})，响应超时",
                             $"Unable to connect to Proxy via IPv4 ({primaryPIpv4Ep}); response timed out");
+                        PrintStepResult(writer, I18n.Text("失败", "Failed"), ConsoleColor.Red);
                     }
                 }
 
                 // ==========================================
                 // 2. 测试本机是否具备 IPV6 直连
                 // ==========================================
-                writer.WriteLine(I18n.Text("[*] 正在测试本机是否具备 IPv6 直连能力...", "[*] Testing local IPv6 direct connectivity..."));
+                PrintStepStart(writer, I18n.Text("正在测试本机是否具备 IPv6 直连能力... ", "Testing local IPv6 direct connectivity... "));
                 var localGlobalIpv6List = allLocalIps.Where(IsGlobalUnicastIPv6).ToList();
 
                 if (localGlobalIpv6List.Count == 0)
                 {
                     result.IsIpv6Direct = false;
                     result.Ipv6Detail = I18n.Text("本机未分配公网 IPv6 地址 (未检测到有效的全球单播地址)", "No public IPv6 address assigned to local machine (no valid global unicast address detected)");
+                    PrintStepResult(writer, I18n.Text("失败", "Failed"), ConsoleColor.Red);
                 }
                 else
                 {
@@ -258,6 +266,7 @@ namespace UDRoute
                             result.Ipv6Detail = I18n.Text(
                                 $"具备公网 IPV6 直连能力 (本机 IPv6: {myIpv6}, P 端检测 IPv6: {p6Res.PublicEp.Address}, 延迟: {p6Res.RttMs}ms)",
                                 $"Public IPv6 direct connectivity available (Local IPv6: {myIpv6}, Proxy detected IPv6: {p6Res.PublicEp.Address}, RTT: {p6Res.RttMs}ms)");
+                            PrintStepResult(writer, I18n.Text("成功", "OK"), ConsoleColor.Green);
                         }
                         else
                         {
@@ -265,6 +274,7 @@ namespace UDRoute
                             result.Ipv6Detail = I18n.Text(
                                 $"本机已分配公网 IPv6 地址 ({myIpv6})，但向 P 端 ({primaryPIpv6Ep}) 发起 IPv6 探测超时",
                                 $"Local machine has public IPv6 ({myIpv6}), but IPv6 probe to Proxy ({primaryPIpv6Ep}) timed out");
+                            PrintStepResult(writer, I18n.Text("失败", "Failed"), ConsoleColor.Red);
                         }
                     }
                     else
@@ -273,13 +283,14 @@ namespace UDRoute
                         result.Ipv6Detail = I18n.Text(
                             $"本机具备公网 IPv6 地址 ({myIpv6}) (目标 P 端未配置 IPv6 地址)",
                             $"Local machine has public IPv6 ({myIpv6}) (Target Proxy does not have IPv6 address configured)");
+                        PrintStepResult(writer, I18n.Text("成功", "OK"), ConsoleColor.Green);
                     }
                 }
 
                 // ==========================================
                 // 3. 测试本机是否处于圆锥路由下
                 // ==========================================
-                writer.WriteLine(I18n.Text("[*] 正在探测本机 NAT 路由类型 (圆锥 vs 对称)...", "[*] Probing local NAT routing type (Cone vs Symmetric)..."));
+                PrintStepStart(writer, I18n.Text("正在探测本机 NAT 路由类型... ", "Probing local NAT routing type... "));
 
                 if (result.IsIpv4Direct == true)
                 {
@@ -288,6 +299,7 @@ namespace UDRoute
                     result.ConeDetail = I18n.Text(
                         "公网直连无 NAT (端口直接暴露于公网，具备最高穿透力，完全支持与任意对端建立 P2P 直连打洞)",
                         "Direct public connection without NAT (ports directly exposed, optimal traversal capability, fully supports direct P2P hole punching with any peer)");
+                    PrintStepResult(writer, "NAT 0", ConsoleColor.Green);
                 }
                 else if (mappedIpv4Ep != null && primaryPIpv4Ep != null)
                 {
@@ -295,12 +307,23 @@ namespace UDRoute
                     result.IsConeNat = isCone;
                     result.NatLevel = natLevel;
                     result.ConeDetail = coneDetail;
+
+                    ConsoleColor color = natLevel switch
+                    {
+                        "NAT 1/2" or "NAT1/2" => ConsoleColor.Green,
+                        "NAT 3" or "NAT3" => ConsoleColor.Yellow,
+                        "NAT 4" or "NAT4" => ConsoleColor.Red,
+                        "NAT 0" or "NAT0" => ConsoleColor.Green,
+                        _ => ConsoleColor.Red
+                    };
+                    PrintStepResult(writer, natLevel, color);
                 }
                 else
                 {
                     result.IsConeNat = null;
                     result.NatLevel = I18n.Text("未知", "Unknown");
                     result.ConeDetail = I18n.Text("由于未能连通 P 端 IPv4，无法测试 NAT 路由类型", "Unable to test NAT routing type because IPv4 connection to Proxy failed");
+                    PrintStepResult(writer, result.NatLevel, ConsoleColor.Red);
                 }
             }
             finally
@@ -311,6 +334,33 @@ namespace UDRoute
 
             PrintSummary(result, writer);
             return result;
+        }
+
+        private static void PrintStepStart(TextWriter writer, string prompt)
+        {
+            writer.Write(prompt);
+            writer.Flush();
+        }
+
+        private static void PrintStepResult(TextWriter writer, string resultText, ConsoleColor color)
+        {
+            if (writer == Console.Out && !Console.IsOutputRedirected)
+            {
+                try
+                {
+                    Console.ForegroundColor = color;
+                    Console.WriteLine(resultText);
+                    Console.ResetColor();
+                    return;
+                }
+                catch
+                {
+                    // Fallback to writer if console properties are not accessible
+                }
+            }
+
+            writer.WriteLine(resultText);
+            writer.Flush();
         }
 
         private static void PrintSummary(NatDiagnosticResult res, TextWriter writer)
