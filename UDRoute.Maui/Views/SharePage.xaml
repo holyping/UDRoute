@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<ContentPage xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+             xmlns:viewmodels="clr-namespace:UDRoute.Maui.ViewModels"
+             x:Class="UDRoute.Maui.Views.SharePage"
+             Title="分享场境配置">
+
+    <ScrollView Padding="20">
+        <VerticalStackLayout Spacing="20" VerticalOptions="Center" HorizontalOptions="Center" MaximumWidthRequest="420">
+            
+            <!-- 场境名称与标题 -->
+            <VerticalStackLayout Spacing="6" HorizontalOptions="Center">
+                <Label Text="{Binding SceneName}" 
+                       FontSize="22" FontAttributes="Bold" HorizontalTextAlignment="Center" />
+                <Label Text="{Binding SummaryText}" 
+                       FontSize="12" TextColor="Gray" HorizontalTextAlignment="Center" />
+            </VerticalStackLayout>
+
+            <!-- 二维码展示卡片 -->
+            <Border StrokeShape="RoundRectangle 16"
+                    BackgroundColor="White"
+                    Stroke="{AppThemeBinding Light=#E5E7EB, Dark=#374151}"
+                    StrokeThickness="2"
+                    Padding="16"
+                    HorizontalOptions="Center"
+                    Shadow="{Shadow Brush=Black, Offset='0,4', Radius=10, Opacity=0.1}">
+                <VerticalStackLayout Spacing="10" HorizontalOptions="Center">
+                    <Image Source="{Binding QrImageSource}" 
+                           WidthRequest="250" HeightRequest="250" 
+                           Aspect="AspectFit" HorizontalOptions="Center" />
+                    <Label Text="使用其它设备扫描上方二维码即可导入配置" 
+                           FontSize="11" TextColor="#6B7280" HorizontalTextAlignment="Center" />
+                </VerticalStackLayout>
+            </Border>
+
+            <!-- 复制到剪贴板按钮 (下方，点击后退出此显示页面并复制) -->
+            <VerticalStackLayout Spacing="10" Margin="0,10,0,0">
+                <Button Text="📋 复制到剪贴板" 
+                        Command="{Binding CopyToClipboardCommand}"
+                        BackgroundColor="#512BD4" TextColor="White" 
+                        FontAttributes="Bold" FontSize="16"
+                        HeightRequest="50" CornerRadius="12"
+                        Shadow="{Shadow Brush=#512BD4, Offset='0,3', Radius=6, Opacity=0.3}" />
+
+                <Label Text="点击后将配置内容复制到系统剪贴板并自动返回" 
+                       FontSize="11" TextColor="Gray" HorizontalTextAlignment="Center" />
+
+                <!-- 返回按钮 -->
+                <Button Text="返回" 
+                        Command="{Binding CloseCommand}"
+                        BackgroundColor="Transparent"
+                        TextColor="{AppThemeBinding Light=#4B5563, Dark=#9CA3AF}"
+                        HeightRequest="40" Margin="0,10,0,0" />
+            </VerticalStackLayout>
+
+        </VerticalStackLayout>
+    </ScrollView>
+
+</ContentPage>

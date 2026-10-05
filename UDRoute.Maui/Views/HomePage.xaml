@@ -1,0 +1,154 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<ContentPage xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+             xmlns:viewmodels="clr-namespace:UDRoute.Maui.ViewModels"
+             xmlns:models="clr-namespace:UDRoute.Maui.Models"
+             xmlns:converters="clr-namespace:UDRoute.Maui.Converters"
+             xmlns:toolkit="http://schemas.microsoft.com/dotnet/2022/maui/toolkit"
+             x:Class="UDRoute.Maui.Views.HomePage"
+             Title="UDRoute 场境管理">
+
+    <ContentPage.Resources>
+        <ResourceDictionary>
+            <converters:BoolToHighlightColorConverter x:Key="BoolToHighlightConverter" />
+        </ResourceDictionary>
+    </ContentPage.Resources>
+
+    <Grid>
+        <!-- 主布局：工具栏 + 列表 + 底部 Footer -->
+        <Grid RowDefinitions="Auto,*,Auto">
+            
+            <!-- 1. 顶部工具栏 (按名称查询 + 增加按钮) -->
+            <Border Grid.Row="0" Margin="12,8" Padding="6" StrokeShape="RoundRectangle 10" 
+                    BackgroundColor="{AppThemeBinding Light=#F3F4F6, Dark=#1F2937}" Stroke="Transparent">
+                <Grid ColumnDefinitions="*,Auto" ColumnSpacing="10">
+                    <!-- 按名称查询输入框 -->
+                    <SearchBar Text="{Binding SearchText}" Placeholder="按名称查询场境..." HorizontalOptions="Fill" />
+                    
+                    <!-- “增加”按钮 (点击弹出下拉菜单) -->
+                    <Button Grid.Column="1" Text="+ 增加" Command="{Binding ToggleAddMenuCommand}" 
+                            BackgroundColor="#512BD4" TextColor="White" FontAttributes="Bold" CornerRadius="8" 
+                            HeightRequest="38" Padding="14,0" />
+                </Grid>
+            </Border>
+
+            <!-- 2. 场境列表 -->
+            <CollectionView Grid.Row="1" ItemsSource="{Binding Scenes}" SelectionMode="None" Margin="10,0">
+                <CollectionView.ItemTemplate>
+                    <DataTemplate x:DataType="models:Scene">
+                        <!-- 使用 SwipeView 支持侧滑手势 -->
+                        <SwipeView Margin="0,0,0,8">
+                            <SwipeView.RightItems>
+                                <SwipeItems>
+                                    <SwipeItem Text="编辑" BackgroundColor="#6B7280" 
+                                               Command="{Binding Source={RelativeSource AncestorType={x:Type viewmodels:HomeViewModel}}, Path=EditSceneCommand}" 
+                                               CommandParameter="{Binding .}" />
+                                    <SwipeItem Text="删除" BackgroundColor="#EF4444" 
+                                               Command="{Binding Source={RelativeSource AncestorType={x:Type viewmodels:HomeViewModel}}, Path=DeleteSceneCommand}" 
+                                               CommandParameter="{Binding .}" />
+                                </SwipeItems>
+                            </SwipeView.RightItems>
+
+                            <!-- 列表项卡片：点击切换当前选择 -->
+                            <Border StrokeShape="RoundRectangle 10" 
+                                    BackgroundColor="{AppThemeBinding Light=White, Dark=#111827}" 
+                                    Stroke="{AppThemeBinding Light=#E5E7EB, Dark=#374151}" 
+                                    StrokeThickness="1" Padding="0">
+                                
+                                <Border.GestureRecognizers>
+                                    <TapGestureRecognizer Command="{Binding Source={RelativeSource AncestorType={x:Type viewmodels:HomeViewModel}}, Path=SelectSceneCommand}" CommandParameter="{Binding .}" />
+                                </Border.GestureRecognizers>
+
+                                <Grid ColumnDefinitions="6,*,Auto" Padding="0,12,14,12" ColumnSpacing="12">
+                                    
+                                    <!-- 选中指示器：左边框粗显 (用明亮颜色) -->
+                                    <BoxView Grid.Column="0" 
+                                             Color="{Binding IsSelected, Converter={StaticResource BoolToHighlightConverter}}" 
+                                             WidthRequest="6" CornerRadius="3" VerticalOptions="Fill" />
+
+                                    <!-- 场境名称与状态提示 -->
+                                    <VerticalStackLayout Grid.Column="1" VerticalOptions="Center" Spacing="2">
+                                        <Label Text="{Binding Name}" FontSize="16" FontAttributes="Bold" />
+                                        <Label Text="{Binding IsSelected, Converter={toolkit:BoolToObjectConverter TrueObject='当前生效', FalseObject='未生效'}}" 
+                                               FontSize="11" TextColor="{Binding IsSelected, Converter={toolkit:BoolToObjectConverter TrueObject='#10B981', FalseObject='Gray'}}" />
+                                    </VerticalStackLayout>
+
+                                    <!-- 每项右边的“分享”按钮 (转到新页面显示二维码) -->
+                                    <Button Grid.Column="2" Text="分享" 
+                                            Command="{Binding Source={RelativeSource AncestorType={x:Type viewmodels:HomeViewModel}}, Path=ShareSceneCommand}" 
+                                            CommandParameter="{Binding .}" 
+                                            BackgroundColor="#3B82F6" TextColor="White" 
+                                            CornerRadius="8" HeightRequest="36" Padding="12,0" FontSize="13" />
+                                </Grid>
+                            </Border>
+                        </SwipeView>
+                    </DataTemplate>
+                </CollectionView.ItemTemplate>
+            </CollectionView>
+
+            <!-- 3. 屏幕下方 Footer (状态展示 + 启停按钮) -->
+            <Border Grid.Row="2" Padding="20,12" 
+                    BackgroundColor="{AppThemeBinding Light=#F9FAFB, Dark=#1F2937}"
+                    Stroke="{AppThemeBinding Light=#E5E7EB, Dark=#374151}" StrokeThickness="1">
+                <Grid ColumnDefinitions="*,Auto" VerticalOptions="Center">
+                    
+                    <!-- 左侧状态与常时动态计算的 Ping 值 -->
+                    <VerticalStackLayout Grid.Column="0" VerticalOptions="Center" Spacing="2">
+                        <Label Text="{Binding Engine.CurrentStatusText}" FontSize="15" FontAttributes="Bold" />
+                        <Label Text="{Binding Engine.CurrentPingText}" FontSize="12" TextColor="#6B7280" />
+                    </VerticalStackLayout>
+
+                    <!-- 启停按钮：停止时播放图标，启动时停止图标 -->
+                    <Button Grid.Column="1" 
+                            Text="{Binding Engine.IsRunning, Converter={toolkit:BoolToObjectConverter TrueObject='⏹ 停止', FalseObject='▶ 启动'}}"
+                            Command="{Binding ToggleCommand}" 
+                            BackgroundColor="{Binding Engine.IsRunning, Converter={toolkit:BoolToObjectConverter TrueObject='#EF4444', FalseObject='#10B981'}}"
+                            TextColor="White" FontAttributes="Bold" FontSize="14"
+                            CornerRadius="20" HeightRequest="40" Padding="16,0" />
+                </Grid>
+            </Border>
+
+        </Grid>
+
+        <!-- 4. “增加”按钮点开显示的下拉菜单 (Dropdown Menu Overlay) -->
+        <Grid IsVisible="{Binding IsAddMenuVisible}">
+            <!-- 背景半透明遮罩，点击外部收起下拉菜单 -->
+            <BoxView BackgroundColor="#20000000">
+                <BoxView.GestureRecognizers>
+                    <TapGestureRecognizer Command="{Binding CloseAddMenuCommand}" />
+                </BoxView.GestureRecognizers>
+            </BoxView>
+
+            <!-- 下拉菜单卡片 (靠右上侧对齐) -->
+            <Border HorizontalOptions="End" VerticalOptions="Start" Margin="0,58,16,0" WidthRequest="210"
+                    StrokeShape="RoundRectangle 12" BackgroundColor="{AppThemeBinding Light=White, Dark=#1F2937}"
+                    Stroke="{AppThemeBinding Light=#E5E7EB, Dark=#374151}" StrokeThickness="1"
+                    Shadow="{Shadow Brush=Black, Offset='0,4', Radius=12, Opacity=0.2}">
+                <VerticalStackLayout Padding="6" Spacing="2">
+                    
+                    <!-- 选项 1: 手动编辑新增 -->
+                    <Button Text="✍️ 手动编辑新增" Command="{Binding AddManualCommand}"
+                            BackgroundColor="Transparent" TextColor="{AppThemeBinding Light=#111827, Dark=#F9FAFB}"
+                            HorizontalOptions="Fill" HeightRequest="44" CornerRadius="8" Padding="12,0" FontSize="14" />
+
+                    <BoxView HeightRequest="1" Color="{AppThemeBinding Light=#F3F4F6, Dark=#374151}" />
+
+                    <!-- 选项 2: 扫描二维码新增 -->
+                    <Button Text="📷 扫描二维码新增" Command="{Binding AddFromQrScanCommand}"
+                            BackgroundColor="Transparent" TextColor="{AppThemeBinding Light=#111827, Dark=#F9FAFB}"
+                            HorizontalOptions="Fill" HeightRequest="44" CornerRadius="8" Padding="12,0" FontSize="14" />
+
+                    <BoxView HeightRequest="1" Color="{AppThemeBinding Light=#F3F4F6, Dark=#374151}" />
+
+                    <!-- 选项 3: 从剪贴板导入新增 -->
+                    <Button Text="📋 从剪贴板导入" Command="{Binding AddFromClipboardCommand}"
+                            BackgroundColor="Transparent" TextColor="{AppThemeBinding Light=#111827, Dark=#F9FAFB}"
+                            HorizontalOptions="Fill" HeightRequest="44" CornerRadius="8" Padding="12,0" FontSize="14" />
+
+                </VerticalStackLayout>
+            </Border>
+        </Grid>
+
+    </Grid>
+
+</ContentPage>

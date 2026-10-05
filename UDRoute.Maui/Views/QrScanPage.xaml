@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<ContentPage xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+             xmlns:zxing="clr-namespace:ZXing.Net.Maui.Controls;assembly=ZXing.Net.MAUI.Controls"
+             x:Class="UDRoute.Maui.Views.QrScanPage"
+             Title="扫描场境二维码"
+             BackgroundColor="Black">
+
+    <Grid>
+        <!-- 摄像头扫描视图 -->
+        <zxing:CameraBarcodeReaderView
+            x:Name="BarcodeReader"
+            BarcodesDetected="BarcodeReader_BarcodesDetected"
+            IsDetecting="True"
+            HorizontalOptions="Fill"
+            VerticalOptions="Fill" />
+
+        <!-- 扫描框蒙层效果与指引 -->
+        <Grid RowDefinitions="*,260,*" ColumnDefinitions="*,260,*">
+            <BoxView Grid.Row="0" Grid.ColumnSpan="3" BackgroundColor="#80000000" />
+            <BoxView Grid.Row="2" Grid.ColumnSpan="3" BackgroundColor="#80000000" />
+            <BoxView Grid.Row="1" Grid.Column="0" BackgroundColor="#80000000" />
+            <BoxView Grid.Row="1" Grid.Column="2" BackgroundColor="#80000000" />
+
+            <!-- 中心对焦框 -->
+            <Border Grid.Row="1" Grid.Column="1" Stroke="#10B981" StrokeThickness="3"
+                    BackgroundColor="Transparent" StrokeShape="RoundRectangle 16">
+                <Label Text="将二维码放入框内即可自动扫描" TextColor="White" FontSize="12" 
+                       HorizontalOptions="Center" VerticalOptions="End" Margin="0,0,0,16" />
+            </Border>
+        </Grid>
+
+        <!-- 顶部提示与关闭按钮 -->
+        <HorizontalStackLayout HorizontalOptions="End" VerticalOptions="Start" Margin="20,40,20,0">
+            <Button Text="关闭" Clicked="Close_Clicked"
+                    BackgroundColor="#40000000" TextColor="White" CornerRadius="18"
+                    HeightRequest="36" Padding="14,0" />
+        </HorizontalStackLayout>
+    </Grid>
+
+</ContentPage>

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<ContentPage xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+             xmlns:viewmodels="clr-namespace:UDRoute.Maui.ViewModels"
+             xmlns:toolkit="http://schemas.microsoft.com/dotnet/2022/maui/toolkit"
+             x:Class="UDRoute.Maui.Views.LogPage"
+             Title="日志">
+
+    <Grid>
+        <CollectionView ItemsSource="{Binding Logs}" Margin="10">
+            <CollectionView.ItemTemplate>
+                <DataTemplate x:DataType="x:String">
+                    <Label Text="{Binding .}" FontSize="12" FontFamily="Consolas" LineBreakMode="WordWrap" Margin="0,2" />
+                </DataTemplate>
+            </CollectionView.ItemTemplate>
+        </CollectionView>
+        
+        <!-- 浮动启停按钮 -->
+        <Button Text="{Binding Engine.IsRunning, Converter={toolkit:BoolToObjectConverter TrueObject='⏹', FalseObject='▶'}}"
+                BackgroundColor="{Binding Engine.IsRunning, Converter={toolkit:BoolToObjectConverter TrueObject='#EF4444', FalseObject='#10B981'}}"
+                TextColor="White" FontAttributes="Bold" FontSize="20"
+                CornerRadius="28" WidthRequest="56" HeightRequest="56"
+                HorizontalOptions="End" VerticalOptions="End"
+                Margin="20"
+                Command="{Binding ToggleCommand}" />
+    </Grid>
+
+</ContentPage>

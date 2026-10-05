@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<ContentPage xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+             xmlns:viewmodels="clr-namespace:UDRoute.Maui.ViewModels"
+             x:Class="UDRoute.Maui.Views.StatusPage"
+             Title="状态">
+
+    <Grid RowDefinitions="*,Auto" Margin="10">
+        <ScrollView Grid.Row="0">
+            <Label Text="{Binding StatusText}" FontSize="14" FontFamily="Consolas" />
+        </ScrollView>
+        <Button Grid.Row="1" Text="刷新" Command="{Binding RefreshCommand}" Margin="0,10,0,0" HeightRequest="45" BackgroundColor="#512BD4" TextColor="White" />
+    </Grid>
+
+</ContentPage>
