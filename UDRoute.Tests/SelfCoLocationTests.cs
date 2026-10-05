@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -21,7 +21,7 @@ namespace UDRoute.Tests
         {
             _out = output;
             Log.SetLogger(new TestLogger(_out));
-            Log.Instance.Level = LogLevel.Info;
+            Log.Level = LogLevel.Info;
         }
 
         private static int GetFreeProxyPort()
@@ -1064,3 +1064,4 @@ namespace UDRoute.Tests
         }
     }
 }
+

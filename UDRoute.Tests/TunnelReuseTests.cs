@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Buffers.Binary;
 using System.Diagnostics;
 using System.IO;
@@ -26,7 +26,7 @@ public class TunnelReuseTests
     {
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         Log.SetLogger(new TestLogger(_out));
-        Log.Instance.Level = LogLevel.Info;
+        Log.Level = LogLevel.Info;
 
         // 1. Setup Local Echo Server (TCP)
         using var echoListener = new TcpListener(IPAddress.Loopback, 0);
@@ -197,7 +197,7 @@ public class TunnelReuseTests
     {
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         Log.SetLogger(new TestLogger(_out));
-        Log.Instance.Level = LogLevel.Info;
+        Log.Level = LogLevel.Info;
 
         // 1. Setup Local Echo Server (TCP)
         using var echoListener = new TcpListener(IPAddress.Loopback, 0);
@@ -339,7 +339,7 @@ public class TunnelReuseTests
     {
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         Log.SetLogger(new TestLogger(_out));
-        Log.Instance.Level = LogLevel.Info;
+        Log.Level = LogLevel.Info;
 
         // 1. Setup Local Echo Server (TCP)
         using var echoListener = new TcpListener(IPAddress.Loopback, 0);
@@ -465,7 +465,7 @@ public class TunnelReuseTests
     {
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         Log.SetLogger(new TestLogger(_out));
-        Log.Instance.Level = LogLevel.Info;
+        Log.Level = LogLevel.Info;
 
         // 1. Setup Local Echo Server (UDP)
         using var echoUdp = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
@@ -585,7 +585,7 @@ public class TunnelReuseTests
     {
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         Log.SetLogger(new TestLogger(_out));
-        Log.Instance.Level = LogLevel.Info;
+        Log.Level = LogLevel.Info;
 
         // 1. Setup Local Echo Server (UDP)
         using var echoUdp = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
@@ -694,7 +694,7 @@ public class TunnelReuseTests
     {
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         Log.SetLogger(new TestLogger(_out));
-        Log.Instance.Level = LogLevel.Info;
+        Log.Level = LogLevel.Info;
 
         // 1. Setup Local Echo Server (UDP)
         using var echoUdp = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
@@ -802,5 +802,6 @@ public class TunnelReuseTests
         cts.Cancel();
     }
 }
+
 
 

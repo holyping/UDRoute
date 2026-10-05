@@ -20,6 +20,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\UDRoute\UDRoute.csproj" />
+    <ProjectReference Include="..\UDRoute.Shared\UDRoute.Shared.csproj" />
   </ItemGroup>
 
 </Project>

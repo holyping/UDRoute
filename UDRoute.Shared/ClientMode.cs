@@ -78,7 +78,7 @@ namespace UDRoute
             {
                 list.Add(new ClientStatusInfo
                 {
-                    Config = $"{rec.Port}/{(rec.IsTcp?"tcp":"udp")}={rec.TargetName}@{rec.TargetServer}",
+                    Config = $"{rec.Port}/{(rec.IsTcp ? "tcp" : "udp")}={rec.TargetName}@{rec.TargetServer}",
                     Status = "Waiting"
                 });
             }
@@ -256,7 +256,6 @@ namespace UDRoute
 
         public async ValueTask<bool> TryHandlePunchAsync(Guid sessionId, Guid peerInstanceId, EndPoint remoteEp, byte status, CancellationToken ct)
         {
-            // 1. 拦截本实例发出的自环打洞包（防止同内网IP+端口或单机环回导致误判直连）
             if (peerInstanceId == _config.InstanceId)
             {
                 Log.Warn($"[C] Dropping loopback punch packet for session {sessionId} from {remoteEp}: InstanceId matches local instance ({peerInstanceId}).");
@@ -264,10 +263,7 @@ namespace UDRoute
             }
 
             TunnelSession? session;
-            lock (_sessionLock)
-            {
-                _sessions.TryGetValue(sessionId, out session);
-            }
+            lock (_sessionLock) { _sessions.TryGetValue(sessionId, out session); }
             if (session != null && !session.IsClosed)
             {
                 if (session.ForceRelay)
@@ -275,37 +271,44 @@ namespace UDRoute
                     Log.Debug($"[C] Ignoring punch for session {sessionId} because ForceRelay is enabled.");
                     return true;
                 }
-
-                // 2. 校验并绑定会话的对端实例唯一标识
                 if (session.PeerInstanceId != Guid.Empty && session.PeerInstanceId != peerInstanceId)
                 {
                     Log.Warn($"[C] Dropping punch packet for session {sessionId} from {remoteEp}: PeerInstanceId mismatch (expected {session.PeerInstanceId}, got {peerInstanceId}).");
                     return true;
                 }
                 session.PeerInstanceId = peerInstanceId;
-
                 session.SwitchToDirect(remoteEp);
 
-                if (status == 2)
+                string statusDesc = status switch
                 {
-                    // 回送打洞确认，避免死循环 ping-pong
-                    byte[] ackBuf = new byte[36];
-                    ackBuf[0] = (byte)MsgType.Punch;
-                    BinaryPrimitives.WriteUInt16LittleEndian(ackBuf.AsSpan(1, 2), 0);
-                    sessionId.TryWriteBytes(ackBuf.AsSpan(3, 16));
-                    _config.InstanceId.TryWriteBytes(ackBuf.AsSpan(19, 16));
-                    ackBuf[35] = 3; // Punch ACK
-                    await _udp.SendAsync(ackBuf, remoteEp, ct);
+                    PunchStatus.PunchReq => "PunchReq(打洞请求)",
+                    PunchStatus.PunchAck => "PunchAck(打洞确认)",
+                    _ => $"Status={status}"
+                };
+
+                Log.Trace($"[C] Session {sessionId} received punch packet from {remoteEp}, {statusDesc}.");
+
+                if (status == PunchStatus.PunchReq)
+                {
+                    byte[] ack = new byte[36];
+                    ack[0] = (byte)MsgType.Punch;
+                    System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(ack.AsSpan(1, 2), 0);
+                    sessionId.TryWriteBytes(ack.AsSpan(3, 16));
+                    _config.InstanceId.TryWriteBytes(ack.AsSpan(19, 16));
+                    ack[35] = PunchStatus.PunchAck;
+                    Log.Trace($"[C] Session {sessionId} replying PunchAck to {remoteEp}.");
+                    try { await _udp.SendAsync(ack, remoteEp, ct); } catch { }
                 }
-                else if (status == 3)
+                else if (status == PunchStatus.PunchAck)
                 {
-                    // 收到对方打洞确认，双向直连打通，通知 P 端释放临时中继
+                    Log.Trace($"[C] Session {sessionId} direct punch communication confirmed ({statusDesc}). Notifying Proxy to end relay session.");
                     session.NotifyDirectCommunicationEstablished();
                 }
                 return true;
             }
             return false;
         }
+
 
         public bool TryHandleAuthRes(ReadOnlySpan<byte> span, EndPoint remoteEp)
         {
@@ -510,7 +513,7 @@ namespace UDRoute
             }
         }
 
-        private async Task<bool> StartPunchingAsync(TunnelSession session, Guid expectedDevId, IPEndPoint sPublicEp, int sWanPort, List<IPEndPoint> localEps, CancellationToken ct)
+        private async Task StartPunchingAsync(TunnelSession session, Guid expectedDevId, IPEndPoint sPublicEp, int sWanPort, List<IPEndPoint> localEps, CancellationToken ct)
         {
             byte[] punchBuf = new byte[36];
             punchBuf[0] = (byte)MsgType.Punch;
@@ -558,7 +561,7 @@ namespace UDRoute
             if (candidates.Count == 0)
             {
                 Log.Info($"[C] Session {session.SessionId}: All candidate endpoints were filtered out (no remote targets). Skipping UDP punch and continuing with Proxy relay.");
-                return false;
+                return;
             }
 
             Log.Info($"[C] Session {session.SessionId} starting UDP punch to targets: {string.Join(", ", candidates)} (duration: {Constants.DefaultPunchRetries * Constants.DefaultPunchIntervalMs / 1000}s, interval: {Constants.DefaultPunchIntervalMs}ms)");
@@ -567,21 +570,14 @@ namespace UDRoute
             {
                 foreach (var ep in candidates)
                 {
-                    await _udp.SendAsync(punchBuf, ep, ct);
+                    try
+                    {
+                        await _udp.SendAsync(punchBuf, ep, ct);
+                    }
+                    catch { }
                 }
                 await Task.Delay(Constants.DefaultPunchIntervalMs, ct);
             }
-
-            if (session.IsDirect)
-            {
-                Log.Info($"[C] Session {session.SessionId} UDP punch successful! Now using direct P2P connection.");
-            }
-            else
-            {
-                Log.Info($"[C] Session {session.SessionId} UDP punch timed out. Continuing with Proxy relay.");
-            }
-
-            return session.IsDirect;
         }
 
         private async Task AcceptUdpLoopAsync(ClientRecord rec, CancellationToken ct)
@@ -609,162 +605,162 @@ namespace UDRoute
 
                 try
                 {
-                while (!ct.IsCancellationRequested)
-                {
-                    try
+                    while (!ct.IsCancellationRequested)
                     {
-                        var (len, clientEp) = await localUdp.ReceiveAsync(poolBuf, ct);
-                        if (len == 0) continue;
-
-                        byte[] packetCopy = poolBuf.AsSpan(0, len).ToArray();
-
-                        _ = Task.Run(async () =>
+                        try
                         {
-                            try
+                            var (len, clientEp) = await localUdp.ReceiveAsync(poolBuf, ct);
+                            if (len == 0) continue;
+
+                            byte[] packetCopy = poolBuf.AsSpan(0, len).ToArray();
+
+                            _ = Task.Run(async () =>
                             {
-                                var session = await GetOrCreateTunnelSessionAsync(rec, queryName, ct);
-                                if (session == null || session.IsClosed)
+                                try
                                 {
-                                    session = await GetOrCreateTunnelSessionAsync(rec, queryName, ct, forceNew: true);
-                                    if (session == null || session.IsClosed) return;
-                                }
-
-                                if (!_udpContexts.TryGetValue(session.SessionId, out var ctx))
-                                {
-                                    lock (session)
+                                    var session = await GetOrCreateTunnelSessionAsync(rec, queryName, ct);
+                                    if (session == null || session.IsClosed)
                                     {
-                                        if (!_udpContexts.TryGetValue(session.SessionId, out ctx))
+                                        session = await GetOrCreateTunnelSessionAsync(rec, queryName, ct, forceNew: true);
+                                        if (session == null || session.IsClosed) return;
+                                    }
+
+                                    if (!_udpContexts.TryGetValue(session.SessionId, out var ctx))
+                                    {
+                                        lock (session)
                                         {
-                                            ctx = new UdpTunnelContext();
-                                            _udpContexts[session.SessionId] = ctx;
-
-                                            session.OnClientUdpDataReceived = (chId, data) =>
+                                            if (!_udpContexts.TryGetValue(session.SessionId, out ctx))
                                             {
-                                                if (_udpContexts.TryGetValue(session.SessionId, out var currentCtx))
-                                                {
-                                                    EndPoint? targetClientEp = null;
-                                                    lock (currentCtx.Lock)
-                                                    {
-                                                        if (currentCtx.ChannelToClient.TryGetValue(chId, out var ep))
-                                                        {
-                                                            targetClientEp = ep;
-                                                        }
-                                                    }
-                                                    if (targetClientEp != null)
-                                                    {
-                                                        _ = Task.Run(async () =>
-                                                        {
-                                                            try
-                                                            {
-                                                                await localUdp.SendAsync(data, targetClientEp, session.SessionToken);
-                                                            }
-                                                            catch (Exception ex)
-                                                            {
-                                                                Log.Warn($"[C] Failed to send reply to client {targetClientEp}: {ex.Message}");
-                                                            }
-                                                        });
-                                                    }
-                                                    else
-                                                    {
-                                                        Log.Warn($"[C] Received reply for unknown ch={chId}!");
-                                                    }
-                                                }
-                                            };
+                                                ctx = new UdpTunnelContext();
+                                                _udpContexts[session.SessionId] = ctx;
 
-                                            session.OnUdpChannelClosed = (chId) =>
-                                            {
-                                                if (_udpContexts.TryGetValue(session.SessionId, out var currentCtx))
+                                                session.OnClientUdpDataReceived = (chId, data) =>
                                                 {
-                                                    lock (currentCtx.Lock)
+                                                    if (_udpContexts.TryGetValue(session.SessionId, out var currentCtx))
                                                     {
-                                                        if (currentCtx.ChannelToClient.Remove(chId, out var cEp))
+                                                        EndPoint? targetClientEp = null;
+                                                        lock (currentCtx.Lock)
                                                         {
-                                                            currentCtx.ClientToChannel.Remove(cEp);
-                                                            currentCtx.ClientLastActive.Remove(cEp);
-                                                            session.DecrementActiveChannel();
-                                                        }
-                                                    }
-                                                }
-                                            };
-
-                                            _ = Task.Run(async () =>
-                                            {
-                                                int timeoutMs = (rec.Timeout > 0 ? rec.Timeout : (session.ReuseInterval > 0 && session.ReuseInterval < 60 ? session.ReuseInterval : 60)) * 1000;
-                                                int checkInterval = Math.Min(1000, Math.Max(200, timeoutMs / 2));
-                                                while (!session.SessionToken.IsCancellationRequested)
-                                                {
-                                                    await Task.Delay(checkInterval, session.SessionToken).ConfigureAwait(false);
-                                                    if (!_udpContexts.TryGetValue(session.SessionId, out var currentCtx))
-                                                        break;
-                                                    long now = Environment.TickCount64;
-                                                    List<KeyValuePair<EndPoint, uint>> toClose = new();
-                                                    lock (currentCtx.Lock)
-                                                    {
-                                                        var expiredEps = new List<EndPoint>();
-                                                        foreach (var kvp in currentCtx.ClientLastActive)
-                                                        {
-                                                            if (now - kvp.Value > timeoutMs)
+                                                            if (currentCtx.ChannelToClient.TryGetValue(chId, out var ep))
                                                             {
-                                                                expiredEps.Add(kvp.Key);
+                                                                targetClientEp = ep;
                                                             }
                                                         }
-                                                        foreach (var ep in expiredEps)
+                                                        if (targetClientEp != null)
                                                         {
-                                                            currentCtx.ClientLastActive.Remove(ep);
-                                                            if (currentCtx.ClientToChannel.Remove(ep, out uint chId))
+                                                            _ = Task.Run(async () =>
                                                             {
-                                                                currentCtx.ChannelToClient.Remove(chId);
+                                                                try
+                                                                {
+                                                                    await localUdp.SendAsync(data, targetClientEp, session.SessionToken);
+                                                                }
+                                                                catch (Exception ex)
+                                                                {
+                                                                    Log.Warn($"[C] Failed to send reply to client {targetClientEp}: {ex.Message}");
+                                                                }
+                                                            });
+                                                        }
+                                                        else
+                                                        {
+                                                            Log.Warn($"[C] Received reply for unknown ch={chId}!");
+                                                        }
+                                                    }
+                                                };
+
+                                                session.OnUdpChannelClosed = (chId) =>
+                                                {
+                                                    if (_udpContexts.TryGetValue(session.SessionId, out var currentCtx))
+                                                    {
+                                                        lock (currentCtx.Lock)
+                                                        {
+                                                            if (currentCtx.ChannelToClient.Remove(chId, out var cEp))
+                                                            {
+                                                                currentCtx.ClientToChannel.Remove(cEp);
+                                                                currentCtx.ClientLastActive.Remove(cEp);
                                                                 session.DecrementActiveChannel();
-                                                                toClose.Add(new KeyValuePair<EndPoint, uint>(ep, chId));
                                                             }
                                                         }
                                                     }
-                                                    foreach (var item in toClose)
+                                                };
+
+                                                _ = Task.Run(async () =>
+                                                {
+                                                    int timeoutMs = (rec.Timeout > 0 ? rec.Timeout : (session.ReuseInterval > 0 && session.ReuseInterval < 60 ? session.ReuseInterval : 60)) * 1000;
+                                                    int checkInterval = Math.Min(1000, Math.Max(200, timeoutMs / 2));
+                                                    while (!session.SessionToken.IsCancellationRequested)
                                                     {
-                                                        _ = session.SendUdpCloseAsync(item.Value, session.SessionToken);
+                                                        await Task.Delay(checkInterval, session.SessionToken).ConfigureAwait(false);
+                                                        if (!_udpContexts.TryGetValue(session.SessionId, out var currentCtx))
+                                                            break;
+                                                        long now = Environment.TickCount64;
+                                                        List<KeyValuePair<EndPoint, uint>> toClose = new();
+                                                        lock (currentCtx.Lock)
+                                                        {
+                                                            var expiredEps = new List<EndPoint>();
+                                                            foreach (var kvp in currentCtx.ClientLastActive)
+                                                            {
+                                                                if (now - kvp.Value > timeoutMs)
+                                                                {
+                                                                    expiredEps.Add(kvp.Key);
+                                                                }
+                                                            }
+                                                            foreach (var ep in expiredEps)
+                                                            {
+                                                                currentCtx.ClientLastActive.Remove(ep);
+                                                                if (currentCtx.ClientToChannel.Remove(ep, out uint chId))
+                                                                {
+                                                                    currentCtx.ChannelToClient.Remove(chId);
+                                                                    session.DecrementActiveChannel();
+                                                                    toClose.Add(new KeyValuePair<EndPoint, uint>(ep, chId));
+                                                                }
+                                                            }
+                                                        }
+                                                        foreach (var item in toClose)
+                                                        {
+                                                            _ = session.SendUdpCloseAsync(item.Value, session.SessionToken);
+                                                        }
                                                     }
-                                                }
-                                            }, session.SessionToken);
+                                                }, session.SessionToken);
+                                            }
                                         }
                                     }
-                                }
 
-                                uint channelId;
-                                lock (ctx.Lock)
-                                {
-                                    if (!ctx.ClientToChannel.TryGetValue(clientEp, out channelId))
+                                    uint channelId;
+                                    lock (ctx.Lock)
                                     {
-                                        channelId = session.AllocateChannelId();
-                                        ctx.ClientToChannel[clientEp] = channelId;
-                                        ctx.ChannelToClient[channelId] = clientEp;
-                                        session.IncrementActiveChannel();
-                                        Log.Info($"[C] Assigned UDP channel {channelId} for client {clientEp} on Session {session.SessionId}");
+                                        if (!ctx.ClientToChannel.TryGetValue(clientEp, out channelId))
+                                        {
+                                            channelId = session.AllocateChannelId();
+                                            ctx.ClientToChannel[clientEp] = channelId;
+                                            ctx.ChannelToClient[channelId] = clientEp;
+                                            session.IncrementActiveChannel();
+                                            Log.Info($"[C] Assigned UDP channel {channelId} for client {clientEp} on Session {session.SessionId}");
+                                        }
+                                        ctx.ClientLastActive[clientEp] = Environment.TickCount64;
                                     }
-                                    ctx.ClientLastActive[clientEp] = Environment.TickCount64;
+                                    await session.SendUdpDataAsync(channelId, packetCopy, session.SessionToken);
                                 }
-                                await session.SendUdpDataAsync(channelId, packetCopy, session.SessionToken);
-                            }
-                            catch (Exception ex)
-                            {
-                                Log.Debug($"[C] UDP forward packet error: {ex.Message}");
-                            }
-                        }, ct);
-                    }
-                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
-                    {
-                        break;
-                    }
-                    catch (Exception ex)
-                    {
-                        Log.Error($"[C] Accept UDP error: {ex.Message}");
-                        await Task.Delay(100, ct);
+                                catch (Exception ex)
+                                {
+                                    Log.Debug($"[C] UDP forward packet error: {ex.Message}");
+                                }
+                            }, ct);
+                        }
+                        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                        {
+                            break;
+                        }
+                        catch (Exception ex)
+                        {
+                            Log.Error($"[C] Accept UDP error: {ex.Message}");
+                            await Task.Delay(100, ct);
+                        }
                     }
                 }
-            }
-            finally
-            {
-                ArrayPool<byte>.Shared.Return(poolBuf);
-            }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(poolBuf);
+                }
             }
         }
 
@@ -1269,7 +1265,9 @@ namespace UDRoute
                     _sessions[sessionId] = tunnelSession;
                 }
 
-                bool punchSuccess = await StartPunchingAsync(tunnelSession, resp.DevId, resp.ServerPublicEp, resp.ServerWanPort, resp.LocalEps, ct);
+                int punchTimeoutMs = Constants.DefaultPunchRetries * Constants.DefaultPunchIntervalMs;
+                _ = StartPunchingAsync(tunnelSession, resp.DevId, resp.ServerPublicEp, resp.ServerWanPort, resp.LocalEps, ct);
+                bool punchSuccess = await tunnelSession.WaitForDirectAsync(TimeSpan.FromMilliseconds(punchTimeoutMs), ct);
                 if (!punchSuccess)
                 {
                     Log.Warn($"[C] P relay is disabled and UDP punch timed out for session {sessionId}.");

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -23,7 +23,7 @@ public class TcpForwardingTests : IDisposable
     {
         _out = output;
         Log.SetLogger(new TestLogger(_out));
-        Log.Instance.Level = LogLevel.Info;
+        Log.Level = LogLevel.Info;
     }
 
     public void Dispose()
@@ -413,4 +413,5 @@ public class TcpForwardingTests : IDisposable
         }
     }
 }
+
 

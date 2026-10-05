@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
@@ -20,7 +20,7 @@ public class ProxyHealthProbeTests
     {
         _out = output;
         Log.SetLogger(new TestLogger(_out));
-        Log.Instance.Level = LogLevel.Debug;
+        Log.Level = LogLevel.Debug;
     }
 
     private static byte[] CreateRegisterPacket(Guid devId, string serviceName, bool isTcp = true, int timeout = 60, ushort contextId = 1)
@@ -745,4 +745,5 @@ public class ProxyHealthProbeTests
         Assert.True(pEngine.Proxy.HasRegisteredServices(devId));
     }
 }
+
 

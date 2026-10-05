@@ -4,3 +4,9 @@
 /UDRoute/bin
 /UDRoute.Tests/bin
 /UDRoute.Tests/obj
+/bin
+/obj
+/UDRoute.Maui/obj
+/UDRoute.Maui/bin
+/UDRoute.Shared/obj
+/UDRoute.Shared/bin

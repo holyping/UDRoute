@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
@@ -22,7 +22,7 @@ public class ProxyResourceManagementTests
     {
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
         Log.SetLogger(new TestLogger(_out));
-        Log.Instance.Level = LogLevel.Info;
+        Log.Level = LogLevel.Info;
 
         // 1. Echo server
         using var echoListener = new TcpListener(IPAddress.Loopback, 0);
@@ -149,7 +149,7 @@ public class ProxyResourceManagementTests
     {
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
         Log.SetLogger(new TestLogger(_out));
-        Log.Instance.Level = LogLevel.Info;
+        Log.Level = LogLevel.Info;
 
         // 1. Echo server
         using var echoListener = new TcpListener(IPAddress.Loopback, 0);
@@ -283,7 +283,7 @@ public class ProxyResourceManagementTests
     {
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
         Log.SetLogger(new TestLogger(_out));
-        Log.Instance.Level = LogLevel.Info;
+        Log.Level = LogLevel.Info;
 
         // 1. Echo server
         using var echoListener = new TcpListener(IPAddress.Loopback, 0);
@@ -413,7 +413,7 @@ public class ProxyResourceManagementTests
     {
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(25));
         Log.SetLogger(new TestLogger(_out));
-        Log.Instance.Level = LogLevel.Info;
+        Log.Level = LogLevel.Info;
 
         // 1. Echo server
         using var echoListener = new TcpListener(IPAddress.Loopback, 0);
@@ -531,7 +531,7 @@ public class ProxyResourceManagementTests
     {
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
         Log.SetLogger(new TestLogger(_out));
-        Log.Instance.Level = LogLevel.Info;
+        Log.Level = LogLevel.Info;
 
         // 1. Echo server
         using var echoListener = new TcpListener(IPAddress.Loopback, 0);
@@ -684,7 +684,7 @@ public class ProxyResourceManagementTests
     {
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(25));
         Log.SetLogger(new TestLogger(_out));
-        Log.Instance.Level = LogLevel.Info;
+        Log.Level = LogLevel.Info;
 
         // 1. Echo server
         using var echoListener = new TcpListener(IPAddress.Loopback, 0);
@@ -898,7 +898,7 @@ public class ProxyResourceManagementTests
     {
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         Log.SetLogger(new TestLogger(_out));
-        Log.Instance.Level = LogLevel.Info;
+        Log.Level = LogLevel.Info;
 
         // 1. Echo server
         using var echoListener = new TcpListener(IPAddress.Loopback, 0);
@@ -1035,7 +1035,7 @@ public class ProxyResourceManagementTests
     {
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         Log.SetLogger(new TestLogger(_out));
-        Log.Instance.Level = LogLevel.Info;
+        Log.Level = LogLevel.Info;
 
         // 1. Echo server
         using var echoListener = new TcpListener(IPAddress.Loopback, 0);
@@ -1164,4 +1164,5 @@ public class ProxyResourceManagementTests
         sEngine2.Dispose();
     }
 }
+
 

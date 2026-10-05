@@ -17,4 +17,8 @@
     <EmbeddedResource Include="udroute_help_zh.txt" />
     <EmbeddedResource Include="udroute_help_en.txt" />
   </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\UDRoute.Shared\UDRoute.Shared.csproj" />
+  </ItemGroup>
 </Project>

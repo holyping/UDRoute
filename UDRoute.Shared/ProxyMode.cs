@@ -843,7 +843,6 @@ namespace UDRoute
                         {
                             _recentQueryResponses[queryKey] = punchCopy;
                         }
-                        UDRoute.Logging.Log.Warn($"[DEBUG] P sending PunchResp to {remoteEp}");
                         await _udp.SendAsync(punchCopy, remoteEp, ct);
                     }
                     finally
@@ -1034,6 +1033,8 @@ namespace UDRoute
             }
             return false;
         }
+
+
 
         public async ValueTask<bool> TryRelayDisconnectAsync(Guid sessionId, ReadOnlyMemory<byte> packetMem, EndPoint remoteEp, CancellationToken ct)
         {

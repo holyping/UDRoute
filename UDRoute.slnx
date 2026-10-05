@@ -4,5 +4,7 @@
     <Platform Name="x64" />
   </Configurations>
   <Project Path="UDRoute/UDRoute.csproj" />
+  <Project Path="UDRoute.Shared/UDRoute.Shared.csproj" />
+  <Project Path="UDRoute.Maui/UDRoute.Maui.csproj" />
   <Project Path="UDRoute.Tests/UDRoute.Tests.csproj" />
 </Solution>

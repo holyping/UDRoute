@@ -49,7 +49,7 @@ graph TD
 **1. Windows (x64)**
 > 编译前需确保已安装 Visual Studio 的“使用 C++ 的桌面开发”工作负载。
 ```bash
-git clone https://github.com/yourusername/udroute.git
+git clone https://github.com/holyping/UDRoute.git
 cd udroute
 dotnet publish UDRoute/UDRoute.csproj -c Release -r win-x64 /p:PublishAot=true
 ```
@@ -172,6 +172,22 @@ udroute 内置了跨平台的系统后台服务自动注册功能。无论是 Wi
 2. **本机是否具备 IPV6 直连**：检测本机是否具备可对外通信的公网 IPv6 地址及直连能力。
 3. **本机是否处于圆锥路由下**：通过 RFC 标准探测端口映射行为，判断当前路由器属于圆锥路由（Full Cone / Restricted Cone，支持 P2P 打洞）还是对称路由（Symmetric NAT，需走中继）。
 
+### 快速生成配置模板 (-init / -create)
+无需手动从头编写配置文件，使用 `-init` 或 `-create` 即可在当前目录生成包含完整注释与示例的标准配置文件：
+```bash
+./udroute -init [配置文件名.ini]
+```
+
+### 密码安全哈希生成 (-hash)
+为了避免在配置文件中写入明文密码，udroute 提供了 `-hash` 实用工具：
+```bash
+# 交互式输入密码并安全计算哈希（防命令行历史记录泄露）
+./udroute -hash
+
+# 或直接传入明文参数快速计算
+./udroute -hash mypassword
+```
+将输出的 `_HASH256_xxxx` 粘贴至配置文件的 `Password` 或 `AccessPassword` 字段即可实现安全鉴权。
 
 ## 🤝 贡献与反馈 (Contributing)
 

@@ -47,7 +47,7 @@ It is highly recommended to publish this project using **Native AOT**. The compi
 ### 1. Windows (x64)
 > Make sure the "Desktop development with C++" workload is installed in Visual Studio before compiling.
 ```bash
-git clone https://github.com/yourusername/udroute.git
+git clone https://github.com/holyping/UDRoute.git
 cd udroute
 dotnet publish UDRoute/UDRoute.csproj -c Release -r win-x64 /p:PublishAot=true
 ```
@@ -163,6 +163,23 @@ The program will initiate a network and NAT diagnostic test towards the specifie
 1. **Whether local machine and P have an IPv4 direct connection**: Tests whether the local machine has a public IPv4 address (no NAT) or is behind a NAT router.
 2. **Whether local machine possesses IPv6 direct connection capability**: Tests whether the local machine has a valid public IPv6 address and direct routing capability.
 3. **Whether local machine is behind a Cone NAT**: Probes port mapping behavior via RFC standards to determine whether the router is a Cone NAT (Full Cone / Restricted Cone, supporting P2P hole-punching) or Symmetric NAT (requiring relay).
+
+### Quick Template Generation (-init / -create)
+Generate a fully commented standard configuration template without writing from scratch:
+```bash
+./udroute -init [config_name.ini]
+```
+
+### Password Secure Hashing (-hash)
+To prevent storing plaintext passwords in configuration files, udroute provides the `-hash` utility:
+```bash
+# Interactively enter and hash your password (prevents console history leakage)
+./udroute -hash
+
+# Or pass the plaintext directly for quick generation
+./udroute -hash mypassword
+```
+Paste the generated `_HASH256_xxxx` string directly into the `Password` or `AccessPassword` field.
 
 ## 🤝 Contributing
 

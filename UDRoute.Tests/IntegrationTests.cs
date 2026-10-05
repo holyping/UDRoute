@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
@@ -23,7 +23,7 @@ public class IntegrationTests
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
 
         Log.SetLogger(new TestLogger(_out));
-        Log.Instance.Level = LogLevel.Trace;
+        Log.Level = LogLevel.Trace;
 
         // 1. Setup Local Echo Server (TCP) representing the actual service S targets
         using var echoListener = new TcpListener(IPAddress.Loopback, 0);
@@ -141,7 +141,7 @@ public class IntegrationTests
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
 
         Log.SetLogger(new TestLogger(_out));
-        Log.Instance.Level = LogLevel.Info;
+        Log.Level = LogLevel.Info;
 
         // 1. Setup Local Echo Server (TCP)
         using var echoListener = new TcpListener(IPAddress.Loopback, 0);
@@ -287,4 +287,5 @@ public class IntegrationTests
         dummySocket.Dispose();
     }
 }
+
 

@@ -18,6 +18,22 @@ namespace UDRoute
 
         static async Task Main(string[] args)
         {
+            Log.LoggerFactory = (config, isServiceMode) =>
+            {
+                Logger logger = config.LogType switch
+                {
+                    LogType.Console => new ConsoleLogger(),
+                    LogType.EventLog => RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+                        ? new WindowsEventLogger()
+                        : new LinuxSyslogLogger(),
+                    LogType.File => new FileLogger(config.LogFile),
+                    _ => isServiceMode
+                        ? (RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? new WindowsEventLogger() : new LinuxSyslogLogger())
+                        : new ConsoleLogger()
+                };
+                return logger;
+            };
+
             // 全局异常陷阱，防止任何后台线程或异步任务中的未捕获异常导致静默崩溃
             AppDomain.CurrentDomain.UnhandledException += (s, e) =>
             {
@@ -112,7 +128,9 @@ namespace UDRoute
             }
 
             using var engine = new RouteEngine(config);
-            await engine.StartAsync(cts.Token);
+            var t1 = engine.StartAsync(cts.Token);
+            var t2 = StatusServer.StartAsync(engine, cts.Token);
+            await Task.WhenAll(t1, t2);
         }
 
         public static bool IsServiceMode;

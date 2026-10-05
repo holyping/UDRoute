@@ -10,7 +10,7 @@ using UDRoute.Logging;
 namespace UDRoute
 {
     // ==========================================
-    // 7. Server (S模式) - 接受数据并转发到Target
+    // 7. Server (S模式) - 接受数据并转发给Target
     // ==========================================
     public class ServerMode
     {
@@ -97,7 +97,7 @@ namespace UDRoute
                 }
             }
 
-            // 启动 S 到各 P 目标服务器的 NAT KeepAlive 保活循环 (按 TargetServer 分组取最小保活间隔)
+            // 启动 S 到各 P 目标服务器的 NAT KeepAlive 保活循环 (按 TargetServer 取最小间隔)
             var keepAliveTargets = _config.ServerRecords
                 .Where(r => !r.IsThis && !string.IsNullOrWhiteSpace(r.TargetServer) && r.KeepAlive > 0)
                 .GroupBy(r => r.TargetServer, StringComparer.OrdinalIgnoreCase)
@@ -197,7 +197,7 @@ namespace UDRoute
                             }
                             else if (res.Target.AddressFamily == AddressFamily.InterNetworkV6)
                             {
-                                // IPv6 获取失败，准备重置重试
+                                // 过滤掉可能为本地回环的 IPv6 地址
                                 ipv6NeedsReset = true;
                                 retryList.Add(res.Target);
                             }
@@ -207,7 +207,7 @@ namespace UDRoute
                         {
                             await ProtocolHelper.ResetIPv6StackAsync();
 
-                            // 重新发送 EchoReq 到失败的 IPv6 节点
+                            // IPv6 获取失败，准备回退到内网地址
                             var retryTasks = new List<Task<(IPEndPoint Target, IPEndPoint? Result)>>();
                             foreach (var pEp in retryList)
                             {
@@ -255,7 +255,7 @@ namespace UDRoute
                         ushort regContextId = (ushort)Interlocked.Increment(ref _contextCounter);
                         if (regContextId == 0) regContextId = (ushort)Interlocked.Increment(ref _contextCounter);
 
-                        // 构造注册包: [MsgType 1][ContextId 2][DevId 16][WanPort 4][IsTcp 1][Timeout 4][Timestamp 8][ReqPass 1][KcpConfig 21][Name string][Suffix string][LocalEps...]
+                        // 记录发送 EchoReq 失败的 IPv6 节点
                         buffer[0] = (byte)MsgType.Register;
                         BinaryPrimitives.WriteUInt16LittleEndian(buffer.AsSpan(1, 2), regContextId);
                         _config.DevId.TryWriteBytes(buffer.AsSpan(3, 16));
@@ -290,7 +290,7 @@ namespace UDRoute
                             string t1 = ConfigProtector.GetMachineId(); // Base64
                             long ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
                             
-                            // ts + C: ts 在前，C 在后
+                            // 极微延迟后等待
                             byte[] tsBytes = Encoding.UTF8.GetBytes(ts.ToString());
                             byte[] bufferToHash = new byte[tsBytes.Length + 32];
                             Buffer.BlockCopy(tsBytes, 0, bufferToHash, 0, tsBytes.Length);
@@ -399,7 +399,7 @@ namespace UDRoute
                 return;
             }
 
-            // 检查尾部是否包含 P 端的注册状态标识 (0: 需重新注册，1: 正常)
+            // 协议注册包: [MsgType 1][ContextId 2][DevId 16][WanPort 4][IsTcp 1][Timeout 4][Timestamp 8][ReqPass 1][KcpConfig 21][Name string][Suffix string][LocalEps...]
             var (_, epLen) = ProtocolHelper.ReadIPEndPoint(data.Slice(17));
             int statusPos = 17 + epLen;
             if (data.Length > statusPos)
@@ -488,7 +488,7 @@ namespace UDRoute
                 {
                     if (_recentRelayStarts.TryGetValue(sessionId, out var seen) && seen.ContextId == contextId)
                     {
-                        // 重复握手请求（Burst 3x 重发包）：重送 RelayStartAck 并直接返回
+                        // 最多 10 个
                         SendRelayStartAck(contextId, sessionId, remoteEp, seen.Status);
                         return;
                     }
@@ -544,7 +544,9 @@ namespace UDRoute
                     {
                         try
                         {
-                            bool punchSuccess = await StartPunchingAsync(runSession, cPublicEp, ct);
+                            int punchTimeoutMs = Constants.DefaultPunchRetries * Constants.DefaultPunchIntervalMs;
+                            _ = StartPunchingAsync(runSession, cPublicEp, ct);
+                            bool punchSuccess = await runSession.WaitForDirectAsync(TimeSpan.FromMilliseconds(punchTimeoutMs), ct);
                             if (!punchSuccess)
                             {
                                 Log.Warn($"[S] P relay is disabled and UDP punch timed out for session {sessionId}. Aborting backend connection.");
@@ -871,9 +873,8 @@ namespace UDRoute
             }
         }
 
-        public async ValueTask<bool> TryHandlePunchAsync(Guid sessionId, Guid peerInstanceId, EndPoint remoteEp, byte status, CancellationToken ct)
+                                public async ValueTask<bool> TryHandlePunchAsync(Guid sessionId, Guid peerInstanceId, EndPoint remoteEp, byte status, CancellationToken ct)
         {
-            // 1. 拦截本实例发出的自环打洞包（防止同一内网IP+端口或单机环回导致误判直连）
             if (peerInstanceId == _config.InstanceId)
             {
                 Log.Warn($"[S] Dropping loopback punch packet for session {sessionId} from {remoteEp}: InstanceId matches local instance ({peerInstanceId}).");
@@ -881,56 +882,60 @@ namespace UDRoute
             }
 
             TunnelSession? session;
-            lock (_sessionLock)
-            {
-                _sessions.TryGetValue(sessionId, out session);
-            }
+            lock (_sessionLock) { _sessions.TryGetValue(sessionId, out session); }
             if (session != null && !session.IsClosed)
             {
                 if (session.ForceRelay)
                 {
-                    Log.Debug($"[S] Ignoring punch for session {sessionId} because client requested ForceRelay.");
+                    Log.Debug($"[S] Ignoring punch for session {sessionId} because ForceRelay is enabled.");
                     return true;
                 }
-
-                // 2. 校验并绑定会话的对端实例唯一标识
                 if (session.PeerInstanceId != Guid.Empty && session.PeerInstanceId != peerInstanceId)
                 {
                     Log.Warn($"[S] Dropping punch packet for session {sessionId} from {remoteEp}: PeerInstanceId mismatch (expected {session.PeerInstanceId}, got {peerInstanceId}).");
                     return true;
                 }
                 session.PeerInstanceId = peerInstanceId;
-
                 session.SwitchToDirect(remoteEp);
 
-                if (status == 2)
+                string statusDesc = status switch
                 {
-                    // 回送打洞确认，避免死循环 ping-pong
-                    byte[] ackBuf = new byte[36];
-                    ackBuf[0] = (byte)MsgType.Punch;
-                    BinaryPrimitives.WriteUInt16LittleEndian(ackBuf.AsSpan(1, 2), 0);
-                    sessionId.TryWriteBytes(ackBuf.AsSpan(3, 16));
-                    _config.InstanceId.TryWriteBytes(ackBuf.AsSpan(19, 16));
-                    ackBuf[35] = 3; // Punch ACK
-                    await _udp.SendAsync(ackBuf, remoteEp, ct);
-                }
-                else if (status == 3)
-                {
-                    // 收到对方打洞确认，双向直连打通，回送一次确认以便 C 端获知双向确认并通知 P 端释放临时中继
-                    byte[] ackBuf = new byte[36];
-                    ackBuf[0] = (byte)MsgType.Punch;
-                    BinaryPrimitives.WriteUInt16LittleEndian(ackBuf.AsSpan(1, 2), 0);
-                    sessionId.TryWriteBytes(ackBuf.AsSpan(3, 16));
-                    _config.InstanceId.TryWriteBytes(ackBuf.AsSpan(19, 16));
-                    ackBuf[35] = 3; // Punch ACK
-                    try { await _udp.SendAsync(ackBuf, remoteEp, ct); } catch { }
+                    PunchStatus.PunchReq => "PunchReq(打洞请求)",
+                    PunchStatus.PunchAck => "PunchAck(打洞确认)",
+                    _ => $"Status={status}"
+                };
 
+                Log.Trace($"[S] Session {sessionId} received punch packet from {remoteEp}, {statusDesc}.");
+
+                if (status == PunchStatus.PunchReq)
+                {
+                    byte[] ack = new byte[36];
+                    ack[0] = (byte)MsgType.Punch;
+                    System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(ack.AsSpan(1, 2), 0);
+                    sessionId.TryWriteBytes(ack.AsSpan(3, 16));
+                    _config.InstanceId.TryWriteBytes(ack.AsSpan(19, 16));
+                    ack[35] = PunchStatus.PunchAck;
+                    Log.Trace($"[S] Session {sessionId} replying PunchAck to {remoteEp}.");
+                    try { await _udp.SendAsync(ack, remoteEp, ct); } catch { }
+                }
+                else if (status == PunchStatus.PunchAck)
+                {
+                    byte[] ack = new byte[36];
+                    ack[0] = (byte)MsgType.Punch;
+                    System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(ack.AsSpan(1, 2), 0);
+                    sessionId.TryWriteBytes(ack.AsSpan(3, 16));
+                    _config.InstanceId.TryWriteBytes(ack.AsSpan(19, 16));
+                    ack[35] = PunchStatus.PunchAck;
+                    try { await _udp.SendAsync(ack, remoteEp, ct); } catch { }
+
+                    Log.Trace($"[S] Session {sessionId} direct punch communication confirmed ({statusDesc}). Notifying Proxy to end relay session.");
                     session.NotifyDirectCommunicationEstablished();
                 }
                 return true;
             }
             return false;
         }
+
 
         public bool TryHandleAuthReq(ReadOnlySpan<byte> span, EndPoint remoteEp)
         {
@@ -1048,7 +1053,7 @@ namespace UDRoute
             return false;
         }
 
-        private async Task<bool> StartPunchingAsync(TunnelSession session, IPEndPoint cPublicEp, CancellationToken ct)
+        private async Task StartPunchingAsync(TunnelSession session, IPEndPoint cPublicEp, CancellationToken ct)
         {
             byte[] punchBuf = new byte[36];
             punchBuf[0] = (byte)MsgType.Punch;
@@ -1069,7 +1074,7 @@ namespace UDRoute
             if (candidates.Count == 0)
             {
                 Log.Info($"[S] Session {session.SessionId}: All candidate endpoints were filtered out (no remote targets). Skipping UDP punch and continuing with Proxy relay.");
-                return false;
+                return;
             }
 
             Log.Info($"[S] Session {session.SessionId} starting UDP punch to targets: {string.Join(", ", candidates)} (duration: {Constants.DefaultPunchRetries * Constants.DefaultPunchIntervalMs / 1000}s, interval: {Constants.DefaultPunchIntervalMs}ms)");
@@ -1078,21 +1083,14 @@ namespace UDRoute
             {
                 foreach (var ep in candidates)
                 {
-                    await _udp.SendAsync(punchBuf, ep, ct);
+                    try
+                    {
+                        await _udp.SendAsync(punchBuf, ep, ct);
+                    }
+                    catch { }
                 }
                 await Task.Delay(Constants.DefaultPunchIntervalMs, ct);
             }
-
-            if (session.IsDirect)
-            {
-                Log.Info($"[S] Session {session.SessionId} UDP punch successful! Now using direct P2P connection.");
-            }
-            else
-            {
-                Log.Info($"[S] Session {session.SessionId} UDP punch timed out. Continuing with Proxy relay.");
-            }
-
-            return session.IsDirect;
         }
 
         private async Task RunPKeepAliveAsync(string pServer, int intervalSec, CancellationToken ct)

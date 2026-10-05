@@ -117,7 +117,12 @@ UDRoute 是一个 P2P/中继 隧道系统。该系统包含三种基本角色：
 
 **NatTestReq (15) / NatTestResp (16)** (NAT 类型与端口映射诊断)
 - Request: `[MsgType = 15 (1 byte)] + [TestId (16 bytes)] + [Flags (1 byte)]`
-- Response: `[MsgType = 16 (1 byte)] + [TestId (16 bytes)] + [PublicEp (EndPoint)] + [AltPort (4 bytes LE)]` (AltPort 为 P 端按需动态创建的临时随机测试端口。P 端收到请求后动态创建临时 Socket，先向 S/C 发包建立云服务器出站状态，同时在主端口返回包含 AltPort 的响应；S/C 随后向 AltPort 发包比对端口映射一致性以探测圆锥路由，P 测完后立即释放该临时 Socket)
+- Response: `[MsgType = 16 (1 byte)] + [TestId (16 bytes)] + [Flags (1 byte)] + [PublicEp (EndPoint)] + [AltPort (4 bytes LE)]` (AltPort 为 P 端按需动态创建的临时随机测试端口。P 端收到请求后动态创建临时 Socket，先向 S/C 发包建立云服务器出站状态，同时在主端口返回包含 AltPort 的响应；S/C 随后向 AltPort 发包比对端口映射一致性以探测圆锥路由，P 测完后立即释放该临时 Socket)
+- **Flags 说明**:
+  - `0 (None)`: 标准请求 / 阶段2测试响应
+  - `1 (Stage1Probe)`: 阶段1 - P 端临时端口向客户端发出的无邀约入站探测包 (主动方重发)
+  - `2 (Stage1Ack)`: 阶段1 - C 端收到无邀约包后的单次回包确认 (回复方收到即回)
+  - `3 (Stage2Notify)`: 阶段2 - 阶段1超时后，P 端通过主端口通知 C 端临时端口号，转入阶段2探测
 
 **Punch (3)**
 - `[MsgType = 3] (1 byte)`

@@ -58,6 +58,7 @@ namespace UDRoute
         private int _directKeepAliveStarted = 0;
 
         public readonly TaskCompletionSource<bool> AuthTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public readonly TaskCompletionSource<bool> DirectTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public Guid SessionId => _sessionId;
         public EndPoint ActiveRemoteEp => _activeRemoteEp;
@@ -374,8 +375,24 @@ namespace UDRoute
             {
                 _activeRemoteEp = directEp;
                 _isDirect = true;
+                DirectTcs.TrySetResult(true);
                 Log.Info($"[Tunnel] Session {_sessionId} route switched to direct: {directEp}");
                 StartDirectKeepAliveLoop();
+            }
+        }
+
+        public async Task<bool> WaitForDirectAsync(TimeSpan timeout, CancellationToken ct)
+        {
+            if (_isDirect) return true;
+            using var timeoutCts = new CancellationTokenSource(timeout);
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token, _sessionCts.Token);
+            try
+            {
+                return await DirectTcs.Task.WaitAsync(linked.Token);
+            }
+            catch
+            {
+                return _isDirect;
             }
         }
 
@@ -1055,6 +1072,8 @@ namespace UDRoute
                 kvp.Value.TrySetResult(false);
             }
             _openAckTcs.Clear();
+            DirectTcs.TrySetResult(false);
+            AuthTcs.TrySetResult(false);
             // 出于高并发安全考虑，不显式 Dispose _signal 和 _sessionCts，交由 GC 回收以避免 ObjectDisposedException 竞争
         }
     }
