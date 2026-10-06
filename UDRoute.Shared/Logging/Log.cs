@@ -108,6 +108,8 @@ namespace UDRoute.Logging
         {
             if (_instance != null && _instance.IsEnabled(LogLevel.Error)) _instance.Error(string.Format(format, args));
         }
+
+        public static void Write(LogLevel level, string message) => _instance?.Write(level, message);
     }
 }
 

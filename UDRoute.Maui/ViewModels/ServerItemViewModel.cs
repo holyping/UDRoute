@@ -16,7 +16,7 @@ public partial class ServerItemViewModel : ObservableObject
     private string _targetIp = "127.0.0.1";
 
     [ObservableProperty]
-    private int _targetPort = 3389;
+    private int? _targetPort = null;
 
     [ObservableProperty]
     private bool _isTcp = true;
@@ -74,7 +74,7 @@ public partial class ServerItemViewModel : ObservableObject
         IsEnabled = record.IsEnabled;
         Name = record.Name;
         TargetIp = record.TargetIp;
-        TargetPort = record.TargetPort;
+        TargetPort = record.TargetPort > 0 ? record.TargetPort : null;
         IsTcp = record.IsTcp;
         TargetServer = record.TargetServer;
         Password = record.Password != null ? Encoding.UTF8.GetString(record.Password) : "";
@@ -105,7 +105,7 @@ public partial class ServerItemViewModel : ObservableObject
             IsEnabled = IsEnabled,
             Name = Name,
             TargetIp = TargetIp,
-            TargetPort = TargetPort,
+            TargetPort = TargetPort ?? 0,
             IsTcp = IsTcp,
             TargetServer = TargetServer,
             Password = !string.IsNullOrEmpty(Password) ? Encoding.UTF8.GetBytes(Password) : null,

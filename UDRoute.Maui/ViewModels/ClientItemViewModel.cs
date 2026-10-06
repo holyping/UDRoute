@@ -10,7 +10,7 @@ public partial class ClientItemViewModel : ObservableObject
     private bool _isEnabled = true;
 
     [ObservableProperty]
-    private int _port = 15389;
+    private int? _port = null;
 
     [ObservableProperty]
     private bool _isTcp = true;
@@ -44,7 +44,7 @@ public partial class ClientItemViewModel : ObservableObject
     public ClientItemViewModel(ClientRecord record, string defaultServer)
     {
         IsEnabled = record.IsEnabled;
-        Port = record.Port;
+        Port = record.Port > 0 ? record.Port : null;
         IsTcp = record.IsTcp;
         TargetName = record.TargetName;
         TargetServer = record.TargetServer;
@@ -61,7 +61,7 @@ public partial class ClientItemViewModel : ObservableObject
         return new ClientRecord
         {
             IsEnabled = IsEnabled,
-            Port = Port,
+            Port = Port ?? 0,
             IsTcp = IsTcp,
             TargetName = TargetName,
             TargetServer = TargetServer,

@@ -23,7 +23,7 @@
             <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="10">
                 <Label Text="场境名称:" VerticalOptions="Center" FontAttributes="Bold" />
                 <Entry Grid.Column="1" Text="{Binding SceneName}" Placeholder="例如：办公室远程办公" VerticalOptions="Center" />
-                <Button Grid.Column="2" Text="保存" Command="{Binding SaveCommand}" BackgroundColor="#512BD4" TextColor="White" CornerRadius="8" HeightRequest="40" Padding="15,0" />
+                <Button Grid.Column="2" FontFamily="MaterialIcons" Text="&#xe161;" Command="{Binding SaveCommand}" BackgroundColor="#512BD4" TextColor="White" CornerRadius="8" WidthRequest="44" HeightRequest="40" Padding="0" FontSize="20" />
             </Grid>
         </Border>
 
@@ -58,7 +58,7 @@
                 <VerticalStackLayout IsVisible="{Binding SelectedTabIndex, Converter={StaticResource TabToBoolConverter}, ConverterParameter=0}" Spacing="12">
                     <Grid ColumnDefinitions="*,Auto" Margin="0,5">
                         <Label Text="客户端规则列表 (映射远端服务到本地端口)" VerticalOptions="Center" FontSize="12" TextColor="Gray" />
-                        <Button Grid.Column="1" Text="+ 添加规则" Command="{Binding AddClientCommand}" BackgroundColor="#10B981" TextColor="White" CornerRadius="6" HeightRequest="34" Padding="10,0" />
+                        <Button Grid.Column="1" FontFamily="MaterialIcons" Text="&#xe145;" Command="{Binding AddClientCommand}" BackgroundColor="#10B981" TextColor="White" CornerRadius="6" WidthRequest="34" HeightRequest="34" Padding="0" FontSize="20" />
                     </Grid>
 
                     <CollectionView ItemsSource="{Binding ClientItems}">
@@ -72,7 +72,7 @@
                                         <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="8">
                                             <Switch IsToggled="{Binding IsEnabled}" VerticalOptions="Center" />
                                             <Label Grid.Column="1" Text="{Binding Port, StringFormat='本地端口: {0}'}" FontAttributes="Bold" VerticalOptions="Center" />
-                                            <Button Grid.Column="2" Text="删除" Command="{Binding Source={RelativeSource AncestorType={x:Type viewmodels:SceneEditViewModel}}, Path=DeleteClientCommand}" CommandParameter="{Binding .}" BackgroundColor="#EF4444" TextColor="White" CornerRadius="6" HeightRequest="30" Padding="8,0" FontSize="11" />
+                                            <Button Grid.Column="2" FontFamily="MaterialIcons" Text="&#xe872;" Command="{Binding Source={RelativeSource AncestorType={x:Type viewmodels:SceneEditViewModel}}, Path=DeleteClientCommand}" CommandParameter="{Binding .}" BackgroundColor="#EF4444" TextColor="White" CornerRadius="6" WidthRequest="32" HeightRequest="30" Padding="0" FontSize="16" />
                                         </Grid>
 
                                         <BoxView HeightRequest="1" Color="{AppThemeBinding Light=#F3F4F6, Dark=#1F2937}" />
@@ -82,7 +82,16 @@
                                             <VerticalStackLayout Grid.Column="0">
                                                 <HorizontalStackLayout Spacing="4">
                                                     <Label Text="本地监听端口" FontSize="12" TextColor="Gray" />
-                                                    <Button Text="?" Command="{Binding Source={RelativeSource AncestorType={x:Type viewmodels:SceneEditViewModel}}, Path=ShowHelpCommand}" CommandParameter="C_Port" WidthRequest="22" HeightRequest="22" CornerRadius="11" Padding="0" BackgroundColor="#E5E7EB" TextColor="#374151" FontSize="11" />
+                                                    <Border WidthRequest="16" HeightRequest="16" StrokeShape="RoundRectangle 8"
+                                                            BackgroundColor="{AppThemeBinding Light=#E5E7EB, Dark=#374151}" 
+                                                            Stroke="Transparent" Padding="0" VerticalOptions="Center">
+                                                        <Border.GestureRecognizers>
+                                                            <TapGestureRecognizer Command="{Binding Source={RelativeSource AncestorType={x:Type viewmodels:SceneEditViewModel}}, Path=ShowHelpCommand}" CommandParameter="C_Port" />
+                                                        </Border.GestureRecognizers>
+                                                        <Label Text="?" FontSize="10" FontAttributes="Bold" 
+                                                               TextColor="{AppThemeBinding Light=#4B5563, Dark=#D1D5DB}" 
+                                                               HorizontalTextAlignment="Center" VerticalTextAlignment="Center" />
+                                                    </Border>
                                                 </HorizontalStackLayout>
                                                 <Entry Text="{Binding Port}" Keyboard="Numeric" Placeholder="例如: 15389" />
                                             </VerticalStackLayout>
@@ -100,7 +109,16 @@
                                         <VerticalStackLayout>
                                             <HorizontalStackLayout Spacing="4">
                                                 <Label Text="目标服务名称" FontSize="12" TextColor="Gray" />
-                                                <Button Text="?" Command="{Binding Source={RelativeSource AncestorType={x:Type viewmodels:SceneEditViewModel}}, Path=ShowHelpCommand}" CommandParameter="C_TargetName" WidthRequest="22" HeightRequest="22" CornerRadius="11" Padding="0" BackgroundColor="#E5E7EB" TextColor="#374151" FontSize="11" />
+                                                <Border WidthRequest="16" HeightRequest="16" StrokeShape="RoundRectangle 8"
+                                                        BackgroundColor="{AppThemeBinding Light=#E5E7EB, Dark=#374151}" 
+                                                        Stroke="Transparent" Padding="0" VerticalOptions="Center">
+                                                    <Border.GestureRecognizers>
+                                                        <TapGestureRecognizer Command="{Binding Source={RelativeSource AncestorType={x:Type viewmodels:SceneEditViewModel}}, Path=ShowHelpCommand}" CommandParameter="C_TargetName" />
+                                                    </Border.GestureRecognizers>
+                                                    <Label Text="?" FontSize="10" FontAttributes="Bold" 
+                                                           TextColor="{AppThemeBinding Light=#4B5563, Dark=#D1D5DB}" 
+                                                           HorizontalTextAlignment="Center" VerticalTextAlignment="Center" />
+                                                </Border>
                                             </HorizontalStackLayout>
                                             <Entry Text="{Binding TargetName}" Placeholder="例如: rdp, ssh, web" />
                                         </VerticalStackLayout>
@@ -109,14 +127,23 @@
                                         <VerticalStackLayout>
                                             <HorizontalStackLayout Spacing="4">
                                                 <Label Text="目标中转服务器 (留空使用默认)" FontSize="12" TextColor="Gray" />
-                                                <Button Text="?" Command="{Binding Source={RelativeSource AncestorType={x:Type viewmodels:SceneEditViewModel}}, Path=ShowHelpCommand}" CommandParameter="C_TargetServer" WidthRequest="22" HeightRequest="22" CornerRadius="11" Padding="0" BackgroundColor="#E5E7EB" TextColor="#374151" FontSize="11" />
+                                                <Border WidthRequest="16" HeightRequest="16" StrokeShape="RoundRectangle 8"
+                                                        BackgroundColor="{AppThemeBinding Light=#E5E7EB, Dark=#374151}" 
+                                                        Stroke="Transparent" Padding="0" VerticalOptions="Center">
+                                                    <Border.GestureRecognizers>
+                                                        <TapGestureRecognizer Command="{Binding Source={RelativeSource AncestorType={x:Type viewmodels:SceneEditViewModel}}, Path=ShowHelpCommand}" CommandParameter="C_TargetServer" />
+                                                    </Border.GestureRecognizers>
+                                                    <Label Text="?" FontSize="10" FontAttributes="Bold" 
+                                                           TextColor="{AppThemeBinding Light=#4B5563, Dark=#D1D5DB}" 
+                                                           HorizontalTextAlignment="Center" VerticalTextAlignment="Center" />
+                                                </Border>
                                             </HorizontalStackLayout>
                                             <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
                                                 <Entry Grid.Column="0" Text="{Binding TargetServer}" Placeholder="{Binding PlaceholderServer}" />
-                                                <Button Grid.Column="1" Text="NAT 测试" 
+                                                <Button Grid.Column="1" FontFamily="MaterialIcons" Text="&#xea0b;" 
                                                         Command="{Binding Source={RelativeSource AncestorType={x:Type viewmodels:SceneEditViewModel}}, Path=TestNatCommand}" 
                                                         CommandParameter="{Binding TargetServer}" 
-                                                        BackgroundColor="#3B82F6" TextColor="White" CornerRadius="8" HeightRequest="36" Padding="10,0" FontSize="11" />
+                                                        BackgroundColor="#3B82F6" TextColor="White" CornerRadius="8" WidthRequest="38" HeightRequest="36" Padding="0" FontSize="18" />
                                             </Grid>
                                         </VerticalStackLayout>
 
@@ -141,14 +168,32 @@
                                                         <VerticalStackLayout Grid.Column="0">
                                                             <HorizontalStackLayout Spacing="4">
                                                                 <Label Text="MTU" FontSize="11" TextColor="Gray" />
-                                                                <Button Text="?" Command="{Binding Source={RelativeSource AncestorType={x:Type viewmodels:SceneEditViewModel}}, Path=ShowHelpCommand}" CommandParameter="General_MTU" WidthRequest="18" HeightRequest="18" CornerRadius="9" Padding="0" BackgroundColor="#E5E7EB" TextColor="#374151" FontSize="9" />
+                                                                <Border WidthRequest="16" HeightRequest="16" StrokeShape="RoundRectangle 8"
+                                                                        BackgroundColor="{AppThemeBinding Light=#E5E7EB, Dark=#374151}" 
+                                                                        Stroke="Transparent" Padding="0" VerticalOptions="Center">
+                                                                    <Border.GestureRecognizers>
+                                                                        <TapGestureRecognizer Command="{Binding Source={RelativeSource AncestorType={x:Type viewmodels:SceneEditViewModel}}, Path=ShowHelpCommand}" CommandParameter="General_MTU" />
+                                                                    </Border.GestureRecognizers>
+                                                                    <Label Text="?" FontSize="10" FontAttributes="Bold" 
+                                                                           TextColor="{AppThemeBinding Light=#4B5563, Dark=#D1D5DB}" 
+                                                                           HorizontalTextAlignment="Center" VerticalTextAlignment="Center" />
+                                                                </Border>
                                                             </HorizontalStackLayout>
                                                             <Entry Text="{Binding Mtu}" Keyboard="Numeric" Placeholder="1400" />
                                                         </VerticalStackLayout>
                                                         <VerticalStackLayout Grid.Column="1">
                                                             <HorizontalStackLayout Spacing="4">
                                                                 <Label Text="强制中转" FontSize="11" TextColor="Gray" />
-                                                                <Button Text="?" Command="{Binding Source={RelativeSource AncestorType={x:Type viewmodels:SceneEditViewModel}}, Path=ShowHelpCommand}" CommandParameter="C_ForceRelay" WidthRequest="18" HeightRequest="18" CornerRadius="9" Padding="0" BackgroundColor="#E5E7EB" TextColor="#374151" FontSize="9" />
+                                                                <Border WidthRequest="16" HeightRequest="16" StrokeShape="RoundRectangle 8"
+                                                                        BackgroundColor="{AppThemeBinding Light=#E5E7EB, Dark=#374151}" 
+                                                                        Stroke="Transparent" Padding="0" VerticalOptions="Center">
+                                                                    <Border.GestureRecognizers>
+                                                                        <TapGestureRecognizer Command="{Binding Source={RelativeSource AncestorType={x:Type viewmodels:SceneEditViewModel}}, Path=ShowHelpCommand}" CommandParameter="C_ForceRelay" />
+                                                                    </Border.GestureRecognizers>
+                                                                    <Label Text="?" FontSize="10" FontAttributes="Bold" 
+                                                                           TextColor="{AppThemeBinding Light=#4B5563, Dark=#D1D5DB}" 
+                                                                           HorizontalTextAlignment="Center" VerticalTextAlignment="Center" />
+                                                                </Border>
                                                             </HorizontalStackLayout>
                                                             <Switch IsToggled="{Binding ForceRelay}" Margin="0,4,0,0" />
                                                         </VerticalStackLayout>
@@ -162,7 +207,16 @@
                                                         <VerticalStackLayout Grid.Column="1">
                                                             <HorizontalStackLayout Spacing="4">
                                                                 <Label Text="心跳保活(秒)" FontSize="11" TextColor="Gray" />
-                                                                <Button Text="?" Command="{Binding Source={RelativeSource AncestorType={x:Type viewmodels:SceneEditViewModel}}, Path=ShowHelpCommand}" CommandParameter="General_KeepAlive" WidthRequest="18" HeightRequest="18" CornerRadius="9" Padding="0" BackgroundColor="#E5E7EB" TextColor="#374151" FontSize="9" />
+                                                                <Border WidthRequest="16" HeightRequest="16" StrokeShape="RoundRectangle 8"
+                                                                        BackgroundColor="{AppThemeBinding Light=#E5E7EB, Dark=#374151}" 
+                                                                        Stroke="Transparent" Padding="0" VerticalOptions="Center">
+                                                                    <Border.GestureRecognizers>
+                                                                        <TapGestureRecognizer Command="{Binding Source={RelativeSource AncestorType={x:Type viewmodels:SceneEditViewModel}}, Path=ShowHelpCommand}" CommandParameter="General_KeepAlive" />
+                                                                    </Border.GestureRecognizers>
+                                                                    <Label Text="?" FontSize="10" FontAttributes="Bold" 
+                                                                           TextColor="{AppThemeBinding Light=#4B5563, Dark=#D1D5DB}" 
+                                                                           HorizontalTextAlignment="Center" VerticalTextAlignment="Center" />
+                                                                </Border>
                                                             </HorizontalStackLayout>
                                                             <Entry Text="{Binding KeepAlive}" Keyboard="Numeric" Placeholder="25" />
                                                         </VerticalStackLayout>
@@ -183,7 +237,7 @@
                 <VerticalStackLayout IsVisible="{Binding SelectedTabIndex, Converter={StaticResource TabToBoolConverter}, ConverterParameter=1}" Spacing="12">
                     <Grid ColumnDefinitions="*,Auto" Margin="0,5">
                         <Label Text="服务端暴露服务列表 (向锚点注册本机/内网服务)" VerticalOptions="Center" FontSize="12" TextColor="Gray" />
-                        <Button Grid.Column="1" Text="+ 添加服务" Command="{Binding AddServerCommand}" BackgroundColor="#10B981" TextColor="White" CornerRadius="6" HeightRequest="34" Padding="10,0" />
+                        <Button Grid.Column="1" FontFamily="MaterialIcons" Text="&#xe145;" Command="{Binding AddServerCommand}" BackgroundColor="#10B981" TextColor="White" CornerRadius="6" WidthRequest="34" HeightRequest="34" Padding="0" FontSize="20" />
                     </Grid>
 
                     <CollectionView ItemsSource="{Binding ServerItems}">
@@ -197,7 +251,7 @@
                                         <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="8">
                                             <Switch IsToggled="{Binding IsEnabled}" VerticalOptions="Center" />
                                             <Label Grid.Column="1" Text="{Binding Name, StringFormat='服务名: {0}'}" FontAttributes="Bold" VerticalOptions="Center" />
-                                            <Button Grid.Column="2" Text="删除" Command="{Binding Source={RelativeSource AncestorType={x:Type viewmodels:SceneEditViewModel}}, Path=DeleteServerCommand}" CommandParameter="{Binding .}" BackgroundColor="#EF4444" TextColor="White" CornerRadius="6" HeightRequest="30" Padding="8,0" FontSize="11" />
+                                            <Button Grid.Column="2" FontFamily="MaterialIcons" Text="&#xe872;" Command="{Binding Source={RelativeSource AncestorType={x:Type viewmodels:SceneEditViewModel}}, Path=DeleteServerCommand}" CommandParameter="{Binding .}" BackgroundColor="#EF4444" TextColor="White" CornerRadius="6" WidthRequest="32" HeightRequest="30" Padding="0" FontSize="16" />
                                         </Grid>
 
                                         <BoxView HeightRequest="1" Color="{AppThemeBinding Light=#F3F4F6, Dark=#1F2937}" />
@@ -206,7 +260,16 @@
                                         <VerticalStackLayout>
                                             <HorizontalStackLayout Spacing="4">
                                                 <Label Text="服务标识名称 (注册名)" FontSize="12" TextColor="Gray" />
-                                                <Button Text="?" Command="{Binding Source={RelativeSource AncestorType={x:Type viewmodels:SceneEditViewModel}}, Path=ShowHelpCommand}" CommandParameter="S_Name" WidthRequest="22" HeightRequest="22" CornerRadius="11" Padding="0" BackgroundColor="#E5E7EB" TextColor="#374151" FontSize="11" />
+                                                <Border WidthRequest="16" HeightRequest="16" StrokeShape="RoundRectangle 8"
+                                                        BackgroundColor="{AppThemeBinding Light=#E5E7EB, Dark=#374151}" 
+                                                        Stroke="Transparent" Padding="0" VerticalOptions="Center">
+                                                    <Border.GestureRecognizers>
+                                                        <TapGestureRecognizer Command="{Binding Source={RelativeSource AncestorType={x:Type viewmodels:SceneEditViewModel}}, Path=ShowHelpCommand}" CommandParameter="S_Name" />
+                                                    </Border.GestureRecognizers>
+                                                    <Label Text="?" FontSize="10" FontAttributes="Bold" 
+                                                           TextColor="{AppThemeBinding Light=#4B5563, Dark=#D1D5DB}" 
+                                                           HorizontalTextAlignment="Center" VerticalTextAlignment="Center" />
+                                                </Border>
                                             </HorizontalStackLayout>
                                             <Entry Text="{Binding Name}" Placeholder="例如: rdp, ssh, file" />
                                         </VerticalStackLayout>
@@ -216,7 +279,16 @@
                                             <VerticalStackLayout Grid.Column="0">
                                                 <HorizontalStackLayout Spacing="4">
                                                     <Label Text="目标真实IP" FontSize="12" TextColor="Gray" />
-                                                    <Button Text="?" Command="{Binding Source={RelativeSource AncestorType={x:Type viewmodels:SceneEditViewModel}}, Path=ShowHelpCommand}" CommandParameter="S_TargetIp" WidthRequest="22" HeightRequest="22" CornerRadius="11" Padding="0" BackgroundColor="#E5E7EB" TextColor="#374151" FontSize="11" />
+                                                    <Border WidthRequest="16" HeightRequest="16" StrokeShape="RoundRectangle 8"
+                                                            BackgroundColor="{AppThemeBinding Light=#E5E7EB, Dark=#374151}" 
+                                                            Stroke="Transparent" Padding="0" VerticalOptions="Center">
+                                                        <Border.GestureRecognizers>
+                                                            <TapGestureRecognizer Command="{Binding Source={RelativeSource AncestorType={x:Type viewmodels:SceneEditViewModel}}, Path=ShowHelpCommand}" CommandParameter="S_TargetIp" />
+                                                        </Border.GestureRecognizers>
+                                                        <Label Text="?" FontSize="10" FontAttributes="Bold" 
+                                                               TextColor="{AppThemeBinding Light=#4B5563, Dark=#D1D5DB}" 
+                                                               HorizontalTextAlignment="Center" VerticalTextAlignment="Center" />
+                                                    </Border>
                                                 </HorizontalStackLayout>
                                                 <Entry Text="{Binding TargetIp}" Placeholder="127.0.0.1" />
                                             </VerticalStackLayout>
@@ -224,7 +296,16 @@
                                             <VerticalStackLayout Grid.Column="1">
                                                 <HorizontalStackLayout Spacing="4">
                                                     <Label Text="目标端口" FontSize="12" TextColor="Gray" />
-                                                    <Button Text="?" Command="{Binding Source={RelativeSource AncestorType={x:Type viewmodels:SceneEditViewModel}}, Path=ShowHelpCommand}" CommandParameter="S_TargetPort" WidthRequest="22" HeightRequest="22" CornerRadius="11" Padding="0" BackgroundColor="#E5E7EB" TextColor="#374151" FontSize="11" />
+                                                    <Border WidthRequest="16" HeightRequest="16" StrokeShape="RoundRectangle 8"
+                                                            BackgroundColor="{AppThemeBinding Light=#E5E7EB, Dark=#374151}" 
+                                                            Stroke="Transparent" Padding="0" VerticalOptions="Center">
+                                                        <Border.GestureRecognizers>
+                                                            <TapGestureRecognizer Command="{Binding Source={RelativeSource AncestorType={x:Type viewmodels:SceneEditViewModel}}, Path=ShowHelpCommand}" CommandParameter="S_TargetPort" />
+                                                        </Border.GestureRecognizers>
+                                                        <Label Text="?" FontSize="10" FontAttributes="Bold" 
+                                                               TextColor="{AppThemeBinding Light=#4B5563, Dark=#D1D5DB}" 
+                                                               HorizontalTextAlignment="Center" VerticalTextAlignment="Center" />
+                                                    </Border>
                                                 </HorizontalStackLayout>
                                                 <Entry Text="{Binding TargetPort}" Keyboard="Numeric" Placeholder="3389" />
                                             </VerticalStackLayout>
@@ -242,14 +323,23 @@
                                         <VerticalStackLayout>
                                             <HorizontalStackLayout Spacing="4">
                                                 <Label Text="注册锚点服务器 (留空使用默认)" FontSize="12" TextColor="Gray" />
-                                                <Button Text="?" Command="{Binding Source={RelativeSource AncestorType={x:Type viewmodels:SceneEditViewModel}}, Path=ShowHelpCommand}" CommandParameter="S_TargetServer" WidthRequest="22" HeightRequest="22" CornerRadius="11" Padding="0" BackgroundColor="#E5E7EB" TextColor="#374151" FontSize="11" />
+                                                <Border WidthRequest="16" HeightRequest="16" StrokeShape="RoundRectangle 8"
+                                                        BackgroundColor="{AppThemeBinding Light=#E5E7EB, Dark=#374151}" 
+                                                        Stroke="Transparent" Padding="0" VerticalOptions="Center">
+                                                    <Border.GestureRecognizers>
+                                                        <TapGestureRecognizer Command="{Binding Source={RelativeSource AncestorType={x:Type viewmodels:SceneEditViewModel}}, Path=ShowHelpCommand}" CommandParameter="S_TargetServer" />
+                                                    </Border.GestureRecognizers>
+                                                    <Label Text="?" FontSize="10" FontAttributes="Bold" 
+                                                           TextColor="{AppThemeBinding Light=#4B5563, Dark=#D1D5DB}" 
+                                                           HorizontalTextAlignment="Center" VerticalTextAlignment="Center" />
+                                                </Border>
                                             </HorizontalStackLayout>
                                             <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
                                                 <Entry Grid.Column="0" Text="{Binding TargetServer}" Placeholder="{Binding PlaceholderServer}" />
-                                                <Button Grid.Column="1" Text="NAT 测试" 
+                                                <Button Grid.Column="1" FontFamily="MaterialIcons" Text="&#xea0b;" 
                                                         Command="{Binding Source={RelativeSource AncestorType={x:Type viewmodels:SceneEditViewModel}}, Path=TestNatCommand}" 
                                                         CommandParameter="{Binding TargetServer}" 
-                                                        BackgroundColor="#3B82F6" TextColor="White" CornerRadius="8" HeightRequest="36" Padding="10,0" FontSize="11" />
+                                                        BackgroundColor="#3B82F6" TextColor="White" CornerRadius="8" WidthRequest="38" HeightRequest="36" Padding="0" FontSize="18" />
                                             </Grid>
                                         </VerticalStackLayout>
 
@@ -350,7 +440,16 @@
                                     <VerticalStackLayout Grid.Column="0">
                                         <HorizontalStackLayout Spacing="4">
                                             <Label Text="监听端口" FontSize="12" TextColor="Gray" />
-                                            <Button Text="?" Command="{Binding ShowHelpCommand}" CommandParameter="P_ProxyPort" WidthRequest="22" HeightRequest="22" CornerRadius="11" Padding="0" BackgroundColor="#E5E7EB" TextColor="#374151" FontSize="11" />
+                                            <Border WidthRequest="16" HeightRequest="16" StrokeShape="RoundRectangle 8"
+                                                    BackgroundColor="{AppThemeBinding Light=#E5E7EB, Dark=#374151}" 
+                                                    Stroke="Transparent" Padding="0" VerticalOptions="Center">
+                                                <Border.GestureRecognizers>
+                                                    <TapGestureRecognizer Command="{Binding ShowHelpCommand}" CommandParameter="P_ProxyPort" />
+                                                </Border.GestureRecognizers>
+                                                <Label Text="?" FontSize="10" FontAttributes="Bold" 
+                                                       TextColor="{AppThemeBinding Light=#4B5563, Dark=#D1D5DB}" 
+                                                       HorizontalTextAlignment="Center" VerticalTextAlignment="Center" />
+                                            </Border>
                                         </HorizontalStackLayout>
                                         <Entry Text="{Binding ProxyPort}" Keyboard="Numeric" Placeholder="9400" />
                                     </VerticalStackLayout>
@@ -386,20 +485,29 @@
                             <VerticalStackLayout>
                                 <HorizontalStackLayout Spacing="4">
                                     <Label Text="默认锚点服务器 (Default Server)" FontSize="12" TextColor="Gray" />
-                                    <Button Text="?" Command="{Binding ShowHelpCommand}" CommandParameter="P_DefaultServer" WidthRequest="22" HeightRequest="22" CornerRadius="11" Padding="0" BackgroundColor="#E5E7EB" TextColor="#374151" FontSize="11" />
+                                    <Border WidthRequest="16" HeightRequest="16" StrokeShape="RoundRectangle 8"
+                                            BackgroundColor="{AppThemeBinding Light=#E5E7EB, Dark=#374151}" 
+                                            Stroke="Transparent" Padding="0" VerticalOptions="Center">
+                                        <Border.GestureRecognizers>
+                                            <TapGestureRecognizer Command="{Binding ShowHelpCommand}" CommandParameter="P_DefaultServer" />
+                                        </Border.GestureRecognizers>
+                                        <Label Text="?" FontSize="10" FontAttributes="Bold" 
+                                               TextColor="{AppThemeBinding Light=#4B5563, Dark=#D1D5DB}" 
+                                               HorizontalTextAlignment="Center" VerticalTextAlignment="Center" />
+                                    </Border>
                                 </HorizontalStackLayout>
                                 <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
                                     <Entry Grid.Column="0" Text="{Binding DefaultServer}" Placeholder="例如: pserver.example.com:9400" />
-                                    <Button Grid.Column="1" Text="NAT 测试" Command="{Binding TestNatCommand}" CommandParameter="{Binding DefaultServer}"
-                                            BackgroundColor="#3B82F6" TextColor="White" CornerRadius="8" HeightRequest="38" Padding="12,0" FontSize="12" FontAttributes="Bold" />
+                                    <Button Grid.Column="1" FontFamily="MaterialIcons" Text="&#xea0b;" Command="{Binding TestNatCommand}" CommandParameter="{Binding DefaultServer}"
+                                            BackgroundColor="#3B82F6" TextColor="White" CornerRadius="8" WidthRequest="38" HeightRequest="38" Padding="0" FontSize="18" />
                                 </Grid>
                                 <Label Text="💡 此处填写的服务器，将作为 C 客户端和 S 服务端留空时的默认值" FontSize="11" TextColor="#3B82F6" Margin="0,2,0,0" />
                             </VerticalStackLayout>
 
                             <!-- 设备名称 -->
                             <VerticalStackLayout>
-                                <Label Text="设备识别名称" FontSize="12" TextColor="Gray" />
-                                <Entry Text="{Binding DevName}" Placeholder="本机设备名称" />
+                                <Label Text="设备识别名称 (可选)" FontSize="12" TextColor="Gray" />
+                                <Entry Text="{Binding DevName}" Placeholder="可选，留空使用服务默认注册名" />
                             </VerticalStackLayout>
 
                             <!-- 高级设置折叠面板 -->
@@ -455,8 +563,8 @@
                 <!-- 顶部标题与右上角关闭按钮 -->
                 <Grid Grid.Row="0" ColumnDefinitions="*,Auto">
                     <Label Text="{Binding HelpTitle}" FontAttributes="Bold" TextColor="White" FontSize="14" VerticalOptions="Center" />
-                    <Button Grid.Column="1" Text="✕" Command="{Binding CloseHelpCommand}" 
-                            BackgroundColor="Transparent" TextColor="#94A3B8" FontAttributes="Bold" FontSize="16" 
+                    <Button Grid.Column="1" FontFamily="MaterialIcons" Text="&#xe5cd;" Command="{Binding CloseHelpCommand}" 
+                            BackgroundColor="Transparent" TextColor="#94A3B8" FontSize="18" 
                             WidthRequest="32" HeightRequest="32" Padding="0" />
                 </Grid>
                 <!-- 说明详情文本 -->

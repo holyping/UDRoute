@@ -2,27 +2,164 @@
 <ContentPage xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
              xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
              xmlns:viewmodels="clr-namespace:UDRoute.Maui.ViewModels"
+             xmlns:logging="clr-namespace:UDRoute.Logging;assembly=UDRoute.Shared"
              xmlns:toolkit="http://schemas.microsoft.com/dotnet/2022/maui/toolkit"
              x:Class="UDRoute.Maui.Views.LogPage"
-             Title="日志">
+             x:DataType="viewmodels:LogViewModel"
+             Title="日志中心">
 
     <Grid>
-        <CollectionView ItemsSource="{Binding Logs}" Margin="10">
-            <CollectionView.ItemTemplate>
-                <DataTemplate x:DataType="x:String">
-                    <Label Text="{Binding .}" FontSize="12" FontFamily="Consolas" LineBreakMode="WordWrap" Margin="0,2" />
-                </DataTemplate>
-            </CollectionView.ItemTemplate>
-        </CollectionView>
-        
-        <!-- 浮动启停按钮 -->
-        <Button Text="{Binding Engine.IsRunning, Converter={toolkit:BoolToObjectConverter TrueObject='⏹', FalseObject='▶'}}"
+        <!-- 主布局：工具栏 + 搜索栏 + 日志列表 + 底部汇总 -->
+        <Grid RowDefinitions="Auto,Auto,*,Auto">
+            
+            <!-- 1. 顶部控制栏 (LogLevel 切换 + 滚动/清空/复制) -->
+            <Border Grid.Row="0" Margin="10,8,10,4" Padding="8,4" StrokeShape="RoundRectangle 8"
+                    BackgroundColor="{AppThemeBinding Light=#F1F5F9, Dark=#1E293B}" Stroke="Transparent">
+                <Grid ColumnDefinitions="Auto,*,Auto,Auto,Auto" ColumnSpacing="6" VerticalOptions="Center">
+                    <!-- 动态 LogLevel 切换下拉列表 -->
+                    <HorizontalStackLayout Grid.Column="0" Spacing="4" VerticalOptions="Center">
+                        <Label Text="级别:" VerticalOptions="Center" FontSize="12" FontAttributes="Bold" />
+                        <Border StrokeShape="RoundRectangle 6" 
+                                BackgroundColor="{AppThemeBinding Light=White, Dark=#0F172A}"
+                                Stroke="{AppThemeBinding Light=#CBD5E1, Dark=#334155}" StrokeThickness="1" Padding="4,0">
+                            <Picker ItemsSource="{Binding AvailableLogLevels}" 
+                                    SelectedItem="{Binding SelectedLogLevel}" 
+                                    FontSize="12" HeightRequest="32" VerticalOptions="Center" />
+                        </Border>
+                    </HorizontalStackLayout>
+
+                    <!-- 自动滚屏开关 -->
+                    <HorizontalStackLayout Grid.Column="2" Spacing="4" VerticalOptions="Center">
+                        <Label Text="自动滚屏" FontSize="11" VerticalOptions="Center" 
+                               TextColor="{AppThemeBinding Light=#475569, Dark=#94A3B8}" />
+                        <Switch IsToggled="{Binding AutoScroll}" VerticalOptions="Center" Scale="0.85" />
+                    </HorizontalStackLayout>
+
+                    <!-- 清空按钮 (Material Icons) -->
+                    <Button Grid.Column="3" FontFamily="MaterialIcons" Text="&#xe16c;" Command="{Binding ClearLogsCommand}" 
+                            BackgroundColor="#64748B" TextColor="White" FontSize="16" 
+                            CornerRadius="6" WidthRequest="34" HeightRequest="30" Padding="0" />
+
+                    <!-- 复制按钮 (Material Icons) -->
+                    <Button Grid.Column="4" FontFamily="MaterialIcons" Text="&#xe14d;" Command="{Binding CopyLogsCommand}" 
+                            BackgroundColor="#512BD4" TextColor="White" FontSize="16" 
+                            CornerRadius="6" WidthRequest="34" HeightRequest="30" Padding="0" />
+                </Grid>
+            </Border>
+
+            <!-- 2. 日志关键词过滤搜索栏 -->
+            <SearchBar Grid.Row="1" Text="{Binding SearchText}" Placeholder="输入关键字过滤日志..." 
+                       Margin="10,0,10,4" HeightRequest="38" FontSize="12" />
+
+            <!-- 3. 日志流展示列表 (轻量化单层容器 + 批量更新 + 虚拟化固定高度优化) -->
+            <CollectionView Grid.Row="2" x:Name="LogCollectionView" ItemsSource="{Binding Logs}" SelectionMode="None" Margin="4,0"
+                            ItemSizingStrategy="MeasureFirstItem">
+                <CollectionView.EmptyView>
+                    <VerticalStackLayout HorizontalOptions="Center" VerticalOptions="Center" Spacing="6" Margin="30">
+                        <Label Text="📝" FontSize="36" HorizontalOptions="Center" />
+                        <Label Text="暂无符合条件的日志记录" TextColor="#94A3B8" FontSize="13" HorizontalOptions="Center" />
+                    </VerticalStackLayout>
+                </CollectionView.EmptyView>
+
+                <CollectionView.ItemTemplate>
+                    <DataTemplate x:DataType="logging:LogEntry">
+                        <!-- 固定高度 76，支持双行显示，极大减少测量开销 -->
+                        <Border StrokeShape="RoundRectangle 6" HeightRequest="76"
+                                BackgroundColor="{AppThemeBinding Light=White, Dark=#111827}" 
+                                Stroke="{AppThemeBinding Light=#E2E8F0, Dark=#1F2937}" 
+                                StrokeThickness="1" Margin="6,2" Padding="8,5">
+                            <VerticalStackLayout Spacing="3">
+                                <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="6" VerticalOptions="Center">
+                                    <Label Grid.Column="0" Text="{Binding LevelString}" TextColor="{Binding LevelColorHex}" 
+                                           FontSize="11" FontAttributes="Bold" />
+                                    <Label Grid.Column="2" Text="{Binding TimeString}" FontSize="11" 
+                                           TextColor="#64748B" FontFamily="Consolas" VerticalOptions="Center" />
+                                </Grid>
+                                <!-- 双行截断以保证固定高度，并加上详情按钮 -->
+                                <Grid ColumnDefinitions="*,Auto" ColumnSpacing="4">
+                                    <Label Grid.Column="0" Text="{Binding Message}" FontSize="12" FontFamily="Consolas" 
+                                           MaxLines="2" LineBreakMode="TailTruncation" TextColor="{AppThemeBinding Light=#1E293B, Dark=#E2E8F0}" 
+                                           VerticalOptions="Start" />
+                                    <Button Grid.Column="1" FontFamily="MaterialIcons" Text="&#xe5d3;" 
+                                            Command="{Binding BindingContext.ShowLogDetailsCommand, Source={x:Reference LogCollectionView}}" 
+                                            CommandParameter="{Binding .}"
+                                            BackgroundColor="Transparent" TextColor="#64748B" FontSize="16" 
+                                            Padding="0" Margin="0" WidthRequest="24" HeightRequest="20" VerticalOptions="Center" />
+                                </Grid>
+                            </VerticalStackLayout>
+                        </Border>
+                    </DataTemplate>
+                </CollectionView.ItemTemplate>
+            </CollectionView>
+
+            <!-- 4. 底部状态汇总条 -->
+            <Border Grid.Row="3" Padding="14,6" 
+                    BackgroundColor="{AppThemeBinding Light=#F8FAFC, Dark=#0F172A}" 
+                    Stroke="{AppThemeBinding Light=#E2E8F0, Dark=#1F2937}" StrokeThickness="1">
+                <Grid ColumnDefinitions="*,Auto">
+                    <Label Grid.Column="0" Text="{Binding LogSummaryText}" FontSize="11" TextColor="#64748B" VerticalOptions="Center" />
+                    <Label Grid.Column="1" Text="{Binding Engine.CurrentStatusText}" FontSize="11" TextColor="#64748B" VerticalOptions="Center" />
+                </Grid>
+            </Border>
+        </Grid>
+
+        <!-- 浮动启停按钮 (带等待动画) -->
+        <Border HorizontalOptions="End" VerticalOptions="End"
+                Margin="20,0,20,40" WidthRequest="56" HeightRequest="56"
+                StrokeShape="RoundRectangle 28" Stroke="Transparent"
                 BackgroundColor="{Binding Engine.IsRunning, Converter={toolkit:BoolToObjectConverter TrueObject='#EF4444', FalseObject='#10B981'}}"
-                TextColor="White" FontAttributes="Bold" FontSize="20"
-                CornerRadius="28" WidthRequest="56" HeightRequest="56"
-                HorizontalOptions="End" VerticalOptions="End"
-                Margin="20"
-                Command="{Binding ToggleCommand}" />
+                Shadow="{Shadow Brush=Black, Offset='0,4', Radius=8, Opacity=0.3}">
+            <Border.GestureRecognizers>
+                <TapGestureRecognizer Command="{Binding ToggleCommand}" />
+            </Border.GestureRecognizers>
+            <Grid HorizontalOptions="Center" VerticalOptions="Center">
+                <Label FontFamily="MaterialIcons"
+                       Text="{Binding Engine.IsRunning, Converter={toolkit:BoolToObjectConverter TrueObject='&#xe047;', FalseObject='&#xe037;'}}"
+                       TextColor="White" FontSize="26"
+                       HorizontalOptions="Center" VerticalOptions="Center"
+                       IsVisible="{Binding Engine.IsBusy, Converter={toolkit:InvertedBoolConverter}}" />
+
+                <ActivityIndicator IsRunning="{Binding Engine.IsBusy}"
+                                   IsVisible="{Binding Engine.IsBusy}"
+                                   Color="White" WidthRequest="26" HeightRequest="26"
+                                   HorizontalOptions="Center" VerticalOptions="Center" />
+            </Grid>
+        </Border>
+
+        <!-- 切换日志页面时的平滑载入等待动画 -->
+        <Grid IsVisible="{Binding IsLoading}"
+              BackgroundColor="{AppThemeBinding Light=#90FFFFFF, Dark=#90000000}">
+            <Border HorizontalOptions="Center" VerticalOptions="Center"
+                    BackgroundColor="{AppThemeBinding Light=White, Dark=#1F2937}"
+                    Stroke="{AppThemeBinding Light=#E5E7EB, Dark=#374151}"
+                    StrokeShape="RoundRectangle 12"
+                    Padding="20,16"
+                    Shadow="{Shadow Brush=Black, Offset='0,4', Radius=12, Opacity=0.2}">
+                <VerticalStackLayout Spacing="8" HorizontalOptions="Center">
+                    <ActivityIndicator IsRunning="{Binding IsLoading}" Color="#512BD4" WidthRequest="32" HeightRequest="32" HorizontalOptions="Center" />
+                    <Label Text="正在载入日志..." FontSize="13" TextColor="{AppThemeBinding Light=#4B5563, Dark=#D1D5DB}" HorizontalTextAlignment="Center" />
+                </VerticalStackLayout>
+            </Border>
+        </Grid>
+
+        <!-- 全局启停操作等待遮罩 (居中卡片加载动画) -->
+        <Grid IsVisible="{Binding Engine.IsBusy}"
+              BackgroundColor="{AppThemeBinding Light=#70000000, Dark=#90000000}">
+            <Border HorizontalOptions="Center" VerticalOptions="Center"
+                    BackgroundColor="{AppThemeBinding Light=White, Dark=#1F2937}"
+                    Stroke="{AppThemeBinding Light=#E5E7EB, Dark=#374151}"
+                    StrokeShape="RoundRectangle 16"
+                    Padding="24,20" WidthRequest="220"
+                    Shadow="{Shadow Brush=Black, Offset='0,6', Radius=16, Opacity=0.3}">
+                <VerticalStackLayout Spacing="12" HorizontalOptions="Center">
+                    <ActivityIndicator IsRunning="{Binding Engine.IsBusy}" Color="#512BD4"
+                                       WidthRequest="36" HeightRequest="36" HorizontalOptions="Center" />
+                    <Label Text="{Binding Engine.CurrentStatusText}" 
+                           TextColor="{AppThemeBinding Light=#111827, Dark=#F9FAFB}"
+                           FontSize="14" FontAttributes="Bold" HorizontalTextAlignment="Center" />
+                </VerticalStackLayout>
+            </Border>
+        </Grid>
     </Grid>
 
 </ContentPage>

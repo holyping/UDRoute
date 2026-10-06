@@ -34,7 +34,7 @@ public partial class SceneEditViewModel : ObservableObject
     private string _defaultServer = "";
 
     [ObservableProperty]
-    private string _devName = Environment.MachineName;
+    private string _devName = "";
 
     [ObservableProperty]
     private int _regTimeout = Constants.DefaultRegTimeout;
@@ -96,7 +96,9 @@ public partial class SceneEditViewModel : ObservableObject
                 ProxyPort = cfg.Port > 0 ? cfg.Port : Constants.DefaultProxyPort;
                 WanPort = cfg.WanPort;
                 DefaultServer = cfg.Server ?? "";
-                DevName = !string.IsNullOrEmpty(cfg.DevName) ? cfg.DevName : Environment.MachineName;
+                DevName = !string.IsNullOrEmpty(cfg.DevName) && !string.Equals(cfg.DevName, "localhost", StringComparison.OrdinalIgnoreCase) 
+                    ? cfg.DevName 
+                    : "";
                 RegTimeout = cfg.RegTimeout;
                 IdleThreshold = cfg.IdleThreshold;
                 ProbeTimeout = cfg.ProbeTimeout;
@@ -119,23 +121,9 @@ public partial class SceneEditViewModel : ObservableObject
             }
         }
 
-        // 默认初始化一个空的示范规则
-        ClientItems.Add(new ClientItemViewModel
-        {
-            Port = 15389,
-            TargetName = "rdp",
-            TargetServer = "",
-            PlaceholderServer = string.IsNullOrWhiteSpace(DefaultServer) ? "未设置默认服务器" : DefaultServer
-        });
-
-        ServerItems.Add(new ServerItemViewModel
-        {
-            Name = "rdp",
-            TargetIp = "127.0.0.1",
-            TargetPort = 3389,
-            TargetServer = "",
-            PlaceholderServer = string.IsNullOrWhiteSpace(DefaultServer) ? "未设置默认服务器" : DefaultServer
-        });
+        // 新建场境默认规则列表留空，不预置任何规则
+        ClientItems.Clear();
+        ServerItems.Clear();
     }
 
     partial void OnDefaultServerChanged(string value)
@@ -165,8 +153,8 @@ public partial class SceneEditViewModel : ObservableObject
     {
         ClientItems.Add(new ClientItemViewModel
         {
-            Port = 10000 + ClientItems.Count,
-            TargetName = "service" + (ClientItems.Count + 1),
+            Port = null,
+            TargetName = "",
             PlaceholderServer = string.IsNullOrWhiteSpace(DefaultServer) ? "未设置默认服务器" : DefaultServer
         });
     }
@@ -182,9 +170,9 @@ public partial class SceneEditViewModel : ObservableObject
     {
         ServerItems.Add(new ServerItemViewModel
         {
-            Name = "service" + (ServerItems.Count + 1),
+            Name = "",
             TargetIp = "127.0.0.1",
-            TargetPort = 8080,
+            TargetPort = null,
             PlaceholderServer = string.IsNullOrWhiteSpace(DefaultServer) ? "未设置默认服务器" : DefaultServer
         });
     }
@@ -247,7 +235,8 @@ public partial class SceneEditViewModel : ObservableObject
         if (string.IsNullOrWhiteSpace(SceneName))
         {
             ValidationError = "场境名称不能为空";
-            await Application.Current!.MainPage!.DisplayAlert("提示", ValidationError, "确定");
+            if (Application.Current?.Windows.Count > 0 && Application.Current.Windows[0].Page != null)
+                await Application.Current.Windows[0].Page!.DisplayAlert("提示", ValidationError, "确定");
             return;
         }
 
@@ -255,7 +244,8 @@ public partial class SceneEditViewModel : ObservableObject
         if (EnableProxy && (ProxyPort <= 0 || ProxyPort > 65535))
         {
             ValidationError = "P模式监听端口必须在 1 - 65535 范围内";
-            await Application.Current!.MainPage!.DisplayAlert("提示", ValidationError, "确定");
+            if (Application.Current?.Windows.Count > 0 && Application.Current.Windows[0].Page != null)
+                await Application.Current.Windows[0].Page!.DisplayAlert("提示", ValidationError, "确定");
             return;
         }
 
@@ -264,16 +254,18 @@ public partial class SceneEditViewModel : ObservableObject
         {
             if (c.IsEnabled)
             {
-                if (c.Port <= 0 || c.Port > 65535)
+                if (c.Port == null || c.Port <= 0 || c.Port > 65535)
                 {
-                    ValidationError = $"客户端本地端口 [{c.Port}] 不合法 (需在 1-65535)";
-                    await Application.Current!.MainPage!.DisplayAlert("提示", ValidationError, "确定");
+                    ValidationError = $"客户端本地端口不能为空且需在 1-65535 范围内";
+                    if (Application.Current?.Windows.Count > 0 && Application.Current.Windows[0].Page != null)
+                        await Application.Current.Windows[0].Page!.DisplayAlert("提示", ValidationError, "确定");
                     return;
                 }
                 if (string.IsNullOrWhiteSpace(c.TargetName))
                 {
                     ValidationError = "客户端目标服务名称不能为空";
-                    await Application.Current!.MainPage!.DisplayAlert("提示", ValidationError, "确定");
+                    if (Application.Current?.Windows.Count > 0 && Application.Current.Windows[0].Page != null)
+                        await Application.Current.Windows[0].Page!.DisplayAlert("提示", ValidationError, "确定");
                     return;
                 }
             }
@@ -287,19 +279,22 @@ public partial class SceneEditViewModel : ObservableObject
                 if (string.IsNullOrWhiteSpace(s.Name))
                 {
                     ValidationError = "服务端暴露服务名不能为空";
-                    await Application.Current!.MainPage!.DisplayAlert("提示", ValidationError, "确定");
+                    if (Application.Current?.Windows.Count > 0 && Application.Current.Windows[0].Page != null)
+                        await Application.Current.Windows[0].Page!.DisplayAlert("提示", ValidationError, "确定");
                     return;
                 }
-                if (s.TargetPort <= 0 || s.TargetPort > 65535)
+                if (s.TargetPort == null || s.TargetPort <= 0 || s.TargetPort > 65535)
                 {
-                    ValidationError = $"服务端目标端口 [{s.TargetPort}] 不合法 (需在 1-65535)";
-                    await Application.Current!.MainPage!.DisplayAlert("提示", ValidationError, "确定");
+                    ValidationError = $"服务端目标端口不能为空且需在 1-65535 范围内";
+                    if (Application.Current?.Windows.Count > 0 && Application.Current.Windows[0].Page != null)
+                        await Application.Current.Windows[0].Page!.DisplayAlert("提示", ValidationError, "确定");
                     return;
                 }
                 if (string.IsNullOrWhiteSpace(s.TargetIp))
                 {
                     ValidationError = $"服务 [{s.Name}] 的目标IP不能为空";
-                    await Application.Current!.MainPage!.DisplayAlert("提示", ValidationError, "确定");
+                    if (Application.Current?.Windows.Count > 0 && Application.Current.Windows[0].Page != null)
+                        await Application.Current.Windows[0].Page!.DisplayAlert("提示", ValidationError, "确定");
                     return;
                 }
             }
@@ -334,7 +329,8 @@ public partial class SceneEditViewModel : ObservableObject
             _db.Scenes.Insert(scene);
         }
 
-        await Application.Current!.MainPage!.DisplayAlert("成功", "场境配置已保存", "确定");
+        if (Application.Current?.Windows.Count > 0 && Application.Current.Windows[0].Page != null)
+            await Application.Current.Windows[0].Page!.DisplayAlert("成功", "场境配置已保存", "确定");
         await Shell.Current.GoToAsync("..");
     }
 

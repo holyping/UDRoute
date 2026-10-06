@@ -37,13 +37,18 @@ public partial class HomeViewModel : ObservableObject
     public void LoadScenes()
     {
         _allScenes = _db.Scenes.FindAll().ToList();
-        if (_allScenes.Count == 0)
+        // 自动清理此前遗留的无实际业务配置的空白示例场境（家庭网络/公司内网）
+        var legacySampleScenes = _allScenes.Where(s => (s.Name == "家庭网络" || s.Name == "公司内网")
+            && (s.Config.ClientRecords == null || s.Config.ClientRecords.Count == 0)
+            && (s.Config.ServerRecords == null || s.Config.ServerRecords.Count == 0)
+            && !s.Config.EnableProxy).ToList();
+        if (legacySampleScenes.Count > 0)
         {
-            var defaultScene1 = new Scene { Name = "家庭网络", IsSelected = true };
-            var defaultScene2 = new Scene { Name = "公司内网", IsSelected = false };
-            _db.Scenes.Insert(defaultScene1);
-            _db.Scenes.Insert(defaultScene2);
-            _allScenes = new List<Scene> { defaultScene1, defaultScene2 };
+            foreach (var sample in legacySampleScenes)
+            {
+                _db.Scenes.Delete(sample.Id);
+                _allScenes.Remove(sample);
+            }
         }
 
         FilterScenes();
@@ -62,14 +67,60 @@ public partial class HomeViewModel : ObservableObject
 
     private void FilterScenes()
     {
-        Scenes.Clear();
         var filtered = string.IsNullOrWhiteSpace(SearchText) 
             ? _allScenes 
             : _allScenes.Where(s => s.Name.Contains(SearchText, StringComparison.OrdinalIgnoreCase)).ToList();
 
-        foreach (var s in filtered)
+        var existingIds = Scenes.Select(s => s.Id).ToList();
+        var targetIds = filtered.Select(s => s.Id).ToList();
+
+        if (existingIds.SequenceEqual(targetIds))
         {
-            Scenes.Add(s);
+            for (int i = 0; i < filtered.Count; i++)
+            {
+                if (Scenes[i].Name != filtered[i].Name)
+                    Scenes[i].Name = filtered[i].Name;
+                if (Scenes[i].IsSelected != filtered[i].IsSelected)
+                    Scenes[i].IsSelected = filtered[i].IsSelected;
+                Scenes[i].Config = filtered[i].Config;
+            }
+            return;
+        }
+
+        for (int i = Scenes.Count - 1; i >= 0; i--)
+        {
+            if (!targetIds.Contains(Scenes[i].Id))
+            {
+                Scenes.RemoveAt(i);
+            }
+        }
+
+        for (int i = 0; i < filtered.Count; i++)
+        {
+            var item = filtered[i];
+            int existingIndex = -1;
+            for (int j = 0; j < Scenes.Count; j++)
+            {
+                if (Scenes[j].Id == item.Id) { existingIndex = j; break; }
+            }
+
+            if (existingIndex == -1)
+            {
+                if (i < Scenes.Count)
+                    Scenes.Insert(i, item);
+                else
+                    Scenes.Add(item);
+            }
+            else
+            {
+                Scenes[existingIndex].Name = item.Name;
+                Scenes[existingIndex].IsSelected = item.IsSelected;
+                Scenes[existingIndex].Config = item.Config;
+                if (existingIndex != i && i < Scenes.Count)
+                {
+                    Scenes.Move(existingIndex, i);
+                }
+            }
         }
     }
 
@@ -239,6 +290,8 @@ public partial class HomeViewModel : ObservableObject
     [RelayCommand]
     private async Task ToggleAsync()
     {
+        if (Engine.IsBusy) return;
+
         if (!Engine.IsRunning)
         {
             if (SelectedScene == null)
@@ -251,7 +304,7 @@ public partial class HomeViewModel : ObservableObject
         }
         else
         {
-            Engine.Stop();
+            await Engine.StopAsync();
         }
     }
 }

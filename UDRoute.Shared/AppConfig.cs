@@ -23,7 +23,7 @@ namespace UDRoute
         public int WanPort { get; set; } // 默认0表示未配置外网NAT端口映射，仅在显式配置时生效
         public string Server { get; set; } = ""; // 默认中转锚点服务器
         public int RegTimeout { get; set; } = Constants.DefaultRegTimeout;
-        public string DevName { get; set; } = Environment.MachineName;
+        public string DevName { get; set; } = "";
         public Guid DevId { get; set; }
         public Guid InstanceId { get; } = Guid.NewGuid(); // 实例运行时唯一随机ID (防止复制ini导致的DevId重复，用于打洞防自环)
 

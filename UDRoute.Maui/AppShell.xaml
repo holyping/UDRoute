@@ -4,16 +4,26 @@
     xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
     xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
     xmlns:views="clr-namespace:UDRoute.Maui.Views"
+    xmlns:helpers="clr-namespace:UDRoute.Maui.Helpers"
     Title="UDRoute">
 
     <TabBar>
         <Tab Title="场境">
+            <Tab.Icon>
+                <FontImageSource FontFamily="MaterialIcons" Glyph="{x:Static helpers:MaterialIconCodes.Router}" Size="24" />
+            </Tab.Icon>
             <ShellContent ContentTemplate="{DataTemplate views:HomePage}" Route="HomePage" />
         </Tab>
         <Tab Title="状态">
+            <Tab.Icon>
+                <FontImageSource FontFamily="MaterialIcons" Glyph="{x:Static helpers:MaterialIconCodes.Timeline}" Size="24" />
+            </Tab.Icon>
             <ShellContent ContentTemplate="{DataTemplate views:StatusPage}" Route="StatusPage" />
         </Tab>
         <Tab Title="日志">
+            <Tab.Icon>
+                <FontImageSource FontFamily="MaterialIcons" Glyph="{x:Static helpers:MaterialIconCodes.Terminal}" Size="24" />
+            </Tab.Icon>
             <ShellContent ContentTemplate="{DataTemplate views:LogPage}" Route="LogPage" />
         </Tab>
     </TabBar>

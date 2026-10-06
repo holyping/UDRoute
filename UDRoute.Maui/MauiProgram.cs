@@ -20,7 +20,15 @@ public static class MauiProgram
 			{
 				fonts.AddFont("OpenSans-Regular.ttf", "OpenSansRegular");
 				fonts.AddFont("OpenSans-Semibold.ttf", "OpenSansSemibold");
+				fonts.AddFont("MaterialIcons-Regular.ttf", "MaterialIcons");
 			});
+
+        // 注册并初始化全局 Logger (将所有 Log.* 收集至内存环形缓冲区，供 LogPage 随时查看)
+        var mauiLogger = new UDRoute.Maui.Services.MauiLogger();
+        UDRoute.Logging.Log.SetLogger(mauiLogger);
+        UDRoute.Logging.Log.LoggerFactory = (cfg, isService) => mauiLogger;
+        UDRoute.Logging.Log.Level = mauiLogger.Level;
+        builder.Services.AddSingleton(mauiLogger);
 
         // 注册数据库上下文 (存储于 AppData 目录)
         string dbPath = Path.Combine(FileSystem.AppDataDirectory, "udroute.db");

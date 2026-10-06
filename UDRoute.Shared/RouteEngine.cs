@@ -115,7 +115,7 @@ namespace UDRoute
                                 if (_server != null)
                                 {
                                     byte[] rCopy = mem.ToArray();
-                                    _ = _server.ProcessRelayStartAsync(rCopy, remoteEp, ct);
+                                    await _server.ProcessRelayStartAsync(rCopy, remoteEp, ct);
                                 }
                                 break;
 

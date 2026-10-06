@@ -731,6 +731,7 @@ namespace UDRoute
                                 byte[] relayCopy = relayStartBuf.AsSpan(0, offset).ToArray();
                                 var relayTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
                                 _pendingProbes[relayContextId] = relayTcs;
+                                await _udp.SendAsync(relayCopy, sInfo.PublicEp, ct);
                                 _ = Task.Run(async () =>
                                 {
                                     try

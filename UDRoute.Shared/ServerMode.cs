@@ -533,6 +533,10 @@ namespace UDRoute
                             session.PasswordHash = rec.AccessPassword;
                             session.ForceRelay = false;
                             if (rec.AccessPassword == null || rec.AccessPassword.Length == 0) session.AuthTcs.TrySetResult(true);
+                            if (!rec.IsTcp)
+                            {
+                                SetupUdpMultiplexForwarder(session, rec, sessionId);
+                            }
                             _sessions[sessionId] = session;
                         }
                     }
@@ -630,6 +634,10 @@ namespace UDRoute
                                 session.ProxyEp = remoteEp;
                                 session.ForceRelay = clientForceRelay;
                                 if (rec.AccessPassword == null || rec.AccessPassword.Length == 0) session.AuthTcs.TrySetResult(true);
+                                if (!rec.IsTcp)
+                                {
+                                    SetupUdpMultiplexForwarder(session, rec, sessionId);
+                                }
                                 _sessions[sessionId] = session;
                                 sessionToRun = session;
                             }
@@ -766,111 +774,114 @@ namespace UDRoute
             }
             else
             {
-                var channelSockets = new Dictionary<uint, UdpChannelEntry>();
-                var targetEp = new IPEndPoint(IPAddress.Parse(rec.TargetIp), rec.TargetPort);
-                Log.Info($"[S] Started Target UDP multiplex forwarder to {rec.TargetIp}:{rec.TargetPort} for Session {sessionId}");
-
-                session.OnIncomingUdpPacket = async (channelId, data) =>
-                {
-                    try
-                    {
-                        UdpChannelEntry? entry;
-                        lock (channelSockets)
-                        {
-                            if (!channelSockets.TryGetValue(channelId, out entry))
-                            {
-                                var targetSocket = new ZeroCopyUdpSocket(0);
-                                entry = new UdpChannelEntry(targetSocket);
-                                channelSockets[channelId] = entry;
-                                session.IncrementActiveChannel();
-
-                                _ = Task.Run(async () =>
-                                {
-                                    byte[] recvBuf = ArrayPool<byte>.Shared.Rent(rec.Mtu);
-                                    try
-                                    {
-                                        while (!session.SessionToken.IsCancellationRequested)
-                                        {
-                                            var (readLen, _) = await targetSocket.ReceiveAsync(recvBuf, session.SessionToken);
-                                            if (readLen <= 0) break;
-
-                                            byte[] respCopy = recvBuf.AsSpan(0, readLen).ToArray();
-                                            await session.SendUdpDataAsync(channelId, respCopy, session.SessionToken);
-                                        }
-                                    }
-                                    catch { }
-                                    finally
-                                    {
-                                        ArrayPool<byte>.Shared.Return(recvBuf);
-                                        lock (channelSockets)
-                                        {
-                                            if (channelSockets.TryGetValue(channelId, out var cur) && ReferenceEquals(cur, entry))
-                                            {
-                                                channelSockets.Remove(channelId);
-                                                session.DecrementActiveChannel();
-                                                targetSocket.Dispose();
-                                            }
-                                        }
-                                    }
-                                }, session.SessionToken);
-                            }
-                        }
-
-                        entry.LastActive = Environment.TickCount64;
-                        await entry.Socket.SendAsync(data, targetEp, session.SessionToken);
-                    }
-                    catch (Exception ex)
-                    {
-                        Log.Debug($"[S] UDP channel {channelId} target send error: {ex.Message}");
-                    }
-                };
-
-                session.OnUdpChannelClosed = (channelId) =>
-                {
-                    lock (channelSockets)
-                    {
-                        if (channelSockets.Remove(channelId, out var entry))
-                        {
-                            session.DecrementActiveChannel();
-                            entry.Socket.Dispose();
-                        }
-                    }
-                };
-
-                _ = Task.Run(async () =>
-                {
-                    int timeoutMs = (rec.Timeout > 0 ? rec.Timeout : (session.ReuseInterval > 0 && session.ReuseInterval < 60 ? session.ReuseInterval : 60)) * 1000;
-                    int checkInterval = Math.Min(1000, Math.Max(200, timeoutMs / 2));
-                    while (!session.SessionToken.IsCancellationRequested)
-                    {
-                        await Task.Delay(checkInterval, session.SessionToken).ConfigureAwait(false);
-                        long now = Environment.TickCount64;
-                        List<KeyValuePair<uint, UdpChannelEntry>> expired = new();
-                        lock (channelSockets)
-                        {
-                            foreach (var kvp in channelSockets)
-                            {
-                                if (now - kvp.Value.LastActive > timeoutMs)
-                                {
-                                    expired.Add(kvp);
-                                }
-                            }
-                            foreach (var kvp in expired)
-                            {
-                                if (channelSockets.TryGetValue(kvp.Key, out var cur) && ReferenceEquals(cur, kvp.Value))
-                                {
-                                    channelSockets.Remove(kvp.Key);
-                                    session.DecrementActiveChannel();
-                                    kvp.Value.Socket.Dispose();
-                                    _ = session.SendUdpCloseAsync(kvp.Key, session.SessionToken);
-                                }
-                            }
-                        }
-                    }
-                }, session.SessionToken);
-
                 await session.SessionClosedTask;
             }
+        }
+
+        private void SetupUdpMultiplexForwarder(TunnelSession session, ServerRecord rec, Guid sessionId)
+        {
+            var channelSockets = new Dictionary<uint, UdpChannelEntry>();
+            var targetEp = new IPEndPoint(IPAddress.Parse(rec.TargetIp), rec.TargetPort);
+            Log.Info($"[S] Started Target UDP multiplex forwarder to {rec.TargetIp}:{rec.TargetPort} for Session {sessionId}");
+
+            session.OnIncomingUdpPacket = async (channelId, data) =>
+            {
+                try
+                {
+                    UdpChannelEntry? entry;
+                    lock (channelSockets)
+                    {
+                        if (!channelSockets.TryGetValue(channelId, out entry))
+                        {
+                            var targetSocket = new ZeroCopyUdpSocket(0);
+                            entry = new UdpChannelEntry(targetSocket);
+                            channelSockets[channelId] = entry;
+                            session.IncrementActiveChannel();
+
+                            _ = Task.Run(async () =>
+                            {
+                                byte[] recvBuf = ArrayPool<byte>.Shared.Rent(rec.Mtu);
+                                try
+                                {
+                                    while (!session.SessionToken.IsCancellationRequested)
+                                    {
+                                        var (readLen, _) = await targetSocket.ReceiveAsync(recvBuf, session.SessionToken);
+                                        if (readLen <= 0) break;
+
+                                        byte[] respCopy = recvBuf.AsSpan(0, readLen).ToArray();
+                                        await session.SendUdpDataAsync(channelId, respCopy, session.SessionToken);
+                                    }
+                                }
+                                catch { }
+                                finally
+                                {
+                                    ArrayPool<byte>.Shared.Return(recvBuf);
+                                    lock (channelSockets)
+                                    {
+                                        if (channelSockets.TryGetValue(channelId, out var cur) && ReferenceEquals(cur, entry))
+                                        {
+                                            channelSockets.Remove(channelId);
+                                            session.DecrementActiveChannel();
+                                            targetSocket.Dispose();
+                                        }
+                                    }
+                                }
+                            }, session.SessionToken);
+                        }
+                    }
+
+                    entry.LastActive = Environment.TickCount64;
+                    await entry.Socket.SendAsync(data, targetEp, session.SessionToken);
+                }
+                catch (Exception ex)
+                {
+                    Log.Debug($"[S] UDP channel {channelId} target send error: {ex.Message}");
+                }
+            };
+
+            session.OnUdpChannelClosed = (channelId) =>
+            {
+                lock (channelSockets)
+                {
+                    if (channelSockets.Remove(channelId, out var entry))
+                    {
+                        session.DecrementActiveChannel();
+                        entry.Socket.Dispose();
+                    }
+                }
+            };
+
+            _ = Task.Run(async () =>
+            {
+                int timeoutMs = (rec.Timeout > 0 ? rec.Timeout : (session.ReuseInterval > 0 && session.ReuseInterval < 60 ? session.ReuseInterval : 60)) * 1000;
+                int checkInterval = Math.Min(1000, Math.Max(200, timeoutMs / 2));
+                while (!session.SessionToken.IsCancellationRequested)
+                {
+                    await Task.Delay(checkInterval, session.SessionToken).ConfigureAwait(false);
+                    long now = Environment.TickCount64;
+                    List<KeyValuePair<uint, UdpChannelEntry>> expired = new();
+                    lock (channelSockets)
+                    {
+                        foreach (var kvp in channelSockets)
+                        {
+                            if (now - kvp.Value.LastActive > timeoutMs)
+                            {
+                                expired.Add(kvp);
+                            }
+                        }
+                        foreach (var kvp in expired)
+                        {
+                            if (channelSockets.TryGetValue(kvp.Key, out var cur) && ReferenceEquals(cur, kvp.Value))
+                            {
+                                channelSockets.Remove(kvp.Key);
+                                session.DecrementActiveChannel();
+                                kvp.Value.Socket.Dispose();
+                                _ = session.SendUdpCloseAsync(kvp.Key, session.SessionToken);
+                            }
+                        }
+                    }
+                }
+            }, session.SessionToken);
         }
 
                                 public async ValueTask<bool> TryHandlePunchAsync(Guid sessionId, Guid peerInstanceId, EndPoint remoteEp, byte status, CancellationToken ct)
@@ -900,8 +911,8 @@ namespace UDRoute
 
                 string statusDesc = status switch
                 {
-                    PunchStatus.PunchReq => "PunchReq(打洞请求)",
-                    PunchStatus.PunchAck => "PunchAck(打洞确认)",
+                    PunchStatus.PunchReq => "PunchReq",
+                    PunchStatus.PunchAck => "PunchAck",
                     _ => $"Status={status}"
                 };
 

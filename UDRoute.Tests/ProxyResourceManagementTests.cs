@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
@@ -816,6 +816,10 @@ public class ProxyResourceManagementTests
             Assert.Equal(msg2, recv2);
             _out.WriteLine("Verified: C automatically recovered from S restart and transferred data!");
         }
+        sEngine2.Dispose();
+        cEngine.Dispose();
+        pEngine.Dispose();
+        cts.Cancel();
     }
 
     [Fact]
@@ -1162,6 +1166,9 @@ public class ProxyResourceManagementTests
 
         _out.WriteLine("Verified: Client cleanly recovered after server restart while tunnel was idle.");
         sEngine2.Dispose();
+        cEngine.Dispose();
+        pEngine.Dispose();
+        cts.Cancel();
     }
 }
 

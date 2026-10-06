@@ -281,8 +281,8 @@ namespace UDRoute
 
                 string statusDesc = status switch
                 {
-                    PunchStatus.PunchReq => "PunchReq(打洞请求)",
-                    PunchStatus.PunchAck => "PunchAck(打洞确认)",
+                    PunchStatus.PunchReq => "PunchReq",
+                    PunchStatus.PunchAck => "PunchAck",
                     _ => $"Status={status}"
                 };
 
@@ -441,75 +441,82 @@ namespace UDRoute
                 throw;
             }
 
-            string queryName = rec.TargetName.EndsWith("/tcp", StringComparison.OrdinalIgnoreCase) || rec.TargetName.EndsWith("/udp", StringComparison.OrdinalIgnoreCase)
-                ? rec.TargetName
-                : $"{rec.TargetName}/tcp";
-
-            Log.Info($"[C] TCP listening on port {rec.Port} -> {queryName}@{rec.TargetServer}");
-
-            while (!ct.IsCancellationRequested)
+            try
             {
-                try
+                string queryName = rec.TargetName.EndsWith("/tcp", StringComparison.OrdinalIgnoreCase) || rec.TargetName.EndsWith("/udp", StringComparison.OrdinalIgnoreCase)
+                    ? rec.TargetName
+                    : $"{rec.TargetName}/tcp";
+
+                Log.Info($"[C] TCP listening on port {rec.Port} -> {queryName}@{rec.TargetServer}");
+
+                while (!ct.IsCancellationRequested)
                 {
-                    var client = await listener.AcceptTcpClientAsync(ct);
-
-                    _ = Task.Run(async () =>
+                    try
                     {
-                        try
-                        {
-                            for (int retry = 0; retry < 2; retry++)
-                            {
-                                var session = await GetOrCreateTunnelSessionAsync(rec, queryName, ct, forceNew: retry > 0);
-                                if (session == null)
-                                {
-                                    client.Close();
-                                    return;
-                                }
+                        var client = await listener.AcceptTcpClientAsync(ct);
 
-                                try
+                        _ = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                for (int retry = 0; retry < 2; retry++)
                                 {
-                                    await session.OpenAndBridgeChannelAsync(client, ct);
-                                    break;
-                                }
-                                catch (Exception ex) when (retry == 0)
-                                {
-                                    Log.Warn($"[C] Data tunnel {session.SessionId} failed to open channel: {ex.Message}. Evicting stale tunnel and retrying with a fresh session...");
-                                    string tunnelKey = $"{rec.TargetServer}@{queryName}";
-                                    lock (_tunnelStateLock)
+                                    var session = await GetOrCreateTunnelSessionAsync(rec, queryName, ct, forceNew: retry > 0);
+                                    if (session == null)
                                     {
-                                        if (_reusableTunnels.TryGetValue(tunnelKey, out var curr) && ReferenceEquals(curr, session))
-                                        {
-                                            _reusableTunnels.Remove(tunnelKey);
-                                        }
+                                        client.Close();
+                                        return;
                                     }
-                                    lock (_sessionLock)
+
+                                    try
                                     {
-                                        if (_sessions.TryGetValue(session.SessionId, out var curS) && ReferenceEquals(curS, session))
-                                        {
-                                            _sessions.Remove(session.SessionId);
-                                        }
+                                        await session.OpenAndBridgeChannelAsync(client, ct);
+                                        break;
                                     }
-                                    session.Dispose();
-                                    continue;
+                                    catch (Exception ex) when (retry == 0)
+                                    {
+                                        Log.Warn($"[C] Data tunnel {session.SessionId} failed to open channel: {ex.Message}. Evicting stale tunnel and retrying with a fresh session...");
+                                        string tunnelKey = $"{rec.TargetServer}@{queryName}";
+                                        lock (_tunnelStateLock)
+                                        {
+                                            if (_reusableTunnels.TryGetValue(tunnelKey, out var curr) && ReferenceEquals(curr, session))
+                                            {
+                                                _reusableTunnels.Remove(tunnelKey);
+                                            }
+                                        }
+                                        lock (_sessionLock)
+                                        {
+                                            if (_sessions.TryGetValue(session.SessionId, out var cur) && ReferenceEquals(cur, session))
+                                            {
+                                                _sessions.Remove(session.SessionId);
+                                            }
+                                        }
+                                        session.Dispose();
+                                        continue;
+                                    }
                                 }
                             }
-                        }
-                        catch (Exception ex)
-                        {
-                            Log.Debug($"[C] TCP bridge error: {ex.Message}");
-                            client.Close();
-                        }
-                    }, ct);
+                            catch (Exception ex)
+                            {
+                                Log.Debug($"[C] TCP bridge error: {ex.Message}");
+                                client.Close();
+                            }
+                        }, ct);
+                    }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                    {
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error($"[C] Accept TCP error: {ex.Message}");
+                        await Task.Delay(100, ct);
+                    }
                 }
-                catch (OperationCanceledException) when (ct.IsCancellationRequested)
-                {
-                    break;
-                }
-                catch (Exception ex)
-                {
-                    Log.Error($"[C] Accept TCP error: {ex.Message}");
-                    await Task.Delay(100, ct);
-                }
+            }
+            finally
+            {
+                try { listener.Stop(); } catch { }
             }
         }
 

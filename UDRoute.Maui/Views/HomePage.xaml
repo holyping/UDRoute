@@ -25,15 +25,24 @@
                     <!-- 按名称查询输入框 -->
                     <SearchBar Text="{Binding SearchText}" Placeholder="按名称查询场境..." HorizontalOptions="Fill" />
                     
-                    <!-- “增加”按钮 (点击弹出下拉菜单) -->
-                    <Button Grid.Column="1" Text="+ 增加" Command="{Binding ToggleAddMenuCommand}" 
-                            BackgroundColor="#512BD4" TextColor="White" FontAttributes="Bold" CornerRadius="8" 
-                            HeightRequest="38" Padding="14,0" />
+                    <!-- “增加”按钮 (Material Icons 字体图标，点击弹出下拉菜单) -->
+                    <Button Grid.Column="1" FontFamily="MaterialIcons" Text="&#xe145;" Command="{Binding ToggleAddMenuCommand}" 
+                            BackgroundColor="#512BD4" TextColor="White" CornerRadius="8" 
+                            WidthRequest="38" HeightRequest="38" Padding="0" FontSize="20" />
                 </Grid>
             </Border>
 
             <!-- 2. 场境列表 -->
             <CollectionView Grid.Row="1" ItemsSource="{Binding Scenes}" SelectionMode="None" Margin="10,0">
+                <CollectionView.EmptyView>
+                    <VerticalStackLayout HorizontalOptions="Center" VerticalOptions="Center" Spacing="8" Margin="40">
+                        <Label Text="🌐" FontSize="44" HorizontalOptions="Center" />
+                        <Label Text="暂无场境配置" FontAttributes="Bold" FontSize="15" HorizontalOptions="Center" 
+                               TextColor="{AppThemeBinding Light=#64748B, Dark=#94A3B8}" />
+                        <Label Text="点击右上角「+ 增加」即可新建或扫码导入场境" FontSize="12" HorizontalOptions="Center" 
+                               TextColor="{AppThemeBinding Light=#94A3B8, Dark=#64748B}" />
+                    </VerticalStackLayout>
+                </CollectionView.EmptyView>
                 <CollectionView.ItemTemplate>
                     <DataTemplate x:DataType="models:Scene">
                         <!-- 使用 SwipeView 支持侧滑手势 -->
@@ -73,12 +82,12 @@
                                                FontSize="11" TextColor="{Binding IsSelected, Converter={toolkit:BoolToObjectConverter TrueObject='#10B981', FalseObject='Gray'}}" />
                                     </VerticalStackLayout>
 
-                                    <!-- 每项右边的“分享”按钮 (转到新页面显示二维码) -->
-                                    <Button Grid.Column="2" Text="分享" 
+                                    <!-- 每项右边的“分享”按钮 (Material Icons 字体图标，转到新页面显示二维码) -->
+                                    <Button Grid.Column="2" FontFamily="MaterialIcons" Text="&#xe80d;" 
                                             Command="{Binding Source={RelativeSource AncestorType={x:Type viewmodels:HomeViewModel}}, Path=ShareSceneCommand}" 
                                             CommandParameter="{Binding .}" 
                                             BackgroundColor="#3B82F6" TextColor="White" 
-                                            CornerRadius="8" HeightRequest="36" Padding="12,0" FontSize="13" />
+                                            CornerRadius="8" WidthRequest="36" HeightRequest="36" Padding="0" FontSize="18" />
                                 </Grid>
                             </Border>
                         </SwipeView>
@@ -86,29 +95,40 @@
                 </CollectionView.ItemTemplate>
             </CollectionView>
 
-            <!-- 3. 屏幕下方 Footer (状态展示 + 启停按钮) -->
-            <Border Grid.Row="2" Padding="20,12" 
+            <!-- 3. 屏幕下方 Footer (状态与常时动态计算的 Ping 值) -->
+            <Border Grid.Row="2" Padding="16,8" 
                     BackgroundColor="{AppThemeBinding Light=#F9FAFB, Dark=#1F2937}"
                     Stroke="{AppThemeBinding Light=#E5E7EB, Dark=#374151}" StrokeThickness="1">
-                <Grid ColumnDefinitions="*,Auto" VerticalOptions="Center">
-                    
-                    <!-- 左侧状态与常时动态计算的 Ping 值 -->
-                    <VerticalStackLayout Grid.Column="0" VerticalOptions="Center" Spacing="2">
-                        <Label Text="{Binding Engine.CurrentStatusText}" FontSize="15" FontAttributes="Bold" />
-                        <Label Text="{Binding Engine.CurrentPingText}" FontSize="12" TextColor="#6B7280" />
-                    </VerticalStackLayout>
-
-                    <!-- 启停按钮：停止时播放图标，启动时停止图标 -->
-                    <Button Grid.Column="1" 
-                            Text="{Binding Engine.IsRunning, Converter={toolkit:BoolToObjectConverter TrueObject='⏹ 停止', FalseObject='▶ 启动'}}"
-                            Command="{Binding ToggleCommand}" 
-                            BackgroundColor="{Binding Engine.IsRunning, Converter={toolkit:BoolToObjectConverter TrueObject='#EF4444', FalseObject='#10B981'}}"
-                            TextColor="White" FontAttributes="Bold" FontSize="14"
-                            CornerRadius="20" HeightRequest="40" Padding="16,0" />
+                <Grid ColumnDefinitions="*,Auto" Margin="0,0,70,0" VerticalOptions="Center">
+                    <Label Grid.Column="0" Text="{Binding Engine.CurrentStatusText}" FontSize="12" FontAttributes="Bold" VerticalOptions="Center" />
+                    <Label Grid.Column="1" Text="{Binding Engine.CurrentPingText}" FontSize="11" TextColor="#6B7280" VerticalOptions="Center" />
                 </Grid>
             </Border>
 
         </Grid>
+
+        <!-- 浮动启停按钮 (FAB，带等待动画，与日志页完全一致) -->
+        <Border HorizontalOptions="End" VerticalOptions="End"
+                Margin="20,0,20,40" WidthRequest="56" HeightRequest="56"
+                StrokeShape="RoundRectangle 28" Stroke="Transparent"
+                BackgroundColor="{Binding Engine.IsRunning, Converter={toolkit:BoolToObjectConverter TrueObject='#EF4444', FalseObject='#10B981'}}"
+                Shadow="{Shadow Brush=Black, Offset='0,4', Radius=8, Opacity=0.3}">
+            <Border.GestureRecognizers>
+                <TapGestureRecognizer Command="{Binding ToggleCommand}" />
+            </Border.GestureRecognizers>
+            <Grid HorizontalOptions="Center" VerticalOptions="Center">
+                <Label FontFamily="MaterialIcons"
+                       Text="{Binding Engine.IsRunning, Converter={toolkit:BoolToObjectConverter TrueObject='&#xe047;', FalseObject='&#xe037;'}}"
+                       TextColor="White" FontSize="26"
+                       HorizontalOptions="Center" VerticalOptions="Center"
+                       IsVisible="{Binding Engine.IsBusy, Converter={toolkit:InvertedBoolConverter}}" />
+
+                <ActivityIndicator IsRunning="{Binding Engine.IsBusy}"
+                                   IsVisible="{Binding Engine.IsBusy}"
+                                   Color="White" WidthRequest="26" HeightRequest="26"
+                                   HorizontalOptions="Center" VerticalOptions="Center" />
+            </Grid>
+        </Border>
 
         <!-- 4. “增加”按钮点开显示的下拉菜单 (Dropdown Menu Overlay) -->
         <Grid IsVisible="{Binding IsAddMenuVisible}">
@@ -145,6 +165,25 @@
                             BackgroundColor="Transparent" TextColor="{AppThemeBinding Light=#111827, Dark=#F9FAFB}"
                             HorizontalOptions="Fill" HeightRequest="44" CornerRadius="8" Padding="12,0" FontSize="14" />
 
+                </VerticalStackLayout>
+            </Border>
+        </Grid>
+
+        <!-- 5. 全局启停操作等待遮罩 (居中卡片加载动画) -->
+        <Grid IsVisible="{Binding Engine.IsBusy}"
+              BackgroundColor="{AppThemeBinding Light=#70000000, Dark=#90000000}">
+            <Border HorizontalOptions="Center" VerticalOptions="Center"
+                    BackgroundColor="{AppThemeBinding Light=White, Dark=#1F2937}"
+                    Stroke="{AppThemeBinding Light=#E5E7EB, Dark=#374151}"
+                    StrokeShape="RoundRectangle 16"
+                    Padding="24,20" WidthRequest="220"
+                    Shadow="{Shadow Brush=Black, Offset='0,6', Radius=16, Opacity=0.3}">
+                <VerticalStackLayout Spacing="12" HorizontalOptions="Center">
+                    <ActivityIndicator IsRunning="{Binding Engine.IsBusy}" Color="#512BD4"
+                                       WidthRequest="36" HeightRequest="36" HorizontalOptions="Center" />
+                    <Label Text="{Binding Engine.CurrentStatusText}" 
+                           TextColor="{AppThemeBinding Light=#111827, Dark=#F9FAFB}"
+                           FontSize="14" FontAttributes="Bold" HorizontalTextAlignment="Center" />
                 </VerticalStackLayout>
             </Border>
         </Grid>

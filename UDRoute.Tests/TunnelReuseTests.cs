@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Buffers.Binary;
 using System.Diagnostics;
 using System.IO;
@@ -773,7 +773,7 @@ public class TunnelReuseTests
         var cEp = new IPEndPoint(IPAddress.Loopback, cPort);
 
         // 5. Packet 1
-        using (var client1 = new UdpClient())
+        using (var client1 = new UdpClient(0))
         {
             byte[] send1 = Encoding.UTF8.GetBytes("Before UDP Idle Timeout");
             await client1.SendAsync(send1, cEp);
@@ -783,12 +783,12 @@ public class TunnelReuseTests
             Assert.Equal(send1, recv1.Buffer);
         }
 
-        // 6. Wait 3.5s for the 1s client timeout + 2s TunnelReuseInterval to trigger
-        _out.WriteLine("Waiting 3.5s for UDP tunnel idle expiration...");
-        await Task.Delay(3500, cts.Token);
+        // 6. Wait 4.5s for the 1s client timeout + 2s TunnelReuseInterval to trigger cleanly
+        _out.WriteLine("Waiting 4.5s for UDP tunnel idle expiration...");
+        await Task.Delay(4500, cts.Token);
 
         // 7. Packet 2: New tunnel established cleanly after old one expired
-        using (var client2 = new UdpClient())
+        using (var client2 = new UdpClient(0))
         {
             byte[] send2 = Encoding.UTF8.GetBytes("After UDP Idle Timeout Reconnect");
             await client2.SendAsync(send2, cEp);
