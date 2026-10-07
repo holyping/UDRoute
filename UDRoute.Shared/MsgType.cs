@@ -19,7 +19,9 @@ namespace UDRoute
         RelayEnd = 13,
         RelayStartAck = 14,
         NatTestReq = 15,
-        NatTestResp = 16
+        NatTestResp = 16,
+        ServerIpsReq = 17,
+        ServerIpsResp = 18
     }
 
     public static class NatTestFlags

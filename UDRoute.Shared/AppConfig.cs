@@ -28,6 +28,7 @@ namespace UDRoute
         public Guid InstanceId { get; } = Guid.NewGuid(); // 实例运行时唯一随机ID (防止复制ini导致的DevId重复，用于打洞防自环)
 
         public bool EnableProxy { get; set; }
+        public bool DisableIPv6 { get; set; } // 全局禁用 IPv6 支持
 
         public Logging.LogLevel LogLevel { get; set; } = Logging.LogLevel.Info;
         public Logging.LogType LogType { get; set; } = Logging.LogType.Default;

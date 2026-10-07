@@ -1,0 +1,15 @@
+E:\mydocs\Visual Studio 18\Projects\udroute\FixApp\bin\Debug\net10.0\FixApp.exe
+E:\mydocs\Visual Studio 18\Projects\udroute\FixApp\bin\Debug\net10.0\FixApp.deps.json
+E:\mydocs\Visual Studio 18\Projects\udroute\FixApp\bin\Debug\net10.0\FixApp.runtimeconfig.json
+E:\mydocs\Visual Studio 18\Projects\udroute\FixApp\bin\Debug\net10.0\FixApp.dll
+E:\mydocs\Visual Studio 18\Projects\udroute\FixApp\bin\Debug\net10.0\FixApp.pdb
+E:\mydocs\Visual Studio 18\Projects\udroute\FixApp\obj\Debug\net10.0\FixApp.GeneratedMSBuildEditorConfig.editorconfig
+E:\mydocs\Visual Studio 18\Projects\udroute\FixApp\obj\Debug\net10.0\FixApp.AssemblyInfoInputs.cache
+E:\mydocs\Visual Studio 18\Projects\udroute\FixApp\obj\Debug\net10.0\FixApp.AssemblyInfo.cs
+E:\mydocs\Visual Studio 18\Projects\udroute\FixApp\obj\Debug\net10.0\FixApp.csproj.CoreCompileInputs.cache
+E:\mydocs\Visual Studio 18\Projects\udroute\FixApp\obj\Debug\net10.0\FixApp.sourcelink.json
+E:\mydocs\Visual Studio 18\Projects\udroute\FixApp\obj\Debug\net10.0\FixApp.dll
+E:\mydocs\Visual Studio 18\Projects\udroute\FixApp\obj\Debug\net10.0\refint\FixApp.dll
+E:\mydocs\Visual Studio 18\Projects\udroute\FixApp\obj\Debug\net10.0\FixApp.pdb
+E:\mydocs\Visual Studio 18\Projects\udroute\FixApp\obj\Debug\net10.0\FixApp.genruntimeconfig.cache
+E:\mydocs\Visual Studio 18\Projects\udroute\FixApp\obj\Debug\net10.0\ref\FixApp.dll

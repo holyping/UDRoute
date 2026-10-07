@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using UDRoute.Logging;
@@ -154,7 +155,7 @@ namespace UDRoute
             if (cmd == "-create" || cmd == "-init")
             {
                 string path = args.Length > 1 && !args[1].StartsWith("-") ? args[1] : "udroute.ini";
-                ConfigParser.CreateTemplate(path);
+                CreateTemplate(path);
                 return true;
             }
 
@@ -284,12 +285,44 @@ namespace UDRoute
             }
         }
 
+
+
+        public static void CreateTemplate(string path)
+        {
+            try
+            {
+                if (File.Exists(path)) throw new Exception(I18n.Text($"配置文件 {path} 已存在！", $"Configuration file {path} already exists!"));
+
+                bool isZh = I18n.IsZh;
+                string resName = isZh ? "UDRoute.udroute_template_zh.ini" : "UDRoute.udroute_template_en.ini";
+
+                using var stream = System.Reflection.Assembly.GetExecutingAssembly().GetManifestResourceStream(resName);
+                if (stream == null)
+                {
+                    Console.WriteLine(I18n.Text($"错误: 未找到内置模板资源 ({resName})。", $"Error: Could not find the embedded template resource ({resName})."));
+                    return;
+                }
+                using var reader = new StreamReader(stream, Encoding.UTF8);
+                string template = reader.ReadToEnd();
+
+                // 自动生成一个新的 DevId 写入模板
+                template = template.Replace("{DevId}", Guid.NewGuid().ToString());
+
+                File.WriteAllText(path, template, Encoding.UTF8);
+                Console.WriteLine(I18n.Text($"配置模板已成功写入: {Path.GetFullPath(path)}", $"Configuration template successfully written to: {Path.GetFullPath(path)}"));
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine(I18n.Text($"写入模板出错: {ex.Message}", $"Error writing template: {ex.Message}"));
+            }
+        }
+
         static void InstallService(string name)
         {
             var exe = Process.GetCurrentProcess().MainModule?.FileName;
             if (string.IsNullOrEmpty(exe)) exe = "udroute";
             var ini = name + ".ini";
-            if (!File.Exists(ini)) ConfigParser.CreateTemplate(ini);
+            if (!File.Exists(ini)) CreateTemplate(ini);
             
             string fullExe = Path.GetFullPath(exe);
             string fullIni = Path.GetFullPath(ini);

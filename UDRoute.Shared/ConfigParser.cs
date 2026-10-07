@@ -71,6 +71,11 @@ namespace UDRoute
                 config.ForceRelay = true;
             }
 
+            if (args.Any(a => a.Equals("-disableipv6", StringComparison.OrdinalIgnoreCase)))
+            {
+                config.DisableIPv6 = true;
+            }
+
             ParseCommandLine(args, config);
 
             if (config.ForceRelay)
@@ -139,9 +144,11 @@ namespace UDRoute
                     Log.Info($"[P] Proxy Mode: UDP Port {config.Port}");
                 }
                 Log.Info($"Log Level: {config.LogLevel}");
+                if (config.DisableIPv6) Log.Info("[IPv6] Globally disabled.");
                 Log.Info("==================================================");
             }
 
+            ProtocolHelper.DisableIPv6 = config.DisableIPv6;
             return config;
         }
 
@@ -379,6 +386,9 @@ namespace UDRoute
                         case "kcprcvwnd": currentKcpConfig.RcvWnd = int.Parse(val); break;
                         case "forcerelay":
                             cfg.ForceRelay = val == "1" || val.Equals("true", StringComparison.OrdinalIgnoreCase);
+                            break;
+                        case "disableipv6":
+                            cfg.DisableIPv6 = val == "1" || val.Equals("true", StringComparison.OrdinalIgnoreCase);
                             break;
                         default:
                             // 解析C模式：15389/tcp=rdp@www.pserver.com
@@ -670,36 +680,6 @@ namespace UDRoute
                         cfg.ServerRecords.Add(sRec);
                     }
                 }
-            }
-        }
-
-        public static void CreateTemplate(string path)
-        {
-            try
-            {
-                if (File.Exists(path)) throw new Exception(I18n.Text($"配置文件 {path} 已存在！", $"Configuration file {path} already exists!"));
-
-                bool isZh = I18n.IsZh;
-                string resName = isZh ? "UDRoute.udroute_template_zh.ini" : "UDRoute.udroute_template_en.ini";
-
-                using var stream = System.Reflection.Assembly.GetExecutingAssembly().GetManifestResourceStream(resName);
-                if (stream == null)
-                {
-                    Console.WriteLine(I18n.Text($"错误: 未找到内置模板资源 ({resName})。", $"Error: Could not find the embedded template resource ({resName})."));
-                    return;
-                }
-                using var reader = new StreamReader(stream, Encoding.UTF8);
-                string template = reader.ReadToEnd();
-                
-                // 自动生成一个新的 DevId 写入模板
-                template = template.Replace("{DevId}", Guid.NewGuid().ToString());
-
-                File.WriteAllText(path, template, Encoding.UTF8);
-                Console.WriteLine(I18n.Text($"配置模板已成功写入: {Path.GetFullPath(path)}", $"Configuration template successfully written to: {Path.GetFullPath(path)}"));
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine(I18n.Text($"写入模板出错: {ex.Message}", $"Error writing template: {ex.Message}"));
             }
         }
 

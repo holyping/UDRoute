@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
 	<PropertyGroup>
     <NoWarn>;NU1605</NoWarn>
@@ -81,7 +81,7 @@
 	  <ProjectReference Include="..\UDRoute.Shared\UDRoute.Shared.csproj" />
 	</ItemGroup>
 
-	<!-- Android Release 涓撶敤 Keystore 绛惧悕閰嶇疆涓?APK 杈撳嚭璁剧疆 -->
+	<!-- Android Release 专用 Keystore 签名配置与 APK 输出设置 -->
 	<PropertyGroup Condition="'$(Configuration)' == 'Release' and $([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'android'">
 		<AndroidPackageFormat>apk</AndroidPackageFormat>
 		<AndroidKeyStore>true</AndroidKeyStore>

@@ -28,30 +28,30 @@ namespace UDRoute
 
     public static class NatDiagnosticHelper
     {
-        public static string ResolveTargetServer(string[] args)
+        public static (string Target, int LocalPort, int WanPort) ResolveTargetServer(string[] args)
         {
-            // 1. 检查是否存在带有 '@' 的快捷命令 (如 3389/tcp=rdp@p.example.com 或 name@p.example.com)
+            string target = "";
+            int localPort = 0;
+            int wanPort = 0;
+            string? iniPath = null;
+
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (args[i].Equals("-c", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+                    iniPath = args[i + 1];
+                else if (args[i].Equals("-port", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+                    int.TryParse(args[i + 1], out localPort);
+                else if ((args[i].Equals("-wanport", StringComparison.OrdinalIgnoreCase) || args[i].Equals("-alterport", StringComparison.OrdinalIgnoreCase)) && i + 1 < args.Length)
+                    int.TryParse(args[i + 1], out wanPort);
+            }
+
             foreach (var arg in args)
             {
                 int atIdx = arg.IndexOf('@');
                 if (atIdx >= 0 && atIdx < arg.Length - 1)
-                {
-                    return arg.Substring(atIdx + 1).Trim();
-                }
+                    return (arg.Substring(atIdx + 1).Trim(), localPort, wanPort);
             }
 
-            // 2. 检查是否有 -c <ini_file> 指定的配置文件
-            string? iniPath = null;
-            for (int i = 0; i < args.Length; i++)
-            {
-                if (args[i].Equals("-c", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
-                {
-                    iniPath = args[i + 1];
-                    break;
-                }
-            }
-
-            // 3. 检查是否有直接传入的 .ini 文件
             if (iniPath == null)
             {
                 foreach (var arg in args)
@@ -64,17 +64,17 @@ namespace UDRoute
                 }
             }
 
-            // 4. 检查是否有独立的非选项参数作为目标地址 (如 udroute -test p.example.com:9400)
             for (int i = 0; i < args.Length; i++)
             {
                 var a = args[i];
                 if (a.StartsWith("-") || a.Contains('=')) continue;
                 if (i > 0 && args[i - 1].Equals("-c", StringComparison.OrdinalIgnoreCase)) continue;
+                if (i > 0 && (args[i - 1].Equals("-port", StringComparison.OrdinalIgnoreCase) || args[i - 1].Equals("-wanport", StringComparison.OrdinalIgnoreCase) || args[i - 1].Equals("-alterport", StringComparison.OrdinalIgnoreCase))) continue;
                 if (a.EndsWith(".ini", StringComparison.OrdinalIgnoreCase)) continue;
-                return a.Trim();
+                target = a.Trim();
+                break;
             }
 
-            // 5. 若指定了 ini 或默认当前目录下存在 udroute.ini，尝试解析获取目标 P 端
             string iniToParse = iniPath ?? "udroute.ini";
             string? resolvedIni = ConfigParser.ResolveIniPath(iniToParse);
             if (resolvedIni != null && File.Exists(resolvedIni))
@@ -82,27 +82,26 @@ namespace UDRoute
                 var cfg = ConfigParser.Parse(new[] { "-c", resolvedIni, "-log", "none" });
                 if (cfg != null)
                 {
+                    int cfgLocal = localPort > 0 ? localPort : cfg.Port;
+                    int cfgWan = wanPort > 0 ? wanPort : cfg.WanPort;
+                    
                     if (cfg.ServerRecords.Count > 0 && !string.IsNullOrWhiteSpace(cfg.ServerRecords[0].TargetServer))
-                    {
-                        return cfg.ServerRecords[0].TargetServer;
-                    }
+                        return (cfg.ServerRecords[0].TargetServer, cfgLocal, cfgWan);
                     if (cfg.ClientRecords.Count > 0 && !string.IsNullOrWhiteSpace(cfg.ClientRecords[0].TargetServer))
-                    {
-                        return cfg.ClientRecords[0].TargetServer;
-                    }
+                        return (cfg.ClientRecords[0].TargetServer, cfgLocal, cfgWan);
                 }
             }
 
-            // 6. 若均未指定，则抛出异常要求用户明确指定目标 P 端
-            throw new InvalidOperationException(I18n.Text(
-                "未指定目标 P 端服务器地址，请通过参数 (如 udroute -test p.example.com:9400) 或配置文件指定。",
-                "Target Proxy server address not specified. Please specify via arguments (e.g. udroute -test p.example.com:9400) or config file."));
+            if (string.IsNullOrWhiteSpace(target))
+                throw new InvalidOperationException(I18n.Text("未指定目标 P 端服务器地址。", "Target Proxy server address not specified."));
+
+            return (target, localPort, wanPort);
         }
 
         public static async Task<NatDiagnosticResult> RunAsync(string[] args, TextWriter? writer = null)
         {
             writer ??= Console.Out;
-            string targetServer = ResolveTargetServer(args);
+            var (targetServer, localPort, wanPort) = ResolveTargetServer(args);
             if (targetServer.Equals("this", StringComparison.OrdinalIgnoreCase) || string.IsNullOrWhiteSpace(targetServer))
             {
                 targetServer = "127.0.0.1:9400";
@@ -111,6 +110,10 @@ namespace UDRoute
             writer.WriteLine("==================================================");
             writer.WriteLine(I18n.Text("UDRoute 网络连通性与 NAT 路由诊断测试", "UDRoute Network Connectivity and NAT Diagnostic Test"));
             writer.WriteLine(I18n.Text($"目标 P 端: {targetServer}", $"Target Proxy: {targetServer}"));
+            if (localPort > 0 || wanPort > 0)
+            {
+                writer.WriteLine(I18n.Text($"本地绑定端口: {localPort}, 映射(WAN/Alter)端口: {wanPort}", $"Local Port: {localPort}, WAN/Alter Port: {wanPort}"));
+            }
             writer.WriteLine("==================================================");
             PrintStepStart(writer, I18n.Text("正在解析目标服务器地址... ", "Resolving target server address... "));
 
@@ -136,7 +139,7 @@ namespace UDRoute
 
             PrintStepResult(writer, I18n.Text("成功", "OK"), ConsoleColor.Green);
 
-            using var udp = new ZeroCopyUdpSocket(0);
+            using var udp = new ZeroCopyUdpSocket(localPort);
             var localBindEp = (IPEndPoint)udp.LocalEndPoint;
             var allLocalIps = ProtocolHelper.GetLocalIPAddresses();
 
@@ -159,7 +162,7 @@ namespace UDRoute
 
                         // 处理 UDRoute 内部协议消息 (EchoResp, NatTestResp 或 NatTestReq)
                         MsgType type = (MsgType)span[0];
-                        if ((type == MsgType.EchoResp || type == MsgType.NatTestResp || type == MsgType.NatTestReq) && len >= 17)
+                        if ((type == MsgType.EchoResp || type == MsgType.NatTestResp || type == MsgType.NatTestReq || type == MsgType.ServerIpsResp) && len >= 17)
                         {
                             Guid id = new Guid(span.Slice(1, 16));
                             if (pendingTestHandlers.TryGetValue(id, out var handler))
@@ -185,6 +188,22 @@ namespace UDRoute
             try
             {
                 // ==========================================
+                // 0. 从 P 端动态获取其监听的所有公网 IP
+                // ==========================================
+                PrintStepStart(writer, I18n.Text("正在从 P 端获取双栈 IP 列表... ", "Fetching dual-stack IPs from Proxy... "));
+                var (pIps, expectedInstanceId) = await ProbeServerIpsAsync(udp, allEps, pendingTests, cts.Token);
+                if (pIps != null && pIps.Length > 0)
+                {
+                    ipv4Eps = pIps.Where(ep => ep.AddressFamily == AddressFamily.InterNetwork).ToArray();
+                    ipv6Eps = pIps.Where(ep => ep.AddressFamily == AddressFamily.InterNetworkV6).ToArray();
+                    PrintStepResult(writer, I18n.Text("成功", "OK"), ConsoleColor.Green);
+                }
+                else
+                {
+                    PrintStepResult(writer, I18n.Text("失败 (回退至 DNS 解析结果)", "Failed (Falling back to DNS)"), ConsoleColor.DarkYellow);
+                }
+
+                // ==========================================
                 // 1. 测试本机与 P 是否是 IPV4 直连
                 // ==========================================
                 PrintStepStart(writer, I18n.Text("正在测试本机与 P 端的 IPv4 直连状态... ", "Testing IPv4 direct connectivity with Proxy... "));
@@ -200,7 +219,7 @@ namespace UDRoute
                 }
                 else
                 {
-                    var probeRes = await ProbePIpv4Async(udp, primaryPIpv4Ep, pendingTests, cts.Token);
+                    var probeRes = await ProbePIpv4Async(udp, primaryPIpv4Ep, pendingTests, cts.Token, expectedInstanceId);
                     if (probeRes.PublicEp != null)
                     {
                         mappedIpv4Ep = probeRes.PublicEp;
@@ -259,8 +278,8 @@ namespace UDRoute
                     if (ipv6Eps.Length > 0)
                     {
                         var primaryPIpv6Ep = ipv6Eps[0];
-                        var p6Res = await ProbePIpv6Async(udp, primaryPIpv6Ep, pendingTests, cts.Token);
-                        if (p6Res.PublicEp != null)
+                        var p6Res = await ProbePIpv6Async(udp, primaryPIpv6Ep, pendingTests, pendingTestHandlers, cts.Token, expectedInstanceId);
+                        if (p6Res.PublicEp != null && p6Res.IsInboundAllowed)
                         {
                             result.IsIpv6Direct = true;
                             result.Ipv6Detail = I18n.Text(
@@ -268,13 +287,82 @@ namespace UDRoute
                                 $"Public IPv6 direct connectivity available (Local IPv6: {myIpv6}, Proxy detected IPv6: {p6Res.PublicEp.Address}, RTT: {p6Res.RttMs}ms)");
                             PrintStepResult(writer, I18n.Text("成功", "OK"), ConsoleColor.Green);
                         }
-                        else
+                        else if (p6Res.PublicEp != null)
                         {
                             result.IsIpv6Direct = false;
                             result.Ipv6Detail = I18n.Text(
-                                $"本机已分配公网 IPv6 地址 ({myIpv6})，但向 P 端 ({primaryPIpv6Ep}) 发起 IPv6 探测超时",
-                                $"Local machine has public IPv6 ({myIpv6}), but IPv6 probe to Proxy ({primaryPIpv6Ep}) timed out");
-                            PrintStepResult(writer, I18n.Text("失败", "Failed"), ConsoleColor.Red);
+                                $"具备公网 IPv6 地址 ({myIpv6})，但 IPv6 防火墙拦截了未经请求的入站连接 (无法直连)",
+                                $"Public IPv6 address available ({myIpv6}), but IPv6 firewall blocks unsolicited inbound connections (Direct connection not possible)");
+                            PrintStepResult(writer, I18n.Text("受限", "Restricted"), ConsoleColor.Yellow);
+                        }
+                        else
+                        {
+                            PrintStepResult(writer, I18n.Text("超时，尝试自动修复...", "Timeout, attempting auto-repair..."), ConsoleColor.Yellow);
+                            
+                            bool repaired = false;
+                            if (ProtocolHelper.IsElevatedPrivilege())
+                            {
+                                await ProtocolHelper.ResetIPv6StackAsync();
+                                repaired = true;
+                            }
+                            else if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows))
+                            {
+                                try
+                                {
+                                    var psi = new System.Diagnostics.ProcessStartInfo("powershell", "-NoProfile -WindowStyle Hidden -Command \"Disable-NetAdapterBinding -Name '*' -ComponentID ms_tcpip6; Start-Sleep -Milliseconds 500; Enable-NetAdapterBinding -Name '*' -ComponentID ms_tcpip6\"")
+                                    {
+                                        UseShellExecute = true,
+                                        Verb = "runas"
+                                    };
+                                    using (var p = System.Diagnostics.Process.Start(psi))
+                                    {
+                                        if (p != null) await p.WaitForExitAsync(cts.Token);
+                                    }
+                                    await Task.Delay(2000);
+                                    repaired = true;
+                                }
+                                catch
+                                {
+                                    // User cancelled UAC prompt or it failed
+                                }
+                            }
+                            
+                            if (repaired)
+                            {
+                                allLocalIps = ProtocolHelper.GetLocalIPAddresses();
+                                localGlobalIpv6List = allLocalIps.Where(IsGlobalUnicastIPv6).ToList();
+                                
+                                if (localGlobalIpv6List.Count > 0)
+                                {
+                                    myIpv6 = localGlobalIpv6List[0];
+                                    p6Res = await ProbePIpv6Async(udp, primaryPIpv6Ep, pendingTests, pendingTestHandlers, cts.Token, expectedInstanceId);
+                                }
+                            }
+
+                            if (p6Res.PublicEp != null && p6Res.IsInboundAllowed)
+                            {
+                                result.IsIpv6Direct = true;
+                                result.Ipv6Detail = I18n.Text(
+                                    $"具备公网 IPV6 直连能力 (已自动修复无效前缀，本机 IPv6: {myIpv6}, P 端检测 IPv6: {p6Res.PublicEp.Address}, 延迟: {p6Res.RttMs}ms)",
+                                    $"Public IPv6 direct connectivity available (Auto-repaired stale prefix, Local IPv6: {myIpv6}, Proxy detected IPv6: {p6Res.PublicEp.Address}, RTT: {p6Res.RttMs}ms)");
+                                PrintStepResult(writer, I18n.Text("成功", "OK"), ConsoleColor.Green);
+                            }
+                            else if (p6Res.PublicEp != null)
+                            {
+                                result.IsIpv6Direct = false;
+                                result.Ipv6Detail = I18n.Text(
+                                    $"具备公网 IPv6 地址 ({myIpv6})，但 IPv6 防火墙拦截了未经请求的入站连接 (无法直连)",
+                                    $"Public IPv6 address available ({myIpv6}), but IPv6 firewall blocks unsolicited inbound connections (Direct connection not possible)");
+                                PrintStepResult(writer, I18n.Text("受限", "Restricted"), ConsoleColor.Yellow);
+                            }
+                            else
+                            {
+                                result.IsIpv6Direct = false;
+                                result.Ipv6Detail = I18n.Text(
+                                    $"本机已分配公网 IPv6 地址 ({myIpv6})，但向 P 端 ({primaryPIpv6Ep}) 发起 IPv6 探测超时",
+                                    $"Local machine has public IPv6 ({myIpv6}), but IPv6 probe to Proxy ({primaryPIpv6Ep}) timed out");
+                                PrintStepResult(writer, I18n.Text("失败", "Failed"), ConsoleColor.Red);
+                            }
                         }
                     }
                     else
@@ -303,7 +391,7 @@ namespace UDRoute
                 }
                 else if (mappedIpv4Ep != null && primaryPIpv4Ep != null)
                 {
-                    var (isCone, natLevel, coneDetail) = await ProbeConeNatAsync(udp, primaryPIpv4Ep, mappedIpv4Ep, pendingTests, pendingTestHandlers, cts.Token);
+                    var (isCone, natLevel, coneDetail) = await ProbeConeNatAsync(udp, primaryPIpv4Ep, mappedIpv4Ep, pendingTests, pendingTestHandlers, cts.Token, wanPort);
                     result.IsConeNat = isCone;
                     result.NatLevel = natLevel;
                     result.ConeDetail = coneDetail;
@@ -314,6 +402,7 @@ namespace UDRoute
                         "NAT 3" or "NAT3" => ConsoleColor.Yellow,
                         "NAT 4" or "NAT4" => ConsoleColor.Red,
                         "NAT 0" or "NAT0" => ConsoleColor.Green,
+                        "DMZ / 1:1 NAT" => ConsoleColor.Cyan,
                         _ => ConsoleColor.Red
                     };
                     PrintStepResult(writer, natLevel, color);
@@ -391,11 +480,67 @@ namespace UDRoute
             writer.WriteLine("--------------------------------------------------");
         }
 
+        private static async Task<(IPEndPoint[] IPs, Guid InstanceId)> ProbeServerIpsAsync(
+            ZeroCopyUdpSocket udp,
+            IPEndPoint[] pEps,
+            ConcurrentDictionary<Guid, TaskCompletionSource<(byte[] Data, EndPoint RemoteEp)>> pendingTests,
+            CancellationToken ct,
+            int timeoutMs = 1500)
+        {
+            var ips = new List<IPEndPoint>();
+            foreach (var ep in pEps)
+            {
+                for (int retry = 0; retry < 2; retry++)
+                {
+                    if (ct.IsCancellationRequested) return (Array.Empty<IPEndPoint>(), Guid.Empty);
+
+                    var testId = Guid.NewGuid();
+                    var tcs = new TaskCompletionSource<(byte[] Data, EndPoint RemoteEp)>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    pendingTests[testId] = tcs;
+
+                    byte[] req = new byte[17];
+                    req[0] = (byte)MsgType.ServerIpsReq;
+                    testId.TryWriteBytes(req.AsSpan(1, 16));
+
+                    try
+                    {
+                        await udp.SendAsync(req, ep, ct);
+                        using var timeout = new CancellationTokenSource(timeoutMs);
+                        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeout.Token);
+                        
+                        var (data, _) = await tcs.Task.WaitAsync(linked.Token);
+                        if (data.Length >= 18 && (MsgType)data[0] == MsgType.ServerIpsResp)
+                        {
+                            byte count = data[17];
+                            int offset = 18;
+                            for (int i = 0; i < count; i++)
+                            {
+                                if (offset >= data.Length) break;
+                                var (parsedEp, readLen) = ProtocolHelper.ReadIPEndPoint(data.AsSpan(offset));
+                                ips.Add(parsedEp);
+                                offset += readLen;
+                            }
+                            Guid instanceId = Guid.Empty;
+                            if (offset + 16 <= data.Length)
+                            {
+                                instanceId = new Guid(data.AsSpan(offset, 16));
+                            }
+                            if (ips.Count > 0) return (ips.ToArray(), instanceId);
+                        }
+                    }
+                    catch { }
+                    finally { pendingTests.TryRemove(testId, out _); }
+                }
+            }
+            return (Array.Empty<IPEndPoint>(), Guid.Empty);
+        }
+
         private static async Task<(IPEndPoint? PublicEp, long RttMs)> ProbePIpv4Async(
             ZeroCopyUdpSocket udp,
             IPEndPoint pEp,
             ConcurrentDictionary<Guid, TaskCompletionSource<(byte[] Data, EndPoint RemoteEp)>> pendingTests,
             CancellationToken ct,
+            Guid expectedInstanceId,
             int timeoutMs = 1000)
         {
             for (int retry = 0; retry < 3; retry++)
@@ -432,7 +577,12 @@ namespace UDRoute
 
                     if (data.Length >= 17)
                     {
-                        var (ep, _) = ProtocolHelper.ReadIPEndPoint(data.AsSpan(17));
+                        var (ep, readLen) = ProtocolHelper.ReadIPEndPoint(data.AsSpan(17));
+                        if (expectedInstanceId != Guid.Empty && data.Length >= 17 + readLen + 16)
+                        {
+                            Guid returnedInstanceId = new Guid(data.AsSpan(17 + readLen, 16));
+                            if (returnedInstanceId != expectedInstanceId) continue;
+                        }
                         return (ep, rtt);
                     }
                 }
@@ -445,13 +595,18 @@ namespace UDRoute
             return (null, 0);
         }
 
-        private static async Task<(IPEndPoint? PublicEp, int? AltPort, long RttMs)> ProbePIpv6Async(
+        private static async Task<(IPEndPoint? PublicEp, bool IsInboundAllowed, long RttMs)> ProbePIpv6Async(
             ZeroCopyUdpSocket udp,
             IPEndPoint pEp6,
             ConcurrentDictionary<Guid, TaskCompletionSource<(byte[] Data, EndPoint RemoteEp)>> pendingTests,
+            ConcurrentDictionary<Guid, Action<(byte[] Data, EndPoint RemoteEp)>> pendingTestHandlers,
             CancellationToken ct,
+            Guid expectedInstanceId,
             int timeoutMs = 1200)
         {
+            IPEndPoint? publicEp = null;
+            long rttMs = 0;
+
             for (int retry = 0; retry < 2; retry++)
             {
                 if (ct.IsCancellationRequested) break;
@@ -482,12 +637,18 @@ namespace UDRoute
                 {
                     var (data, _) = await tcs.Task.WaitAsync(linked.Token);
                     sw.Stop();
-                    long rtt = sw.ElapsedMilliseconds;
+                    rttMs = sw.ElapsedMilliseconds;
 
                     if (data.Length >= 17)
                     {
-                        var (ep, _) = ProtocolHelper.ReadIPEndPoint(data.AsSpan(17));
-                        return (ep, null, rtt);
+                        var (ep, readLen) = ProtocolHelper.ReadIPEndPoint(data.AsSpan(17));
+                        if (expectedInstanceId != Guid.Empty && data.Length >= 17 + readLen + 16)
+                        {
+                            Guid returnedInstanceId = new Guid(data.AsSpan(17 + readLen, 16));
+                            if (returnedInstanceId != expectedInstanceId) continue;
+                        }
+                        publicEp = ep;
+                        break;
                     }
                 }
                 catch
@@ -496,7 +657,53 @@ namespace UDRoute
                 }
             }
 
-            return (null, null, 0);
+            if (publicEp == null) return (null, false, 0);
+
+            // 2. Inbound Unsolicited Test (IPv6 NAT-0 / DMZ / Firewall Open test)
+            bool isInboundAllowed = false;
+            Guid inboundTestId = Guid.NewGuid();
+            var stage1Tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            pendingTestHandlers[inboundTestId] = item =>
+            {
+                var (rData, rEp) = item;
+                if (rEp is IPEndPoint ipEp && rData.Length >= 17)
+                {
+                    if (ipEp.Port != pEp6.Port)
+                    {
+                        byte[] ackBuf = new byte[18];
+                        ackBuf[0] = (byte)MsgType.NatTestResp;
+                        inboundTestId.TryWriteBytes(ackBuf.AsSpan(1, 16));
+                        ackBuf[17] = NatTestFlags.Stage1Ack;
+                        _ = udp.SendAsync(ackBuf, ipEp, ct);
+                        stage1Tcs.TrySetResult(true);
+                    }
+                }
+            };
+
+            try
+            {
+                byte[] req = new byte[18];
+                req[0] = (byte)MsgType.NatTestReq;
+                inboundTestId.TryWriteBytes(req.AsSpan(1, 16));
+                req[17] = NatTestFlags.None;
+                await udp.SendAsync(req, pEp6, ct);
+
+                using var ctsTimeout = new CancellationTokenSource(1200);
+                using var linked2 = CancellationTokenSource.CreateLinkedTokenSource(ct, ctsTimeout.Token);
+                await stage1Tcs.Task.WaitAsync(linked2.Token);
+                isInboundAllowed = true;
+            }
+            catch
+            {
+                isInboundAllowed = false;
+            }
+            finally
+            {
+                pendingTestHandlers.TryRemove(inboundTestId, out _);
+            }
+
+            return (publicEp, isInboundAllowed, rttMs);
         }
 
         private static async Task<(bool? IsCone, string NatLevel, string Detail)> ProbeConeNatAsync(
@@ -505,7 +712,8 @@ namespace UDRoute
             IPEndPoint mappedIpv4Ep,
             ConcurrentDictionary<Guid, TaskCompletionSource<(byte[] Data, EndPoint RemoteEp)>> pendingTests,
             ConcurrentDictionary<Guid, Action<(byte[] Data, EndPoint RemoteEp)>> pendingTestHandlers,
-            CancellationToken ct)
+            CancellationToken ct,
+            int wanPort = 0)
         {
             Guid testId = Guid.NewGuid();
             var stage1DirectTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -574,10 +782,19 @@ namespace UDRoute
 
                 if (receivedFromAlt)
                 {
-                    // 阶段 1 成功：收到无邀约入站包并回包确认，确诊为 NAT 1/2
-                    return (true, "NAT 1/2", I18n.Text(
-                        "圆锥路由 - NAT 1/2 (全锥 / IP受限锥)，无邀约入站连通正常，具备最高穿透力，可与任意对端 (含 NAT 4) 建立 P2P 直连",
-                        "Cone NAT - NAT 1/2 (Full Cone / IP-Restricted Cone): Unsolicited inbound accessible, optimal traversal capability, can establish P2P direct connection with any peer (including NAT 4)."));
+                    bool isPortPreserved = (wanPort > 0) ? (mappedIpv4Ep.Port == wanPort) : ((udp.LocalEndPoint is IPEndPoint lep) && lep.Port == mappedIpv4Ep.Port);
+                    if (isPortPreserved)
+                    {
+                        return (true, "DMZ / 1:1 NAT", I18n.Text(
+                            "1:1 NAT 或 DMZ 或已成功映射端口 (完全支持双向直连)",
+                            "1:1 NAT, DMZ, or Successfully Port-Mapped (Fully supports bidirectional direct connection)."));
+                    }
+                    else
+                    {
+                        return (true, "NAT 1/2", I18n.Text(
+                            "圆锥路由 - NAT 1/2 (全锥 / IP受限锥，具备最高穿透力)",
+                            "Cone NAT - NAT 1/2 (Full Cone / IP-Restricted Cone): Unsolicited inbound accessible, optimal traversal capability."));
+                    }
                 }
 
                 // =========================================================================

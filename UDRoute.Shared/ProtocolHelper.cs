@@ -7,6 +7,8 @@ namespace UDRoute
 {
     public static class ProtocolHelper
     {
+        public static bool DisableIPv6 { get; set; } = false;
+
         // 编码字符串: 4字节长度 + UTF8内容 (零拷贝方式写入Span)
         public static int WriteString(Span<byte> buffer, string text)
         {
@@ -142,6 +144,7 @@ namespace UDRoute
             {
                 using var timeoutCts = new CancellationTokenSource(3000);
                 var addresses = await Dns.GetHostAddressesAsync(host, timeoutCts.Token);
+                if (DisableIPv6) addresses = System.Linq.Enumerable.ToArray(System.Linq.Enumerable.Where(addresses, a => a.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork));
                 if (addresses.Length > 0)
                 {
                     return new IPEndPoint(addresses[0], port);
@@ -185,6 +188,7 @@ namespace UDRoute
             {
                 using var timeoutCts = new CancellationTokenSource(3000);
                 var addresses = await Dns.GetHostAddressesAsync(host, timeoutCts.Token);
+                if (DisableIPv6) addresses = System.Linq.Enumerable.ToArray(System.Linq.Enumerable.Where(addresses, a => a.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork));
                 var eps = new List<IPEndPoint>();
                 foreach (var a in addresses)
                 {
@@ -210,7 +214,7 @@ namespace UDRoute
                     {
                         if (IPAddress.IsLoopback(ip.Address)) continue;
                         if (ip.Address.AddressFamily == AddressFamily.InterNetwork ||
-                            (ip.Address.AddressFamily == AddressFamily.InterNetworkV6 && !ip.Address.IsIPv6LinkLocal))
+                            (!DisableIPv6 && ip.Address.AddressFamily == AddressFamily.InterNetworkV6 && !ip.Address.IsIPv6LinkLocal))
                         {
                             Logging.Log.Trace($"Found local IP: {ip.Address}");
                             list.Add(new IPEndPoint(ip.Address, port));
@@ -263,6 +267,8 @@ namespace UDRoute
 
                     foreach (var ip in ni.GetIPProperties().UnicastAddresses)
                     {
+                        if (DisableIPv6 && ip.Address.AddressFamily == AddressFamily.InterNetworkV6) continue;
+
                         if (!IPAddress.IsLoopback(ip.Address))
                         {
                             set.Add(ip.Address);

@@ -33,17 +33,17 @@ namespace UDRoute.Tests
         [Fact]
         public void ResolveTargetServer_ExplicitHost_ParsedCorrectly()
         {
-            string target = NatDiagnosticHelper.ResolveTargetServer(new[] { "-test", "p.example.com:7000" });
+            var (target, _, _) = NatDiagnosticHelper.ResolveTargetServer(new[] { "-test", "p.example.com:7000" });
             Assert.Equal("p.example.com:7000", target);
         }
 
         [Fact]
         public void ResolveTargetServer_QuickSetupSyntax_ParsedCorrectly()
         {
-            string target1 = NatDiagnosticHelper.ResolveTargetServer(new[] { "-test", "33890/tcp=rdp_home:pass@myproxy.org" });
+            var (target1, _, _) = NatDiagnosticHelper.ResolveTargetServer(new[] { "-test", "33890/tcp=rdp_home:pass@myproxy.org" });
             Assert.Equal("myproxy.org", target1);
 
-            string target2 = NatDiagnosticHelper.ResolveTargetServer(new[] { "rdp_home=127.0.0.1:3389/tcp@server.com:9400", "-test" });
+            var (target2, _, _) = NatDiagnosticHelper.ResolveTargetServer(new[] { "rdp_home=127.0.0.1:3389/tcp@server.com:9400", "-test" });
             Assert.Equal("server.com:9400", target2);
         }
 
@@ -58,7 +58,7 @@ server = p.fromini.com:8888
 target=127.0.0.1:80/tcp
 ");
 
-            string target = NatDiagnosticHelper.ResolveTargetServer(new[] { "-test", "-c", iniPath });
+            var (target, _, _) = NatDiagnosticHelper.ResolveTargetServer(new[] { "-test", "-c", iniPath });
             Assert.Equal("p.fromini.com:8888", target);
         }
 

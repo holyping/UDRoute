@@ -190,6 +190,10 @@ namespace UDRoute
                                 }
                                 break;
 
+                            case MsgType.ServerIpsReq:
+                                await HandleServerIpsReqAsync(mem, remoteEp, ct);
+                                break;
+
                             default:
                                 Log.Debug($"[RouteEngine] Unknown MsgType {(byte)type} from {remoteEp}");
                                 break;
@@ -239,6 +243,48 @@ namespace UDRoute
                     {
                         Log.Info($"[P] Received KeepAlive from unregistered DevId {devId} ({remoteEp}). Replying with NeedRegister signal.");
                     }
+                }
+
+                _config.InstanceId.TryWriteBytes(respBuf.AsSpan(offset, 16));
+                offset += 16;
+
+                await _udp!.SendAsync(respBuf.AsMemory(0, offset), remoteEp, ct);
+            }
+            finally
+            {
+                System.Buffers.ArrayPool<byte>.Shared.Return(respBuf);
+            }
+        }
+
+        private async ValueTask HandleServerIpsReqAsync(ReadOnlyMemory<byte> mem, EndPoint remoteEp, CancellationToken ct)
+        {
+            if (mem.Length < 17) return;
+            var span = mem.Span;
+            byte[] respBuf = System.Buffers.ArrayPool<byte>.Shared.Rent(512);
+            try
+            {
+                respBuf[0] = (byte)MsgType.ServerIpsResp;
+                span.Slice(1, 16).CopyTo(respBuf.AsSpan(1));
+                int offset = 17;
+
+                var allLocalIps = ProtocolHelper.GetLocalIPAddresses();
+                var globalIps = allLocalIps.Where(ip => 
+                    ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork || 
+                    NatDiagnosticHelper.IsGlobalUnicastIPv6(ip)).ToArray();
+
+                respBuf[offset++] = (byte)globalIps.Length;
+                int pPort = _udp?.LocalEndPoint is IPEndPoint ep ? ep.Port : Constants.DefaultProxyPort;
+
+                foreach (var ip in globalIps)
+                {
+                    if (offset + 21 > respBuf.Length) break;
+                    offset += ProtocolHelper.WriteIPEndPoint(respBuf.AsSpan(offset), new IPEndPoint(ip, pPort));
+                }
+
+                if (offset + 16 <= respBuf.Length)
+                {
+                    _config.InstanceId.TryWriteBytes(respBuf.AsSpan(offset, 16));
+                    offset += 16;
                 }
 
                 await _udp!.SendAsync(respBuf.AsMemory(0, offset), remoteEp, ct);
