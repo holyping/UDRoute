@@ -43,6 +43,8 @@ namespace UDRoute
         public string Username { get; set; } = "";
         public byte[]? Password { get; set; }
         public byte[]? AccessPassword { get; set; }
+        public byte[]? ControllerPassword { get; set; }
+        public int ControllerPort { get; set; } = Constants.DefaultControllerPort;
         public bool ForceRelay { get; set; }
         public int TunnelReuseInterval { get; set; } = Constants.DefaultTunnelReuseInterval;
         public int IdleThreshold { get; set; } = Constants.DefaultIdleThreshold;

@@ -18,6 +18,9 @@ Commands:
   -init, -create [file] Generate a well-commented default configuration template file
   -i [ServiceName]      Install the program as a system service and start automatically (Windows / Linux Systemd)
   -u [ServiceName]      Stop and uninstall the specified system service
+  -add <host[/pwd]> <ep...>   Dynamically add endpoint(s) to remote udroute via TCP 9401 (e.g. udroute -add 192.168.1.4/pwd 3443=xeno@www.qzsoft.top)
+  -delete, -del <host[/pwd]> <id...> Dynamically delete endpoint(s) from remote udroute (e.g. udroute -delete 192.168.1.4/pwd 3443)
+  -list, -ls <host[/pwd]>    Query and list all active/configured S/C endpoints on remote udroute (prompt masked if pwd omitted)
 
 Quick Setup:
   You can bypass the .ini file and provide configurations directly via command-line syntax:

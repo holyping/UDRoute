@@ -33,9 +33,57 @@ public class AuthTests : IDisposable
     {
         string iniPath = Path.Combine(_testDir, "udroute.ini");
         using var auth = new AuthManager(iniPath);
-        // Default should be udroute.pwd
+        // Default should be udroute.pwd in ini directory
+        Assert.Equal(Path.Combine(_testDir, "udroute.pwd"), auth.PwdFilePath);
         auth.Start();
         Assert.False(auth.Authenticate("any", "any").success);
+    }
+
+    [Fact]
+    public void PwdPath_ResolvedRelativeToIni_WhenRelativePathProvided()
+    {
+        string subDir = Path.Combine(_testDir, "subdir");
+        Directory.CreateDirectory(subDir);
+        string iniPath = Path.Combine(subDir, "custom.ini");
+
+        // Relative path "users.pwd" should resolve to subdir/users.pwd
+        using var auth = new AuthManager(iniPath, "users.pwd");
+        Assert.Equal(Path.Combine(subDir, "users.pwd"), auth.PwdFilePath);
+    }
+
+    [Fact]
+    public void PwdPath_ResolvedRelativeToCurrentDir_WhenNoIniProvided()
+    {
+        // When no ini provided, relative path should resolve to CurrentDirectory
+        using var auth1 = new AuthManager("", "standalone.pwd");
+        Assert.Equal(Path.Combine(Environment.CurrentDirectory, "standalone.pwd"), auth1.PwdFilePath);
+
+        using var auth2 = new AuthManager("");
+        Assert.Equal(Path.Combine(Environment.CurrentDirectory, "udroute.pwd"), auth2.PwdFilePath);
+    }
+
+    [Fact]
+    public async Task Watcher_RenameEvent_ReloadsFile()
+    {
+        string pwdFile = Path.Combine(_testDir, "rename_target.pwd");
+        File.WriteAllLines(pwdFile, new[] { "alice:pass1" });
+
+        using var auth = new AuthManager(Path.Combine(_testDir, "dummy.ini"), pwdFile);
+        auth.Start();
+        Assert.True(auth.Authenticate("alice", "pass1").success);
+        Assert.False(auth.Authenticate("bob", "pass2").success);
+
+        // Atomic rename simulation (like vim/nano writing to temp then renaming to target)
+        string tempFile = Path.Combine(_testDir, "rename_temp.pwd");
+        File.WriteAllLines(tempFile, new[] { "bob:pass2" });
+
+        await Task.Delay(200);
+        File.Move(tempFile, pwdFile, overwrite: true);
+
+        // Wait for FileSystemWatcher debounce (500ms in AuthManager + buffer)
+        await Task.Delay(1000);
+
+        Assert.True(auth.Authenticate("bob", "pass2").success, "User bob should be loaded after file atomic rename");
     }
 
     [Fact]
@@ -1146,3 +1194,4 @@ public class AuthTests : IDisposable
         }
     }
 }
+

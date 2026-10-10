@@ -18,6 +18,9 @@ UDRoute - 基于 UDP 穿透的高性能端口转发/内网穿透工具
   -init, -create [file] 在当前目录生成一份带有详尽注释的默认配置文件模板
   -i [ServiceName]      将当前程序注册为系统服务并自动启动 (支持 Windows / Linux Systemd)
   -u [ServiceName]      停止并卸载指定的系统服务
+  -add <host[/pwd]> <ep...>   通过 TCP 9401 向远程 udroute 动态添加端点 (例: udroute -add 192.168.1.4/pwd 3443=xeno@www.qzsoft.top)
+  -delete, -del <host[/pwd]> <id...> 从远程 udroute 动态删除指定端点 (例: udroute -delete 192.168.1.4/pwd 3443)
+  -list, -ls <host[/pwd]>    查询并列出远程运行的 udroute 所有正在监听和配置的 S/C 端点 (密码可省略提示输入)
 
 快捷配置 (Command-line Quick Setup):
   支持不使用 ini 文件，直接在命令行中按规范传入配置项。

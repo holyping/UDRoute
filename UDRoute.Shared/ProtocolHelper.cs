@@ -111,13 +111,36 @@ namespace UDRoute
             return (config, 21);
         }
 
+        public static (string Host, int Port) ParseHostAndPort(string hostAndPort, int defaultPort)
+        {
+            if (string.IsNullOrWhiteSpace(hostAndPort)) return ("", defaultPort);
+            string host = hostAndPort.Trim();
+            int port = defaultPort;
+
+            int lastColon = host.LastIndexOf(':');
+            if (lastColon > 0 && !host.EndsWith("]"))
+            {
+                var portStr = host.Substring(lastColon + 1);
+                var hostStr = host.Substring(0, lastColon).Trim('[', ']');
+                if (int.TryParse(portStr, out int p))
+                {
+                    port = p;
+                    host = hostStr;
+                }
+            }
+            else
+            {
+                host = host.Trim('[', ']');
+            }
+            return (host, port);
+        }
+
         // 解析标准 EndPoint（支持域名/IP 及自定义端口）
         public static async Task<IPEndPoint?> ResolveEndPointAsync(string hostAndPort, int defaultPort)
         {
             if (string.IsNullOrWhiteSpace(hostAndPort)) return null;
 
-            string host = hostAndPort.Trim();
-            int port = defaultPort;
+            var (host, port) = ParseHostAndPort(hostAndPort, defaultPort);
 
             int lastColon = host.LastIndexOf(':');
             if (lastColon > 0 && !host.EndsWith("]"))

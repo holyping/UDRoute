@@ -13,6 +13,7 @@ namespace UDRoute
     {
         private FileSystemWatcher? _watcher;
         private string _pwdFilePath;
+        public string PwdFilePath => _pwdFilePath;
         
         // 存储 Username -> Hash 的字典，大小写不敏感
         private Dictionary<string, string> _users = new(StringComparer.OrdinalIgnoreCase);
@@ -33,14 +34,27 @@ namespace UDRoute
         /// <param name="explicitPwdFile">可选：指定的密码文件路径</param>
         public AuthManager(string configFilePath, string? explicitPwdFile = null)
         {
+            // 路径判定基准：有 ini 的以 ini 所在目录为准，无 ini 的以当前工作目录为准
+            string baseDir = !string.IsNullOrWhiteSpace(configFilePath)
+                ? (Path.GetDirectoryName(Path.GetFullPath(configFilePath)) ?? Environment.CurrentDirectory)
+                : Environment.CurrentDirectory;
+
             if (!string.IsNullOrWhiteSpace(explicitPwdFile))
             {
-                _pwdFilePath = Path.GetFullPath(explicitPwdFile);
+                _pwdFilePath = Path.IsPathRooted(explicitPwdFile)
+                    ? Path.GetFullPath(explicitPwdFile)
+                    : Path.GetFullPath(Path.Combine(baseDir, explicitPwdFile));
             }
             else
             {
-                // 默认策略：将配置文件的后缀改成 .pwd
-                _pwdFilePath = Path.ChangeExtension(Path.GetFullPath(configFilePath), ".pwd");
+                if (!string.IsNullOrWhiteSpace(configFilePath))
+                {
+                    _pwdFilePath = Path.ChangeExtension(Path.GetFullPath(configFilePath), ".pwd");
+                }
+                else
+                {
+                    _pwdFilePath = Path.GetFullPath(Path.Combine(baseDir, "udroute.pwd"));
+                }
             }
         }
 
@@ -73,6 +87,7 @@ namespace UDRoute
             
             _watcher.Changed += OnFileChanged;
             _watcher.Created += OnFileChanged;
+            _watcher.Renamed += OnFileChanged;
             _watcher.EnableRaisingEvents = true;
             
             Log.Info($"[Auth] 开始监听密码文件变更: {_pwdFilePath}");

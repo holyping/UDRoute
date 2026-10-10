@@ -100,15 +100,16 @@ namespace UDRoute
             return list;
         }
 
+        private CancellationToken _engineCt;
+        private readonly ConcurrentDictionary<string, (CancellationTokenSource Cts, Task Task, ClientRecord Record)> _listeners = new();
+        private readonly ConcurrentDictionary<string, bool> _activeKeepAlives = new();
+
         public async Task RunAsync(CancellationToken ct)
         {
-            var tasks = new List<Task>();
+            _engineCt = ct;
             foreach (var rec in _config.ClientRecords)
             {
-                if (rec.IsTcp)
-                    tasks.Add(AcceptTcpLoopAsync(rec, ct));
-                else
-                    tasks.Add(AcceptUdpLoopAsync(rec, ct));
+                StartListener(rec, ct);
             }
 
             // 启动 C 到各 P 目标服务器的 NAT KeepAlive 保活循环 (使用全局 KeepAlive 间隔)
@@ -122,11 +123,94 @@ namespace UDRoute
 
                 foreach (var pServer in distinctPServers)
                 {
-                    tasks.Add(RunPKeepAliveAsync(pServer, _config.KeepAlive, ct));
+                    EnsureKeepAlive(pServer, ct);
                 }
             }
 
-            await Task.WhenAll(tasks);
+            try
+            {
+                await Task.Delay(Timeout.Infinite, ct);
+            }
+            catch (OperationCanceledException) { }
+        }
+
+        private void EnsureKeepAlive(string pServer, CancellationToken ct)
+        {
+            if (_activeKeepAlives.TryAdd(pServer, true))
+            {
+                _ = Task.Run(() => RunPKeepAliveAsync(pServer, _config.KeepAlive, ct), ct);
+            }
+        }
+
+        public (bool Success, string Error) AddClientEndpoint(ClientRecord rec)
+        {
+            return StartListener(rec, _engineCt);
+        }
+
+        private (bool Success, string Error) StartListener(ClientRecord rec, CancellationToken parentCt)
+        {
+            string key = $"{rec.Port}/{(rec.IsTcp ? "tcp" : "udp")}";
+            if (_listeners.ContainsKey(key))
+            {
+                return (false, $"Listener on port {key} is already active.");
+            }
+
+            var cts = CancellationTokenSource.CreateLinkedTokenSource(parentCt);
+            try
+            {
+                Task task;
+                if (rec.IsTcp)
+                {
+                    var listener = new TcpListener(IPAddress.IPv6Any, rec.Port);
+                    listener.Server.DualMode = true;
+                    listener.Start();
+                    task = AcceptTcpLoopWithListenerAsync(rec, listener, cts.Token);
+                }
+                else
+                {
+                    var localUdp = new ZeroCopyUdpSocket(rec.Port);
+                    task = AcceptUdpLoopWithSocketAsync(rec, localUdp, cts.Token);
+                }
+
+                _listeners[key] = (cts, task, rec);
+
+                if (_config.KeepAlive > 0 && !rec.IsThis && !string.IsNullOrWhiteSpace(rec.TargetServer))
+                {
+                    EnsureKeepAlive(rec.TargetServer, parentCt);
+                }
+
+                return (true, "");
+            }
+            catch (Exception ex)
+            {
+                cts.Dispose();
+                return (false, ex.Message);
+            }
+        }
+
+        public void RemoveClientEndpoint(ClientRecord rec)
+        {
+            string key = $"{rec.Port}/{(rec.IsTcp ? "tcp" : "udp")}";
+            if (_listeners.TryRemove(key, out var entry))
+            {
+                try
+                {
+                    entry.Cts.Cancel();
+                    entry.Cts.Dispose();
+                }
+                catch { }
+            }
+
+            // 关闭匹配本地端口的会话
+            List<TunnelSession> toClose;
+            lock (_sessionLock)
+            {
+                toClose = _sessions.Values.Where(s => s.ChannelDesc.Contains($":{rec.Port}") || s.ChannelDesc.StartsWith($"{rec.Port}/")).ToList();
+            }
+            foreach (var s in toClose)
+            {
+                try { s.Dispose(); } catch { }
+            }
         }
 
         public bool TryHandleQueryResponse(ReadOnlySpan<byte> data)
@@ -441,6 +525,11 @@ namespace UDRoute
                 throw;
             }
 
+            await AcceptTcpLoopWithListenerAsync(rec, listener, ct);
+        }
+
+        private async Task AcceptTcpLoopWithListenerAsync(ClientRecord rec, TcpListener listener, CancellationToken ct)
+        {
             try
             {
                 string queryName = rec.TargetName.EndsWith("/tcp", StringComparison.OrdinalIgnoreCase) || rec.TargetName.EndsWith("/udp", StringComparison.OrdinalIgnoreCase)
@@ -600,6 +689,11 @@ namespace UDRoute
                 throw;
             }
 
+            await AcceptUdpLoopWithSocketAsync(rec, localUdp, ct);
+        }
+
+        private async Task AcceptUdpLoopWithSocketAsync(ClientRecord rec, ZeroCopyUdpSocket localUdp, CancellationToken ct)
+        {
             using (localUdp)
             {
                 string queryName = rec.TargetName.EndsWith("/tcp", StringComparison.OrdinalIgnoreCase) || rec.TargetName.EndsWith("/udp", StringComparison.OrdinalIgnoreCase)

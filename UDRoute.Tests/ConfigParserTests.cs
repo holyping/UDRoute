@@ -269,6 +269,42 @@ accesspassword = {preHashed}
         Assert.Contains(preHashed, content);
         Assert.DoesNotContain("_HWHash_", content);
     }
+
+    [Fact]
+    public void ParseIni_RelativeLogFileAndAuthFile_ResolvedRelativeToIniDir()
+    {
+        string subDir = Path.Combine(_testDir, "service_dir");
+        Directory.CreateDirectory(subDir);
+        string iniPath = Path.Combine(subDir, "udroute.ini");
+
+        File.WriteAllText(iniPath, @"
+server = 1.2.3.4:1399
+logfile = app.log
+authfile = secret.pwd
+");
+
+        var cfg = ConfigParser.Parse(new[] { "-c", iniPath });
+        Assert.NotNull(cfg);
+        Assert.Equal(Path.Combine(subDir, "app.log"), cfg.LogFile);
+        Assert.Equal(Path.Combine(subDir, "secret.pwd"), cfg.AuthFile);
+    }
+
+    [Fact]
+    public void ParseIni_DefaultLogFile_ResolvedRelativeToIniDir()
+    {
+        string subDir = Path.Combine(_testDir, "default_log_dir");
+        Directory.CreateDirectory(subDir);
+        string iniPath = Path.Combine(subDir, "custom.ini");
+
+        File.WriteAllText(iniPath, @"
+server = 1.2.3.4:1399
+");
+
+        var cfg = ConfigParser.Parse(new[] { "-c", iniPath });
+        Assert.NotNull(cfg);
+        Assert.Equal(Path.Combine(subDir, "custom.log"), cfg.LogFile);
+    }
 }
+
 
 

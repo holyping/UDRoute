@@ -85,6 +85,11 @@ namespace UDRoute
                 await FileClientHelper.RunAsync(args);
                 return;
             }
+            if (cmd == "-add" || cmd == "-delete" || cmd == "-del" || cmd == "-remove" || cmd == "-rm" || cmd == "-list" || cmd == "-ls")
+            {
+                await RemoteControlHelper.RunAsync(args);
+                return;
+            }
             if (args.Any(a => a.Equals("-test", StringComparison.OrdinalIgnoreCase) ||
                               a.Equals("-check", StringComparison.OrdinalIgnoreCase) ||
                               a.Equals("-diag", StringComparison.OrdinalIgnoreCase) ||
@@ -337,7 +342,8 @@ namespace UDRoute
             }
             else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
             {
-                string svc = $"[Unit]\nDescription={name}\nAfter=network.target\n\n[Service]\nExecStart=\"{fullExe}\" -service -c \"{fullIni}\"\nRestart=always\nUser=root\n\n[Install]\nWantedBy=multi-user.target";
+                string iniDir = Path.GetDirectoryName(fullIni) ?? "/";
+                string svc = $"[Unit]\nDescription={name}\nAfter=network.target\n\n[Service]\nWorkingDirectory={iniDir}\nExecStart=\"{fullExe}\" -service -c \"{fullIni}\"\nRestart=always\nUser=root\n\n[Install]\nWantedBy=multi-user.target";
                 File.WriteAllText($"/etc/systemd/system/{name.ToLower()}.service", svc);
                 Process.Start("systemctl", "daemon-reload").WaitForExit();
                 Process.Start("systemctl", $"enable {name.ToLower()}").WaitForExit();

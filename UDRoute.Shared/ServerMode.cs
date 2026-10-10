@@ -74,8 +74,63 @@ namespace UDRoute
             return list;
         }
 
+        private CancellationToken _engineCt;
+        private readonly ConcurrentDictionary<string, bool> _activeKeepAlives = new();
+
+        public (bool Success, string Error) AddServerEndpoint(ServerRecord rec)
+        {
+            if (rec.IsFile)
+            {
+                try
+                {
+                    var listener = new TcpListener(IPAddress.Loopback, 0);
+                    listener.Start();
+                    rec.TargetIp = "127.0.0.1";
+                    rec.TargetPort = ((IPEndPoint)listener.LocalEndpoint).Port;
+                    rec.IsTcp = true;
+                    _ = FileProtocolHelper.RunServerAsync(listener, rec.BaseDir, rec.ReadOnly, _engineCt);
+                    Log.Info($"[S] Started internal File Protocol server on 127.0.0.1:{rec.TargetPort} for base dir {rec.BaseDir}");
+                }
+                catch (Exception ex)
+                {
+                    Log.Error($"[S] Failed to start File Protocol server for '{rec.Name}': {ex.Message}");
+                    return (false, ex.Message);
+                }
+            }
+
+            if (rec.IsThis && _localProxy != null)
+            {
+                _localProxy.ProcessRegisterDirect(rec, _config.DevId, _config.WanPort, _config.DevName);
+            }
+
+            if (!rec.IsThis && !string.IsNullOrWhiteSpace(rec.TargetServer) && rec.KeepAlive > 0)
+            {
+                if (_activeKeepAlives.TryAdd(rec.TargetServer, true))
+                {
+                    _ = Task.Run(() => RunPKeepAliveAsync(rec.TargetServer, rec.KeepAlive, _engineCt), _engineCt);
+                }
+            }
+
+            try { _reRegisterSignal.Release(); } catch { }
+            return (true, "");
+        }
+
+        public void RemoveServerEndpoint(ServerRecord rec)
+        {
+            List<TunnelSession> toClose;
+            lock (_sessionLock)
+            {
+                toClose = _sessions.Values.Where(s => s.ChannelDesc.Equals(rec.Name, StringComparison.OrdinalIgnoreCase) || s.ChannelDesc.StartsWith(rec.Name + "@", StringComparison.OrdinalIgnoreCase)).ToList();
+            }
+            foreach (var s in toClose)
+            {
+                try { s.Dispose(); } catch { }
+            }
+        }
+
         public async Task RunAsync(CancellationToken ct)
         {
+            _engineCt = ct;
             foreach (var rec in _config.ServerRecords)
             {
                 if (rec.IsFile)
@@ -106,7 +161,10 @@ namespace UDRoute
 
             foreach (var target in keepAliveTargets)
             {
-                _ = Task.Run(() => RunPKeepAliveAsync(target.TargetServer, target.Interval, ct), ct);
+                if (_activeKeepAlives.TryAdd(target.TargetServer, true))
+                {
+                    _ = Task.Run(() => RunPKeepAliveAsync(target.TargetServer, target.Interval, ct), ct);
+                }
             }
 
             NetworkAddressChangedEventHandler netHandler = (s, e) =>

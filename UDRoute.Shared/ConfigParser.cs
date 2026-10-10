@@ -105,9 +105,29 @@ namespace UDRoute
                 }
             }
 
+            string baseDir = !string.IsNullOrEmpty(config.ConfigPath)
+                ? (Path.GetDirectoryName(Path.GetFullPath(config.ConfigPath)) ?? Environment.CurrentDirectory)
+                : Environment.CurrentDirectory;
+
             if (string.IsNullOrEmpty(config.LogFile))
             {
-                config.LogFile = Path.ChangeExtension(config.ConfigPath ?? "udroute.ini", ".log");
+                if (!string.IsNullOrEmpty(config.ConfigPath))
+                {
+                    config.LogFile = Path.ChangeExtension(config.ConfigPath, ".log");
+                }
+                else
+                {
+                    config.LogFile = Path.GetFullPath(Path.Combine(baseDir, "udroute.log"));
+                }
+            }
+            else if (!Path.IsPathRooted(config.LogFile))
+            {
+                config.LogFile = Path.GetFullPath(Path.Combine(baseDir, config.LogFile));
+            }
+
+            if (!string.IsNullOrEmpty(config.AuthFile) && !Path.IsPathRooted(config.AuthFile))
+            {
+                config.AuthFile = Path.GetFullPath(Path.Combine(baseDir, config.AuthFile));
             }
 
             // 刷新日志系统配置
@@ -118,7 +138,7 @@ namespace UDRoute
                 config.EnableProxy = true;
             }
 
-            if (config.EnableProxy && config.Port == 0)
+            if (config.Port == 0)
             {
                 config.Port = Constants.DefaultProxyPort;
             }
@@ -188,6 +208,7 @@ namespace UDRoute
 
         private static bool ParseIniFile(string path, AppConfig cfg)
         {
+            string iniDir = Path.GetDirectoryName(Path.GetFullPath(path)) ?? Environment.CurrentDirectory;
             var lines = new List<string>();
             try
             {
@@ -312,8 +333,8 @@ namespace UDRoute
                                 _ => LogType.Default
                             };
                             break;
-                        case "logfile": cfg.LogFile = val; break;
-                        case "authfile": cfg.AuthFile = val; break;
+                        case "logfile": cfg.LogFile = Path.IsPathRooted(val) ? Path.GetFullPath(val) : Path.GetFullPath(Path.Combine(iniDir, val)); break;
+                        case "authfile": cfg.AuthFile = Path.IsPathRooted(val) ? Path.GetFullPath(val) : Path.GetFullPath(Path.Combine(iniDir, val)); break;
                         case "authmode":
                             cfg.AuthMode = val.ToLower() switch
                             {
@@ -376,6 +397,31 @@ namespace UDRoute
                                 configModified = true;
                                 cfg.AccessPassword = currentAccessPassword = hashBytes;
                             }
+                            break;
+                        case "controllerpassword" or "controllerpwd" or "controllerpass":
+                            if (val.StartsWith("_HASH256_", StringComparison.OrdinalIgnoreCase))
+                            {
+                                try
+                                {
+                                    cfg.ControllerPassword = Convert.FromBase64String(val.Substring(9));
+                                }
+                                catch
+                                {
+                                    Log.Warn($"[Config] Global controller password Base64 format error");
+                                    cfg.ControllerPassword = null;
+                                }
+                            }
+                            else
+                            {
+                                byte[] hashBytes = ManagedSHA256.ComputeHashBytes(Encoding.UTF8.GetBytes(val));
+                                string protectedVal = "_HASH256_" + Convert.ToBase64String(hashBytes);
+                                lines[i] = lines[i].Replace(val, protectedVal);
+                                configModified = true;
+                                cfg.ControllerPassword = hashBytes;
+                            }
+                            break;
+                        case "controllerport":
+                            if (int.TryParse(val, out int cp)) cfg.ControllerPort = cp;
                             break;
                         case "kcp": currentKcpConfig.SetProfile(val); break;
                         case "kcpnodelay": currentKcpConfig.NoDelay = val == "1" || bool.Parse(val); break;
@@ -548,18 +594,23 @@ namespace UDRoute
             return true;
         }
 
-        private static string? ParseClientRecord(string key, string val, AppConfig cfg, string defaultServer = "", int defaultMtu = Constants.DefaultMtu)
+        public static (ClientRecord? Record, string? ProtectedValue) ParseClientEndpoint(string key, string val, AppConfig cfg, string defaultServer = "", int defaultMtu = Constants.DefaultMtu)
         {
             var parts = key.Split('/');
             if (parts.Length > 1 && parts[1].Equals("file", StringComparison.OrdinalIgnoreCase))
             {
                 Console.WriteLine(I18n.Text("[Config] 错误: C模式下 'file' 协议不能绑定到本地端口。请使用 -push/-pull 命令。", "[Config] Error: The 'file' protocol cannot be bound to a local port in C-mode. Use the -push/-pull CLI commands instead."));
-                return null;
+                return (null, null);
+            }
+
+            if (!int.TryParse(parts[0], out int port) || port <= 0 || port > 65535)
+            {
+                return (null, null);
             }
 
             var rec = new ClientRecord
             {
-                Port = int.Parse(parts[0]),
+                Port = port,
                 IsTcp = parts.Length == 1 || parts[1].ToLower() == "tcp",
                 Mtu = defaultMtu,
                 ForceRelay = cfg.ForceRelay,
@@ -568,7 +619,7 @@ namespace UDRoute
 
             var valParts = val.Split('@');
             string namePart = valParts[0];
-            rec.TargetServer = valParts.Length > 1 ? valParts[1] : defaultServer;
+            rec.TargetServer = valParts.Length > 1 ? valParts[1] : (string.IsNullOrEmpty(defaultServer) ? cfg.Server : defaultServer);
             
             int colonIdx = namePart.IndexOf(':');
             string? newVal = null;
@@ -595,7 +646,7 @@ namespace UDRoute
             if (rec.TargetName.Contains('/'))
             {
                 Console.WriteLine(I18n.Text($"[Config] 错误: 目标服务名 '{rec.TargetName}' 不能包含 '/'，已忽略该条目。", $"[Config] Error: Target name '{rec.TargetName}' cannot contain '/'. Entry ignored."));
-                return null;
+                return (null, null);
             }
 
             if (string.IsNullOrEmpty(rec.TargetServer) || rec.TargetServer.Equals("this", StringComparison.OrdinalIgnoreCase))
@@ -604,8 +655,75 @@ namespace UDRoute
                 cfg.EnableProxy = true;
             }
 
-            cfg.ClientRecords.Add(rec);
+            return (rec, newVal);
+        }
+
+        private static string? ParseClientRecord(string key, string val, AppConfig cfg, string defaultServer = "", int defaultMtu = Constants.DefaultMtu)
+        {
+            var (rec, newVal) = ParseClientEndpoint(key, val, cfg, defaultServer, defaultMtu);
+            if (rec != null)
+            {
+                cfg.ClientRecords.Add(rec);
+            }
             return newVal;
+        }
+
+        public static ServerRecord? ParseServerEndpoint(string left, string right, AppConfig cfg)
+        {
+            var valParts = right.Split('@');
+            string srv = valParts.Length > 1 ? valParts[1] : (string.IsNullOrEmpty(cfg.Server) ? "localhost" : cfg.Server);
+            bool isThis = string.IsNullOrEmpty(srv) || srv.Equals("this", StringComparison.OrdinalIgnoreCase);
+            if (isThis) cfg.EnableProxy = true;
+
+            string srvName = left.Split('.')[0];
+            if (srvName.Contains('/'))
+            {
+                Console.WriteLine(I18n.Text($"[Config] 错误: 命令行服务名 '{srvName}' 不能包含 '/'，已忽略该参数。", $"[Config] Error: Server name '{srvName}' in command line cannot contain '/'. Argument ignored."));
+                return null;
+            }
+
+            var sRec = new ServerRecord
+            {
+                Name = srvName,
+                TargetServer = srv,
+                IsThis = isThis,
+                RegInterval = Constants.DefaultRegInterval,
+                Mtu = Constants.DefaultMtu,
+                KcpConfig = new KcpConfig(),
+                KeepAlive = cfg.KeepAlive
+            };
+
+            string targetPart = valParts[0];
+            if (targetPart.StartsWith("\"") && targetPart.EndsWith("\"") && targetPart.Length >= 2)
+            {
+                targetPart = targetPart.Substring(1, targetPart.Length - 2).Trim();
+            }
+            if (targetPart.EndsWith(";/file", StringComparison.OrdinalIgnoreCase))
+            {
+                sRec.IsFile = true;
+                sRec.BaseDir = targetPart.Substring(0, targetPart.Length - 6).TrimEnd('\\', '/');
+                if (!sRec.Name.EndsWith("/file", StringComparison.OrdinalIgnoreCase))
+                {
+                    sRec.Name += "/file";
+                }
+            }
+            else
+            {
+                var targetParts = targetPart.Split(new[] { ':', '/' });
+                if (targetParts.Length >= 2 && int.TryParse(targetParts[1], out int port))
+                {
+                    sRec.TargetIp = targetParts[0];
+                    sRec.TargetPort = port;
+                    sRec.IsTcp = targetParts.Length < 3 || targetParts[2].ToLower() == "tcp";
+                }
+                else
+                {
+                    Console.WriteLine(I18n.Text($"[Config] 错误: 目标格式 '{targetPart}' 无效。应为 'ip:port[/tcp|udp]' 或 'path;/file'。", $"[Config] Error: Invalid target format '{targetPart}'. Expected 'ip:port[/tcp|udp]' or 'path;/file'."));
+                    return null;
+                }
+            }
+
+            return sRec;
         }
 
         private static void ParseCommandLine(string[] args, AppConfig cfg)
@@ -626,58 +744,11 @@ namespace UDRoute
                     }
                     else
                     {
-                        // S模式命令: name.suffix=target:port/tcp@server or name=path;/file@server
-                        var valParts = right.Split('@');
-                        string srv = valParts.Length > 1 ? valParts[1] : "localhost";
-                        bool isThis = string.IsNullOrEmpty(srv) || srv.Equals("this", StringComparison.OrdinalIgnoreCase);
-                        if (isThis) cfg.EnableProxy = true;
-
-                        string srvName = left.Split('.')[0];
-                        if (srvName.Contains('/'))
+                        var sRec = ParseServerEndpoint(left, right, cfg);
+                        if (sRec != null)
                         {
-                            Console.WriteLine(I18n.Text($"[Config] 错误: 命令行服务名 '{srvName}' 不能包含 '/'，已忽略该参数。", $"[Config] Error: Server name '{srvName}' in command line cannot contain '/'. Argument ignored."));
-                            continue;
+                            cfg.ServerRecords.Add(sRec);
                         }
-
-                        var sRec = new ServerRecord
-                        {
-                            Name = srvName,
-                            TargetServer = srv,
-                            IsThis = isThis,
-                            RegInterval = Constants.DefaultRegInterval,
-                            Mtu = Constants.DefaultMtu,
-                            KcpConfig = new KcpConfig(),
-                            KeepAlive = cfg.KeepAlive
-                        };
-
-                        if (valParts[0].StartsWith("\"") && valParts[0].EndsWith("\"") && valParts[0].Length >= 2)
-                        {
-                            valParts[0] = valParts[0].Substring(1, valParts[0].Length - 2).Trim();
-                        }
-                        if (valParts[0].EndsWith(";/file", StringComparison.OrdinalIgnoreCase))
-                        {
-                            sRec.IsFile = true;
-                            sRec.BaseDir = valParts[0].Substring(0, valParts[0].Length - 6).TrimEnd('\\', '/');
-                            if (!sRec.Name.EndsWith("/file", StringComparison.OrdinalIgnoreCase))
-                            {
-                                sRec.Name += "/file";
-                            }
-                        }
-                        else
-                        {
-                            var targetParts = valParts[0].Split(new[] { ':', '/' });
-                            if (targetParts.Length >= 2 && int.TryParse(targetParts[1], out int port))
-                            {
-                                sRec.TargetIp = targetParts[0];
-                                sRec.TargetPort = port;
-                                sRec.IsTcp = targetParts.Length < 3 || targetParts[2].ToLower() == "tcp";
-                            }
-                            else
-                            {
-                                Console.WriteLine(I18n.Text($"[Config] 错误: 目标格式 '{valParts[0]}' 无效。应为 'ip:port[/tcp|udp]' 或 'path;/file'。", $"[Config] Error: Invalid target format '{valParts[0]}'. Expected 'ip:port[/tcp|udp]' or 'path;/file'."));
-                            }
-                        }
-                        cfg.ServerRecords.Add(sRec);
                     }
                 }
             }

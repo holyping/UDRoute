@@ -19,6 +19,8 @@ namespace UDRoute
         private ServerMode? _server;
         private ClientMode? _client;
 
+        private CancellationTokenSource? _engineCts;
+
         public ProxyMode? Proxy => _proxy;
         public ServerMode? Server => _server;
         public ClientMode? Client => _client;
@@ -33,6 +35,9 @@ namespace UDRoute
 
         public async Task StartAsync(CancellationToken ct)
         {
+            _engineCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            var effectiveCt = _engineCts.Token;
+
             _udp = new ZeroCopyUdpSocket(_config.Port);
             var boundEp = _udp.LocalEndPoint;
             Log.Info($"[RouteEngine] Core UDP socket bound to {boundEp}");
@@ -42,31 +47,37 @@ namespace UDRoute
             if (_config.EnableProxy)
             {
                 _proxy = new ProxyMode(_config, _udp);
-                tasks.Add(_proxy.RunAsync(ct));
+                tasks.Add(_proxy.RunAsync(effectiveCt));
                 Log.Info($"[P] Proxy running on UDP {_proxy.Port}");
             }
 
+            _server = new ServerMode(_config, _udp, _proxy); // 传入_proxy以支持 @this 优化模式
+            tasks.Add(_server.RunAsync(effectiveCt));
             if (_config.ServerRecords.Count > 0)
             {
-                _server = new ServerMode(_config, _udp, _proxy); // 传入_proxy以支持 @this 优化模式
-                tasks.Add(_server.RunAsync(ct));
                 Log.Info($"[S] Server mode active. DevId: {_config.DevId}");
             }
 
+            _client = new ClientMode(_config, _udp, _proxy);
+            tasks.Add(_client.RunAsync(effectiveCt));
             if (_config.ClientRecords.Count > 0)
             {
-                _client = new ClientMode(_config, _udp, _proxy);
-                tasks.Add(_client.RunAsync(ct));
                 Log.Info($"[C] Client mode active.");
             }
 
             if (_proxy != null && _server != null)
             {
-                _proxy.LocalServerRelayStartHandler = (mem, ep, ct) => _server.ProcessRelayStartAsync(mem, ep, ct);
+                _proxy.LocalServerRelayStartHandler = (mem, ep, c) => _server.ProcessRelayStartAsync(mem, ep, c);
             }
 
             // 核心 UDP 接收与分发循环
             tasks.Add(ReceiveUdpLoopAsync(ct));
+
+            if (_config.ControllerPassword != null && _config.ControllerPassword.Length > 0)
+            {
+                tasks.Add(RunTcpControllerLoopAsync(effectiveCt));
+                Log.Info($"[Controller] Remote controller active on TCP {_config.ControllerPort}");
+            }
 
             try
             {
@@ -621,8 +632,419 @@ namespace UDRoute
             return sb.ToString();
         }
 
+        private async Task RunTcpControllerLoopAsync(CancellationToken ct)
+        {
+            TcpListener? listener = null;
+            try
+            {
+                listener = Socket.OSSupportsIPv6 && !ProtocolHelper.DisableIPv6
+                    ? TcpListener.Create(_config.ControllerPort)
+                    : new TcpListener(IPAddress.Any, _config.ControllerPort);
+                listener.Server.SetSocketOption(SocketOptionLevel.IPv6, SocketOptionName.IPv6Only, false);
+                listener.Start();
+            }
+            catch (Exception ex)
+            {
+                Log.Error($"[Controller] Failed to start TCP controller listener on port {_config.ControllerPort}: {ex.Message}");
+                return;
+            }
+
+            try
+            {
+                while (!ct.IsCancellationRequested)
+                {
+                    var tcpClient = await listener.AcceptTcpClientAsync(ct);
+                    _ = HandleTcpControllerClientAsync(tcpClient, ct);
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                if (!ct.IsCancellationRequested)
+                {
+                    Log.Error($"[Controller] Controller listener loop error: {ex.Message}");
+                }
+            }
+            finally
+            {
+                try { listener.Stop(); } catch { }
+            }
+        }
+
+        private async Task HandleTcpControllerClientAsync(TcpClient client, CancellationToken ct)
+        {
+            using (client)
+            using (var stream = client.GetStream())
+            {
+                try
+                {
+                    using var readTimeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                    using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, readTimeoutCts.Token);
+                    var token = linkedCts.Token;
+
+                    byte[] lenBuf = new byte[4];
+                    await stream.ReadExactlyAsync(lenBuf, token);
+                    int totalLen = BinaryPrimitives.ReadInt32LittleEndian(lenBuf);
+                    if (totalLen < 62 || totalLen > 65536)
+                    {
+                        return;
+                    }
+
+                    byte[] reqBuf = new byte[totalLen];
+                    await stream.ReadExactlyAsync(reqBuf, token);
+
+                    var span = reqBuf.AsSpan();
+                    if ((MsgType)span[0] != MsgType.ControlReq)
+                    {
+                        return;
+                    }
+
+                    var requestId = new Guid(span.Slice(1, 16));
+                    var action = (ControlAction)span[17];
+                    long timestamp = BinaryPrimitives.ReadInt64LittleEndian(span.Slice(18, 8));
+                    var authHash = span.Slice(26, 32);
+
+                    // Anti-replay: 5 minutes tolerance
+                    long nowTicks = DateTime.UtcNow.Ticks;
+                    if (Math.Abs(nowTicks - timestamp) > TimeSpan.FromMinutes(5).Ticks)
+                    {
+                        await SendTcpControlRespAsync(stream, requestId, action, false, I18n.Text("认证失败: 时间偏差过大或重放校验失败。", "Authentication failed: time drift exceeds 5 minutes or replay detected."), token);
+                        return;
+                    }
+
+                    // ControllerPassword required
+                    if (_config.ControllerPassword == null || _config.ControllerPassword.Length == 0)
+                    {
+                        await SendTcpControlRespAsync(stream, requestId, action, false, I18n.Text("错误: 目标主机未配置 ControllerPassword，拒绝控制。", "Error: ControllerPassword not configured on remote host."), token);
+                        return;
+                    }
+
+                    byte[] hashInput = new byte[_config.ControllerPassword.Length + 8];
+                    _config.ControllerPassword.CopyTo(hashInput, 0);
+                    BinaryPrimitives.WriteInt64LittleEndian(hashInput.AsSpan(_config.ControllerPassword.Length, 8), timestamp);
+                    byte[] expectedHash = ManagedSHA256.ComputeHashBytes(hashInput);
+
+                    if (!authHash.SequenceEqual(expectedHash))
+                    {
+                        await SendTcpControlRespAsync(stream, requestId, action, false, I18n.Text("认证失败: 远程控制密码错误。", "Authentication failed: invalid ControllerPassword."), token);
+                        return;
+                    }
+
+                    int count = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(58, 4));
+                    var items = new List<string>();
+                    int offset = 62;
+                    for (int i = 0; i < count; i++)
+                    {
+                        if (offset >= span.Length) break;
+                        var (item, readLen) = ProtocolHelper.ReadString(span.Slice(offset));
+                        items.Add(item);
+                        offset += readLen;
+                    }
+
+                    bool success = true;
+                    string message = "";
+
+                    switch (action)
+                    {
+                        case ControlAction.Add:
+                        {
+                            var msgs = new List<string>();
+                            bool anyFail = false;
+                            foreach (var item in items)
+                            {
+                                var (addOk, addMsg) = await AddEndpointFromControlAsync(item);
+                                if (!addOk) anyFail = true;
+                                msgs.Add(addMsg);
+                            }
+                            success = !anyFail;
+                            message = string.Join("\n", msgs);
+                            break;
+                        }
+                        case ControlAction.Delete:
+                        {
+                            var msgs = new List<string>();
+                            bool anyFail = false;
+                            foreach (var item in items)
+                            {
+                                var (delOk, delMsg) = await RemoveEndpointFromControlAsync(item);
+                                if (!delOk) anyFail = true;
+                                msgs.Add(delMsg);
+                            }
+                            success = !anyFail;
+                            message = string.Join("\n", msgs);
+                            break;
+                        }
+                        case ControlAction.List:
+                        {
+                            success = true;
+                            message = GetEndpointsListString();
+                            break;
+                        }
+                        default:
+                            success = false;
+                            message = $"Unknown control action {(byte)action}";
+                            break;
+                    }
+
+                    await SendTcpControlRespAsync(stream, requestId, action, success, message, token);
+                }
+                catch (Exception ex)
+                {
+                    Log.Debug($"[Controller] TCP client handler exception: {ex.Message}");
+                }
+            }
+        }
+
+        private static async ValueTask SendTcpControlRespAsync(NetworkStream stream, Guid requestId, ControlAction action, bool success, string message, CancellationToken ct)
+        {
+            int msgBytes = Encoding.UTF8.GetByteCount(message);
+            int bodyLen = 1 + 16 + 1 + 1 + 4 + msgBytes;
+            byte[] buf = new byte[4 + bodyLen];
+            BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(0, 4), bodyLen);
+            buf[4] = (byte)MsgType.ControlResp;
+            requestId.TryWriteBytes(buf.AsSpan(5, 16));
+            buf[21] = (byte)action;
+            buf[22] = (byte)(success ? 1 : 0);
+            ProtocolHelper.WriteString(buf.AsSpan(23), message);
+
+            await stream.WriteAsync(buf, ct);
+            await stream.FlushAsync(ct);
+        }
+
+        private async Task<(bool Success, string Message)> AddEndpointFromControlAsync(string endpointStr)
+        {
+            if (string.IsNullOrWhiteSpace(endpointStr))
+                return (false, "Endpoint definition cannot be empty.");
+
+            int eqIdx = endpointStr.IndexOf('=');
+            if (eqIdx <= 0)
+                return (false, "Endpoint definition must contain '=' (e.g. 3443=xeno@www.qzsoft.top).");
+
+            string left = endpointStr.Substring(0, eqIdx).Trim();
+            string right = endpointStr.Substring(eqIdx + 1).Trim();
+
+            if (char.IsDigit(left[0]))
+            {
+                var (cRec, _) = ConfigParser.ParseClientEndpoint(left, right, _config);
+                if (cRec == null)
+                    return (false, $"Invalid C-endpoint syntax: '{endpointStr}'");
+
+                return await AddClientEndpointAsync(cRec, endpointStr);
+            }
+            else
+            {
+                var sRec = ConfigParser.ParseServerEndpoint(left, right, _config);
+                if (sRec == null)
+                    return (false, $"Invalid S-endpoint syntax: '{endpointStr}'");
+
+                return await AddServerEndpointAsync(sRec, endpointStr);
+            }
+        }
+
+        public async Task<(bool Success, string Message)> AddClientEndpointAsync(ClientRecord rec, string? rawLine = null)
+        {
+            lock (_config.ClientRecords)
+            {
+                if (_config.ClientRecords.Any(c => c.Port == rec.Port && c.IsTcp == rec.IsTcp))
+                {
+                    return (false, $"Port {rec.Port}/{(rec.IsTcp ? "tcp" : "udp")} is already in use by another C-endpoint.");
+                }
+            }
+
+            if (_client == null)
+            {
+                _client = new ClientMode(_config, _udp!, _proxy);
+                _ = _client.RunAsync(_engineCts != null ? _engineCts.Token : CancellationToken.None);
+            }
+
+            var (started, err) = _client.AddClientEndpoint(rec);
+            if (!started)
+            {
+                return (false, $"Failed to start listener on port {rec.Port}: {err}");
+            }
+
+            lock (_config.ClientRecords)
+            {
+                _config.ClientRecords.Add(rec);
+            }
+
+            ConfigFileHelper.AddClientRecordToIni(_config.ConfigPath, rec, rawLine);
+            Log.Info($"[Control] Added C-endpoint {rec.Port}/{(rec.IsTcp ? "tcp" : "udp")}={rec.TargetName}@{rec.TargetServer}");
+            return (true, $"Added C-endpoint: {rec.Port}/{(rec.IsTcp ? "tcp" : "udp")}={rec.TargetName}@{rec.TargetServer}");
+        }
+
+        public async Task<(bool Success, string Message)> AddServerEndpointAsync(ServerRecord rec, string? rawLine = null)
+        {
+            lock (_config.ServerRecords)
+            {
+                if (_config.ServerRecords.Any(s => s.Name.Equals(rec.Name, StringComparison.OrdinalIgnoreCase)))
+                {
+                    return (false, $"Server service name '{rec.Name}' already exists.");
+                }
+            }
+
+            if (_server == null)
+            {
+                _server = new ServerMode(_config, _udp!, _proxy);
+                if (_proxy != null)
+                {
+                    _proxy.LocalServerRelayStartHandler = (mem, ep, ct) => _server.ProcessRelayStartAsync(mem, ep, ct);
+                }
+                _ = _server.RunAsync(_engineCts != null ? _engineCts.Token : CancellationToken.None);
+            }
+
+            var (started, err) = _server.AddServerEndpoint(rec);
+            if (!started)
+            {
+                return (false, $"Failed to start S-endpoint '{rec.Name}': {err}");
+            }
+
+            lock (_config.ServerRecords)
+            {
+                _config.ServerRecords.Add(rec);
+            }
+
+            ConfigFileHelper.AddServerRecordToIni(_config.ConfigPath, rec, rawLine);
+            Log.Info($"[Control] Added S-endpoint {rec.Name}");
+            return (true, $"Added S-endpoint: {rec.Name}");
+        }
+
+        private async Task<(bool Success, string Message)> RemoveEndpointFromControlAsync(string target)
+        {
+            if (string.IsNullOrWhiteSpace(target))
+                return (false, "Target endpoint name or port cannot be empty.");
+
+            int eqIdx = target.IndexOf('=');
+            string left = (eqIdx > 0 ? target.Substring(0, eqIdx) : target).Trim();
+
+            if (char.IsDigit(left[0]))
+            {
+                var parts = left.Split('/');
+                if (int.TryParse(parts[0], out int port))
+                {
+                    bool? isTcp = parts.Length > 1
+                        ? (parts[1].Equals("tcp", StringComparison.OrdinalIgnoreCase) ? true : parts[1].Equals("udp", StringComparison.OrdinalIgnoreCase) ? false : null)
+                        : null;
+
+                    return await RemoveClientEndpointAsync(port, isTcp);
+                }
+            }
+
+            return await RemoveServerEndpointAsync(left);
+        }
+
+        public async Task<(bool Success, string Message)> RemoveClientEndpointAsync(int port, bool? isTcp = null)
+        {
+            ClientRecord? rec;
+            lock (_config.ClientRecords)
+            {
+                rec = _config.ClientRecords.FirstOrDefault(c => c.Port == port && (isTcp == null || c.IsTcp == isTcp.Value));
+                if (rec != null)
+                {
+                    _config.ClientRecords.Remove(rec);
+                }
+            }
+
+            if (rec == null)
+            {
+                return (false, $"C-endpoint on port {port} not found.");
+            }
+
+            if (_client != null)
+            {
+                _client.RemoveClientEndpoint(rec);
+            }
+
+            ConfigFileHelper.RemoveClientRecordFromIni(_config.ConfigPath, rec.Port, rec.IsTcp);
+            Log.Info($"[Control] Removed C-endpoint {rec.Port}/{(rec.IsTcp ? "tcp" : "udp")}");
+            return (true, $"Removed C-endpoint: {rec.Port}/{(rec.IsTcp ? "tcp" : "udp")}");
+        }
+
+        public async Task<(bool Success, string Message)> RemoveServerEndpointAsync(string name)
+        {
+            ServerRecord? rec;
+            lock (_config.ServerRecords)
+            {
+                rec = _config.ServerRecords.FirstOrDefault(s =>
+                    s.Name.Equals(name, StringComparison.OrdinalIgnoreCase) ||
+                    s.Name.Equals(name + "/file", StringComparison.OrdinalIgnoreCase) ||
+                    (s.Name.EndsWith("/file", StringComparison.OrdinalIgnoreCase) && s.Name.Substring(0, s.Name.Length - 5).Equals(name, StringComparison.OrdinalIgnoreCase)));
+
+                if (rec != null)
+                {
+                    _config.ServerRecords.Remove(rec);
+                }
+            }
+
+            if (rec == null)
+            {
+                return (false, $"S-endpoint '{name}' not found.");
+            }
+
+            if (_server != null)
+            {
+                _server.RemoveServerEndpoint(rec);
+            }
+
+            ConfigFileHelper.RemoveServerRecordFromIni(_config.ConfigPath, rec.Name);
+            Log.Info($"[Control] Removed S-endpoint {rec.Name}");
+            return (true, $"Removed S-endpoint: {rec.Name}");
+        }
+
+        public string GetEndpointsListString()
+        {
+            var sb = new StringBuilder();
+            if (_proxy != null)
+            {
+                sb.AppendLine($"[Proxy Mode] UDP Port {_proxy.Port}");
+            }
+
+            List<ClientRecord> clients;
+            lock (_config.ClientRecords)
+            {
+                clients = _config.ClientRecords.ToList();
+            }
+
+            sb.AppendLine($"[Client Endpoints] (Total: {clients.Count})");
+            if (clients.Count == 0)
+            {
+                sb.AppendLine("  (None)");
+            }
+            else
+            {
+                foreach (var c in clients)
+                {
+                    sb.AppendLine($"  - {c.Port}/{(c.IsTcp ? "tcp" : "udp")}={c.TargetName}@{c.TargetServer}");
+                }
+            }
+
+            List<ServerRecord> servers;
+            lock (_config.ServerRecords)
+            {
+                servers = _config.ServerRecords.ToList();
+            }
+
+            sb.AppendLine($"[Server Endpoints] (Total: {servers.Count})");
+            if (servers.Count == 0)
+            {
+                sb.AppendLine("  (None)");
+            }
+            else
+            {
+                foreach (var s in servers)
+                {
+                    string target = s.IsFile ? $"{s.BaseDir};/file" : $"{s.TargetIp}:{s.TargetPort}/{(s.IsTcp ? "tcp" : "udp")}";
+                    sb.AppendLine($"  - {s.Name}={target}@{s.TargetServer}");
+                }
+            }
+
+            return sb.ToString().TrimEnd();
+        }
+
         public void Dispose()
         {
+            _engineCts?.Cancel();
+            _engineCts?.Dispose();
             _udp?.Dispose();
         }
     }

@@ -21,7 +21,16 @@ namespace UDRoute
         NatTestReq = 15,
         NatTestResp = 16,
         ServerIpsReq = 17,
-        ServerIpsResp = 18
+        ServerIpsResp = 18,
+        ControlReq = 19,
+        ControlResp = 20
+    }
+
+    public enum ControlAction : byte
+    {
+        Add = 1,
+        Delete = 2,
+        List = 3
     }
 
     public static class NatTestFlags

@@ -36,6 +36,10 @@ UDRoute 是一个 P2P/中继 隧道系统。该系统包含三种基本角色：
 - `RelayStartAck = 14`：S -> P (响应中继建立请求)
 - `NatTestReq = 15`：S/C -> P (NAT 诊断探测请求)
 - `NatTestResp = 16`：P -> S/C (NAT 诊断探测响应)
+- `ServerIpsReq = 17`：客户端向 P 查询本地多 IP 候选列表
+- `ServerIpsResp = 18`：P 响应本地多 IP 候选列表
+- `ControlReq = 19`：管理客户端向远程 udroute 发起端点增删查控制请求 (-add / -delete / -list)
+- `ControlResp = 20`：远程 udroute 响应控制指令执行结果
 
 ## 3. 核心数据包结构解析 (Packet Formats)
 
@@ -166,6 +170,26 @@ UDRoute 是一个 P2P/中继 隧道系统。该系统包含三种基本角色：
 - **Disconnect (6)**: 携带 `[SessionId]` 即可，用于终止整个会话。
 - **RelayEnd (13)**: 携带 `[SessionId]`。当 C 与 S 打洞成功并建立直连通讯后，发送给 P，告知 P 端不再需要中继，释放服务器内存资源。
 
+### 3.7. 远程控制与端点管理 (ControlReq / ControlResp)
+用于通过 `-add`、`-delete`、`-list` 命令远程对正在运行的 udroute 实例进行 S/C 端点管理。
+
+**ControlReq (19)** (Client -> Remote udroute)
+- `[MsgType = 19] (1 byte)`
+- `[RequestId] (16 bytes, Guid)`: 请求跟踪 ID
+- `[Action] (1 byte)`: 1 = Add, 2 = Delete, 3 = List
+- `[AuthHash] (32 bytes)`: SHA256 哈希值 (若远程配置了 AccessPassword 则比对；未配置则忽略)
+- `[Payload] (String, 4 bytes LE 长度 + UTF-8 字符串)`:
+  - Add: 端点快捷配置语法字符串 (例: `3443=xeno@www.qzsoft.top` 或 `web=127.0.0.1:80/tcp@www.qzsoft.top`)
+  - Delete: 目标端点端口、服务名或完整定义字符串 (例: `3443` 或 `web`)
+  - List: 空字符串 `""`
+
+**ControlResp (20)** (Remote udroute -> Client)
+- `[MsgType = 20] (1 byte)`
+- `[RequestId] (16 bytes, Guid)`: 对应请求的 RequestId
+- `[Action] (1 byte)`: 对应请求的 Action
+- `[Status] (1 byte)`: 1 = 成功, 0 = 失败
+- `[Message] (String, 4 bytes LE 长度 + UTF-8 字符串)`: 响应结果说明或端点清单格式化文本
+
 ## 4. 文件传输子协议 (File Transfer Protocol: /file)
 
 UDRoute 内置了基于隧道流式传输的轻量级文件传输子协议（由 TCP/KCP 可靠通道承载）。S 端可通过 `/file` 语法暴露指定基础目录，C 端使用 `-push` 或 `-pull` 进行文件上传与下载。
@@ -201,4 +225,35 @@ UDRoute 内置了基于隧道流式传输的轻量级文件传输子协议（由
 4. **数据传输**:
    - **Server -> Client**: `[FileSize] (8 bytes LE)` + `[Payload (FileSize bytes)]`。
    - Client 将数据流式写入本地文件或标准输出 (`con:`)。
+
+---
+
+## 5. 远程动态管理协议 (Remote Control Protocol, TCP 9401)
+
+专用于通过命令行 `udroute -add`、`-delete` (`-del`)、`-list` (`-ls`) 对远端正在运行的 `udroute` 节点进行热增删查操作。
+
+- **独立 TCP 端口**: 默认使用 TCP `9401`（可通过 ini 中的 `ControllerPort` 调整）。
+- **安全防护**: 远端仅在配置了 `ControllerPassword` 时开启此端口；未配置时拒绝任何遥控，端口不打开。
+- **通信载荷**: 基于 4 字节小端序长度前缀定界。
+
+### 5.1. 请求报文 (ControlReq = 19)
+
+```text
++-------------------+------------------+---------------------+-------------------+---------------------+--------------------+--------------------+--------------------+
+| TotalLength (4B)  | MsgType 19 (1B)  | RequestId GUID (16B)| Action (1B)       | Timestamp Ticks (8B)| AuthHash (32B)     | PayloadCount (4B)  | Payloads (N * Str) |
++-------------------+------------------+---------------------+-------------------+---------------------+--------------------+--------------------+--------------------+
+```
+
+- `Action`: `1 = Add`, `2 = Delete`, `3 = List`
+- `Timestamp Ticks`: 发起请求时的 UTC 时间戳 (`DateTime.UtcNow.Ticks`)，允许 ±5 分钟漂移抗重放。
+- `AuthHash`: `SHA256(ControllerPasswordHash + Timestamp Ticks)`
+- `Payloads`: 包含的端点定义或删除标识符列表（每个为 `4字节长度 + UTF8内容`）。
+
+### 5.2. 响应报文 (ControlResp = 20)
+
+```text
++-------------------+------------------+---------------------+-------------------+---------------------+---------------------------------------+
+| TotalLength (4B)  | MsgType 20 (1B)  | RequestId GUID (16B)| Action (1B)       | Status (1B, 0/1)    | Message (4B Len + UTF8 Result String) |
++-------------------+------------------+---------------------+-------------------+---------------------+---------------------------------------+
+```
 
