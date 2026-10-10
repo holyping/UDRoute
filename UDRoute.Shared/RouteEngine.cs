@@ -51,17 +51,17 @@ namespace UDRoute
                 Log.Info($"[P] Proxy running on UDP {_proxy.Port}");
             }
 
-            _server = new ServerMode(_config, _udp, _proxy); // 传入_proxy以支持 @this 优化模式
-            tasks.Add(_server.RunAsync(effectiveCt));
             if (_config.ServerRecords.Count > 0)
             {
+                _server = new ServerMode(_config, _udp, _proxy); // 传入_proxy以支持 @this 优化模式
+                tasks.Add(_server.RunAsync(effectiveCt));
                 Log.Info($"[S] Server mode active. DevId: {_config.DevId}");
             }
 
-            _client = new ClientMode(_config, _udp, _proxy);
-            tasks.Add(_client.RunAsync(effectiveCt));
             if (_config.ClientRecords.Count > 0)
             {
+                _client = new ClientMode(_config, _udp, _proxy);
+                tasks.Add(_client.RunAsync(effectiveCt));
                 Log.Info($"[C] Client mode active.");
             }
 
@@ -569,6 +569,15 @@ namespace UDRoute
             if (_proxy != null && await _proxy.TryRelayDataAsync(sessionId, mem, remoteEp, ct))
             {
                 return;
+            }
+
+            // 4. 所有模式均未处理 (如果非 Proxy 模式节点收到未知或已失效 Session 的数据，回发 Disconnect 促使对端清理)
+            if (_proxy == null)
+            {
+                byte[] disc = new byte[17];
+                disc[0] = (byte)MsgType.Disconnect;
+                sessionId.TryWriteBytes(disc.AsSpan(1, 16));
+                try { await _udp!.SendAsync(disc, remoteEp, default); } catch { }
             }
         }
 

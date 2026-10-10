@@ -909,10 +909,7 @@ public class AuthTests : IDisposable
         string passwordB = "_HASH256_" + Convert.ToBase64String(bBytes);
         File.WriteAllLines(pwdFile, new[] { $"holyping:{passwordB}" });
 
-        using var lP = new TcpListener(IPAddress.Loopback, 0);
-        lP.Start();
-        int pPort = ((IPEndPoint)lP.LocalEndpoint).Port;
-        lP.Stop();
+        int pPort = GetFreeUdpPort();
 
         var pCfg = new AppConfig
         {
@@ -928,8 +925,10 @@ public class AuthTests : IDisposable
 
         // 2. Setup S configuration with plaintext password in s.ini
         string sIniPath = Path.Combine(_testDir, "s.ini");
+        int sPort = GetFreeUdpPort();
         File.WriteAllLines(sIniPath, new[]
         {
+            $"Port={sPort}",
             $"DevId={Guid.NewGuid()}",
             "Username=holyping",
             $"Password={passwordA}",
@@ -940,11 +939,13 @@ public class AuthTests : IDisposable
 
         // First run: parse s.ini with plaintext password
         var sCfg1 = ConfigParser.Parse(new[] { "-c", sIniPath }, false);
+        Assert.NotNull(sCfg1);
         var sEngine1 = new RouteEngine(sCfg1);
-        _ = sEngine1.StartAsync(cts.Token);
+        var startTask = sEngine1.StartAsync(cts.Token);
 
         // Wait for S to register with P
         await Task.Delay(1500, cts.Token);
+        if (startTask.IsFaulted) throw startTask.Exception!;
 
         // Verify P registered the service and it is authenticated
         var proxy = pEngine.Proxy;
@@ -1192,6 +1193,12 @@ public class AuthTests : IDisposable
             ClientMode.CustomPasswordReader = null;
             echoListener.Stop();
         }
+    }
+
+    private static int GetFreeUdpPort()
+    {
+        using var udp = new UdpClient(0);
+        return ((IPEndPoint)udp.Client.LocalEndPoint!).Port;
     }
 }
 

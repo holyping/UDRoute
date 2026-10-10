@@ -1099,12 +1099,6 @@ namespace UDRoute
                 return true;
             }
 
-            // 防御性处理：收到未知或已失效 Session 的数据（例如 S 重启后），主动向发送方回发 Disconnect
-            // 告知对端（或 P 端）该会话已不存在，促使对端立即清理失效的复用通道
-            byte[] disc = new byte[17];
-            disc[0] = (byte)MsgType.Disconnect;
-            sessionId.TryWriteBytes(disc.AsSpan(1, 16));
-            try { _ = _udp.SendAsync(disc, remoteEp, default); } catch { }
             return false;
         }
 

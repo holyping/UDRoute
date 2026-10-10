@@ -181,8 +181,9 @@ namespace UDRoute.Tests
         {
             string iniPath = Path.Combine(_testDir, "udroute.ini");
             int ctrlPort = GetFreeTcpPort();
+            int freeUdpPort = GetFreeUdpPort();
 
-            File.WriteAllText(iniPath, $@"Port=9400
+            File.WriteAllText(iniPath, $@"Port={freeUdpPort}
 ControllerPort={ctrlPort}
 ControllerPassword=MyPlainSecret999
 
@@ -203,13 +204,13 @@ server=p.com
             using var cts = new CancellationTokenSource();
             using var engine = new RouteEngine(cfg);
             _ = engine.StartAsync(cts.Token);
-            await Task.Delay(150);
+            await Task.Delay(500);
 
             int cPort = GetFreeTcpPort();
 
             // Add endpoint remotely using plain password
-            var (addOk, _) = await RemoteControlHelper.SendControlCommandAsync("127.0.0.1", ctrlPort, ControlAction.Add, new List<string> { $"{cPort}=xeno@www.qzsoft.top" }, "MyPlainSecret999");
-            Assert.True(addOk);
+            var (addOk, addMsg) = await RemoteControlHelper.SendControlCommandAsync("127.0.0.1", ctrlPort, ControlAction.Add, new List<string> { $"{cPort}=xeno@www.qzsoft.top" }, "MyPlainSecret999");
+            Assert.True(addOk, addMsg);
 
             string iniAfterAdd = File.ReadAllText(iniPath);
             Assert.Contains($"{cPort}=xeno@www.qzsoft.top", iniAfterAdd);
@@ -281,6 +282,12 @@ server=p.com
             int port = ((IPEndPoint)listener.LocalEndpoint).Port;
             listener.Stop();
             return port;
+        }
+
+        private static int GetFreeUdpPort()
+        {
+            using var udp = new UdpClient(0);
+            return ((IPEndPoint)udp.Client.LocalEndPoint!).Port;
         }
     }
 }
