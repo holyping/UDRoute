@@ -1,4 +1,8 @@
 using System.IO;
+using System.Net;
+using System.Net.Sockets;
+using System.Threading;
+using System.Threading.Tasks;
 using UDRoute;
 using Xunit;
 
@@ -303,6 +307,147 @@ server = 1.2.3.4:1399
         var cfg = ConfigParser.Parse(new[] { "-c", iniPath });
         Assert.NotNull(cfg);
         Assert.Equal(Path.Combine(subDir, "custom.log"), cfg.LogFile);
+    }
+
+    [Fact]
+    public void ParseCommandLine_ClientOnly_UsesRandomPort_NotDefault9400()
+    {
+        var cfg = ConfigParser.Parse(new[] { "11433=sql@www.qzsoft.top" });
+        Assert.NotNull(cfg);
+        Assert.False(cfg.EnableProxy);
+        Assert.Equal(0, cfg.Port);
+        Assert.Single(cfg.ClientRecords);
+    }
+
+    [Fact]
+    public void ParseCommandLine_ServerOnly_UsesRandomPort_NotDefault9400()
+    {
+        var cfg = ConfigParser.Parse(new[] { "sql=127.0.0.1:1433@www.qzsoft.top" });
+        Assert.NotNull(cfg);
+        Assert.False(cfg.EnableProxy);
+        Assert.Equal(0, cfg.Port);
+        Assert.Single(cfg.ServerRecords);
+    }
+
+    [Fact]
+    public void ParseIni_ClientOrServerOnly_WithoutProxyConfig_UsesRandomPort()
+    {
+        string cIni = Path.Combine(_testDir, "c_only.ini");
+        File.WriteAllText(cIni, "11433/tcp = sql@www.qzsoft.top\n");
+        var cCfg = ConfigParser.Parse(new[] { "-c", cIni });
+        Assert.NotNull(cCfg);
+        Assert.False(cCfg.EnableProxy);
+        Assert.Equal(0, cCfg.Port);
+
+        string sIni = Path.Combine(_testDir, "s_only.ini");
+        File.WriteAllText(sIni, "server = www.qzsoft.top\n[sql]\ntarget = 127.0.0.1:1433/tcp\n");
+        var sCfg = ConfigParser.Parse(new[] { "-c", sIni });
+        Assert.NotNull(sCfg);
+        Assert.False(sCfg.EnableProxy);
+        Assert.Equal(0, sCfg.Port);
+
+        string scIni = Path.Combine(_testDir, "sc_only.ini");
+        File.WriteAllText(scIni, "server = www.qzsoft.top\n11433/tcp = sql\n[sql]\ntarget = 127.0.0.1:1433/tcp\n");
+        var scCfg = ConfigParser.Parse(new[] { "-c", scIni });
+        Assert.NotNull(scCfg);
+        Assert.False(scCfg.EnableProxy);
+        Assert.Equal(0, scCfg.Port);
+    }
+
+    [Fact]
+    public void Parse_ExplicitProxyMode_UsesDefault9400OrConfiguredPort()
+    {
+        var cThis = ConfigParser.Parse(new[] { "11433=sql@this" });
+        Assert.NotNull(cThis);
+        Assert.True(cThis.EnableProxy);
+        Assert.Equal(Constants.DefaultProxyPort, cThis.Port);
+
+        var sThis = ConfigParser.Parse(new[] { "sql=127.0.0.1:1433@this" });
+        Assert.NotNull(sThis);
+        Assert.True(sThis.EnableProxy);
+        Assert.Equal(Constants.DefaultProxyPort, sThis.Port);
+
+        string pOnlyIni = Path.Combine(_testDir, "p_only.ini");
+        File.WriteAllText(pOnlyIni, "authmode=none\n");
+        var pCfg = ConfigParser.Parse(new[] { "-c", pOnlyIni });
+        Assert.NotNull(pCfg);
+        Assert.True(pCfg.EnableProxy);
+        Assert.Equal(Constants.DefaultProxyPort, pCfg.Port);
+
+        string sWithPortIni = Path.Combine(_testDir, "s_port.ini");
+        File.WriteAllText(sWithPortIni, "port=9501\n[sql]\ntarget=127.0.0.1:1433\nserver=www.qzsoft.top\n");
+        var sWithPortCfg = ConfigParser.Parse(new[] { "-c", sWithPortIni });
+        Assert.NotNull(sWithPortCfg);
+        Assert.True(sWithPortCfg.EnableProxy);
+        Assert.Equal(9501, sWithPortCfg.Port);
+
+        string cWithRegTimeoutIni = Path.Combine(_testDir, "c_regtimeout.ini");
+        File.WriteAllText(cWithRegTimeoutIni, "regtimeout=600\n11433=sql@www.qzsoft.top\n");
+        var cWithRegTimeoutCfg = ConfigParser.Parse(new[] { "-c", cWithRegTimeoutIni });
+        Assert.NotNull(cWithRegTimeoutCfg);
+        Assert.True(cWithRegTimeoutCfg.EnableProxy);
+        Assert.Equal(Constants.DefaultProxyPort, cWithRegTimeoutCfg.Port);
+
+        string sThisIni = Path.Combine(_testDir, "s_this.ini");
+        File.WriteAllText(sThisIni, "[sql]\ntarget=127.0.0.1:1433\nserver=this\n");
+        var sThisIniCfg = ConfigParser.Parse(new[] { "-c", sThisIni });
+        Assert.NotNull(sThisIniCfg);
+        Assert.True(sThisIniCfg.EnableProxy);
+        Assert.Equal(Constants.DefaultProxyPort, sThisIniCfg.Port);
+    }
+
+    [Fact]
+    public async Task RouteEngine_ClientOrServerWithoutProxy_BindsRandomPortNot9400()
+    {
+        using var probeTcp = new TcpListener(IPAddress.Loopback, 0);
+        probeTcp.Start();
+        int freeTcpPort = ((IPEndPoint)probeTcp.LocalEndpoint).Port;
+        probeTcp.Stop();
+
+        var cliCfg = ConfigParser.Parse(new[] { $"{freeTcpPort}=sql@127.0.0.1", "-log", "none" });
+        Assert.NotNull(cliCfg);
+        Assert.False(cliCfg.EnableProxy);
+        Assert.Equal(0, cliCfg.Port);
+
+        using (var cts = new CancellationTokenSource())
+        using (var engine = new RouteEngine(cliCfg))
+        {
+            var runTask = engine.StartAsync(cts.Token);
+            await Task.Delay(150);
+            Assert.Null(engine.Proxy);
+            Assert.True(engine.BoundPort > 0);
+            Assert.NotEqual(Constants.DefaultProxyPort, engine.BoundPort);
+            cts.Cancel();
+            try { await runTask; } catch { }
+        }
+
+        // Defense-in-depth: even if AppConfig has Port=9400 while EnableProxy=false, RouteEngine binds random port
+        var legacyCfg = new AppConfig
+        {
+            EnableProxy = false,
+            Port = Constants.DefaultProxyPort,
+            ConfigPath = "dummy.ini"
+        };
+        legacyCfg.ServerRecords.Add(new ServerRecord
+        {
+            Name = "sql",
+            TargetIp = "127.0.0.1",
+            TargetPort = 1433,
+            TargetServer = "127.0.0.1:9400",
+            IsTcp = true
+        });
+
+        using (var cts = new CancellationTokenSource())
+        using (var engine = new RouteEngine(legacyCfg))
+        {
+            var runTask = engine.StartAsync(cts.Token);
+            await Task.Delay(150);
+            Assert.Null(engine.Proxy);
+            Assert.True(engine.BoundPort > 0);
+            Assert.NotEqual(Constants.DefaultProxyPort, engine.BoundPort);
+            cts.Cancel();
+            try { await runTask; } catch { }
+        }
     }
 }
 

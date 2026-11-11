@@ -24,6 +24,7 @@ namespace UDRoute
         public ProxyMode? Proxy => _proxy;
         public ServerMode? Server => _server;
         public ClientMode? Client => _client;
+        public int BoundPort => (_udp?.LocalEndPoint is IPEndPoint ep) ? ep.Port : 0;
 
         private readonly IEngineCallback? _callback;
 
@@ -38,7 +39,8 @@ namespace UDRoute
             _engineCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             var effectiveCt = _engineCts.Token;
 
-            _udp = new ZeroCopyUdpSocket(_config.Port);
+            int bindPort = (!_config.EnableProxy && _config.Port == Constants.DefaultProxyPort) ? 0 : _config.Port;
+            _udp = new ZeroCopyUdpSocket(bindPort);
             var boundEp = _udp.LocalEndPoint;
             Log.Info($"[RouteEngine] Core UDP socket bound to {boundEp}");
 

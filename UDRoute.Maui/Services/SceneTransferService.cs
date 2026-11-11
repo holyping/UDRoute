@@ -46,6 +46,11 @@ public static class SceneTransferService
             var dto = JsonSerializer.Deserialize<SceneTransferDto>(json, _jsonOptions);
             if (dto == null) return null;
 
+            if (!dto.Config.EnableProxy)
+            {
+                dto.Config.Port = 0;
+            }
+
             return new Scene
             {
                 Name = dto.Name,

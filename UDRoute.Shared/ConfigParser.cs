@@ -138,7 +138,7 @@ namespace UDRoute
                 config.EnableProxy = true;
             }
 
-            if (config.Port == 0)
+            if (config.EnableProxy && config.Port == 0)
             {
                 config.Port = Constants.DefaultProxyPort;
             }
@@ -545,10 +545,6 @@ namespace UDRoute
                 }
             }
 
-            if (cfg.ServerRecords.Count == 0 && cfg.ClientRecords.Count == 0)
-            {
-                cfg.EnableProxy = true;
-            }
             foreach (var r in cfg.ClientRecords)
             {
                 r.ForceRelay = cfg.ForceRelay;

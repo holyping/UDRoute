@@ -306,7 +306,7 @@ public partial class SceneEditViewModel : ObservableObject
 
         scene.Name = SceneName;
         scene.Config.EnableProxy = EnableProxy;
-        scene.Config.Port = ProxyPort;
+        scene.Config.Port = EnableProxy ? ProxyPort : 0;
         scene.Config.WanPort = WanPort;
         scene.Config.Server = DefaultServer;
         scene.Config.DevName = DevName;

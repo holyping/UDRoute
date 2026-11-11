@@ -45,6 +45,10 @@ public partial class EngineService : ObservableObject, IEngineCallback
         _runningTask = Task.Run(async () =>
         {
             var config = scene.Config;
+            if (!config.EnableProxy)
+            {
+                config.Port = 0;
+            }
             try
             {
                 _engine = new RouteEngine(config, this);
