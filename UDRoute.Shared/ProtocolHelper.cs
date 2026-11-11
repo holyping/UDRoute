@@ -1,5 +1,7 @@
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text;
 
@@ -224,29 +226,298 @@ namespace UDRoute
             return Array.Empty<IPEndPoint>();
         }
 
+        public static bool IsGlobalUnicastIPv6(IPAddress addr)
+        {
+            if (addr.AddressFamily != AddressFamily.InterNetworkV6) return false;
+            if (addr.IsIPv6LinkLocal || addr.IsIPv6SiteLocal || addr.IsIPv6Multicast) return false;
+            if (IPAddress.IsLoopback(addr) || addr.IsIPv4MappedToIPv6) return false;
+
+            Span<byte> bytes = stackalloc byte[16];
+            if (!addr.TryWriteBytes(bytes, out int written) || written != 16) return false;
+            if ((bytes[0] & 0xFE) == 0xFC) return false;
+
+            for (int i = 0; i < 16; i++)
+            {
+                if (bytes[i] != 0) return true;
+            }
+            return false;
+        }
+
+        private static int GetLocalEndpointPriority(UnicastIPAddressInformation ip)
+        {
+            if (ip.Address.AddressFamily == AddressFamily.InterNetworkV6)
+            {
+                bool isDeprecated = false;
+                bool isRandom = false;
+                if (OperatingSystem.IsWindows())
+                {
+                    try
+                    {
+                        var dad = ip.DuplicateAddressDetectionState;
+                        isDeprecated = dad == DuplicateAddressDetectionState.Deprecated || dad == DuplicateAddressDetectionState.Invalid;
+                    }
+                    catch { }
+                    try
+                    {
+                        isRandom = ip.SuffixOrigin == SuffixOrigin.Random;
+                    }
+                    catch { }
+                }
+
+                if (IsGlobalUnicastIPv6(ip.Address))
+                {
+                    if (isDeprecated) return 4;
+                    return isRandom ? 0 : 1;
+                }
+                return 3;
+            }
+
+            Span<byte> v4Bytes = stackalloc byte[4];
+            if (ip.Address.TryWriteBytes(v4Bytes, out int len) && len == 4 && v4Bytes[0] == 169 && v4Bytes[1] == 254)
+            {
+                return 5;
+            }
+            return 2;
+        }
+
         // 获取本机所有有效的局域网/公网 IP (IPv4 和 IPv6)
         public static List<IPEndPoint> GetLocalEndPoints(int port)
         {
-            var list = new List<IPEndPoint>();
+            var candidates = new List<(IPEndPoint Ep, int Priority)>();
+            var seenIps = new HashSet<IPAddress>();
             try
             {
-                foreach (var ni in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
+                foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
                 {
-                    if (ni.OperationalStatus != System.Net.NetworkInformation.OperationalStatus.Up) continue;
+                    if (ni.OperationalStatus != OperationalStatus.Up) continue;
+                    if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+
                     foreach (var ip in ni.GetIPProperties().UnicastAddresses)
                     {
                         if (IPAddress.IsLoopback(ip.Address)) continue;
                         if (ip.Address.AddressFamily == AddressFamily.InterNetwork ||
                             (!DisableIPv6 && ip.Address.AddressFamily == AddressFamily.InterNetworkV6 && !ip.Address.IsIPv6LinkLocal))
                         {
-                            Logging.Log.Trace($"Found local IP: {ip.Address}");
-                            list.Add(new IPEndPoint(ip.Address, port));
+                            if (seenIps.Add(ip.Address))
+                            {
+                                Logging.Log.Trace($"Found local IP: {ip.Address}");
+                                candidates.Add((new IPEndPoint(ip.Address, port), GetLocalEndpointPriority(ip)));
+                            }
                         }
                     }
                 }
             }
             catch { }
+
+            candidates.Sort((a, b) => a.Priority.CompareTo(b.Priority));
+            var list = new List<IPEndPoint>(candidates.Count);
+            foreach (var item in candidates)
+            {
+                list.Add(item.Ep);
+            }
             return list;
+        }
+
+        public static int WriteLocalEndPoints(Span<byte> buffer, IReadOnlyList<IPEndPoint>? endpoints, int maxCount = 10)
+        {
+            if (buffer.Length < 1) return 0;
+            int offset = 1;
+            byte count = 0;
+
+            if (endpoints != null)
+            {
+                foreach (var ep in endpoints)
+                {
+                    if (ep.Port <= 0 || ep.Port > 65535) continue;
+                    int needed = (ep.AddressFamily == AddressFamily.InterNetwork || ep.Address.IsIPv4MappedToIPv6) ? 9 : 21;
+                    if (offset + needed > buffer.Length) break;
+                    offset += WriteIPEndPoint(buffer.Slice(offset), ep);
+                    count++;
+                    if (count >= maxCount) break;
+                }
+            }
+
+            buffer[0] = count;
+            return offset;
+        }
+
+        public static List<IPEndPoint> ReadLocalEndPoints(ReadOnlySpan<byte> buffer, out int bytesRead)
+        {
+            var list = new List<IPEndPoint>();
+            bytesRead = 0;
+            if (buffer.Length < 1) return list;
+
+            byte count = buffer[0];
+            int offset = 1;
+            for (int i = 0; i < count && offset < buffer.Length; i++)
+            {
+                byte family = buffer[offset];
+                int needed = family == 4 ? 9 : (family == 6 ? 21 : -1);
+                if (needed < 0 || offset + needed > buffer.Length) break;
+
+                var (ep, len) = ReadIPEndPoint(buffer.Slice(offset));
+                offset += len;
+                if (ep.Port > 0 && ep.Port <= 65535)
+                {
+                    list.Add(ep);
+                }
+            }
+
+            bytesRead = offset;
+            return list;
+        }
+
+        public static byte[] BuildQueryPacket(
+            ushort contextId,
+            Guid sessionId,
+            string queryName,
+            bool forceRelay,
+            bool isReuse,
+            Guid instanceId,
+            IReadOnlyList<IPEndPoint>? localEps)
+        {
+            byte[] buf = ArrayPool<byte>.Shared.Rent(512);
+            try
+            {
+                buf[0] = (byte)MsgType.Query;
+                BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(1, 2), contextId);
+                sessionId.TryWriteBytes(buf.AsSpan(3, 16));
+                int offset = 19 + WriteString(buf.AsSpan(19), queryName);
+                buf[offset++] = (byte)((forceRelay ? 1 : 0) | (isReuse ? 2 : 0));
+                instanceId.TryWriteBytes(buf.AsSpan(offset, 16));
+                offset += 16;
+
+                if (localEps != null && localEps.Count > 0)
+                {
+                    offset += WriteLocalEndPoints(buf.AsSpan(offset), localEps);
+                }
+
+                return buf.AsSpan(0, offset).ToArray();
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buf);
+            }
+        }
+
+        public static byte[] BuildRelayStartPacket(
+            ushort contextId,
+            Guid sessionId,
+            string targetName,
+            EndPoint clientPublicEp,
+            bool allowRelay,
+            bool effectiveForceRelay,
+            bool isReuse,
+            IReadOnlyList<IPEndPoint>? clientLocalEps)
+        {
+            byte[] buf = ArrayPool<byte>.Shared.Rent(512);
+            try
+            {
+                buf[0] = (byte)MsgType.RelayStart;
+                BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(1, 2), contextId);
+                sessionId.TryWriteBytes(buf.AsSpan(3, 16));
+                int offset = 19;
+                offset += WriteString(buf.AsSpan(offset), targetName);
+                offset += WriteIPEndPoint(buf.AsSpan(offset), clientPublicEp);
+                buf[offset++] = (byte)((allowRelay ? 1 : 0) | (effectiveForceRelay ? 2 : 0) | (isReuse ? 4 : 0));
+
+                if (clientLocalEps != null && clientLocalEps.Count > 0)
+                {
+                    offset += WriteLocalEndPoints(buf.AsSpan(offset), clientLocalEps);
+                }
+
+                return buf.AsSpan(0, offset).ToArray();
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buf);
+            }
+        }
+
+        public static List<IPEndPoint> BuildPunchCandidates(
+            IPEndPoint? primaryRemoteEp,
+            int wanPort,
+            IReadOnlyList<IPEndPoint>? peerLocalEps,
+            int myLocalPort,
+            string logPrefix)
+        {
+            var localIps = GetLocalIPAddresses();
+            var candidates = new List<IPEndPoint>();
+
+            void TryAddPublicCandidate(IPEndPoint? ep)
+            {
+                if (ep == null || ep.Port <= 0 || ep.Port > 65535) return;
+                if (DisableIPv6 && ep.AddressFamily == AddressFamily.InterNetworkV6) return;
+                if (myLocalPort > 0 && ep.Port == myLocalPort && (localIps.Contains(ep.Address) || IPAddress.IsLoopback(ep.Address))) return;
+                if (!candidates.Any(c => AreEndPointsEqual(c, ep))) candidates.Add(ep);
+            }
+
+            TryAddPublicCandidate(primaryRemoteEp);
+            if (primaryRemoteEp != null && wanPort > 0 && wanPort != primaryRemoteEp.Port)
+            {
+                TryAddPublicCandidate(new IPEndPoint(primaryRemoteEp.Address, wanPort));
+            }
+
+            if (peerLocalEps != null)
+            {
+                foreach (var ep in peerLocalEps)
+                {
+                    if (ep.Port <= 0 || ep.Port > 65535) continue;
+                    if (DisableIPv6 && ep.AddressFamily == AddressFamily.InterNetworkV6) continue;
+
+                    if (localIps.Contains(ep.Address))
+                    {
+                        Logging.Log.Debug($"[{logPrefix}] Skipping candidate endpoint {ep}: IP matches local machine IP.");
+                        continue;
+                    }
+
+                    if (IPAddress.IsLoopback(ep.Address) && myLocalPort > 0 && ep.Port == myLocalPort)
+                    {
+                        continue;
+                    }
+
+                    if (!candidates.Any(c => AreEndPointsEqual(c, ep))) candidates.Add(ep);
+                }
+            }
+
+            return candidates;
+        }
+
+        public static async Task RunUdpPunchLoopAsync(
+            ZeroCopyUdpSocket udp,
+            TunnelSession session,
+            Guid selfInstanceId,
+            IReadOnlyList<IPEndPoint> candidates,
+            string logPrefix,
+            CancellationToken ct)
+        {
+            if (candidates.Count == 0)
+            {
+                Logging.Log.Info($"[{logPrefix}] Session {session.SessionId}: All candidate endpoints were filtered out (no remote targets). Skipping UDP punch and continuing with Proxy relay.");
+                return;
+            }
+
+            byte[] punchBuf = new byte[36];
+            punchBuf[0] = (byte)MsgType.Punch;
+            BinaryPrimitives.WriteUInt16LittleEndian(punchBuf.AsSpan(1, 2), 0);
+            session.SessionId.TryWriteBytes(punchBuf.AsSpan(3, 16));
+            selfInstanceId.TryWriteBytes(punchBuf.AsSpan(19, 16));
+            punchBuf[35] = PunchStatus.PunchReq;
+
+            Logging.Log.Info($"[{logPrefix}] Session {session.SessionId} starting UDP punch to targets: {string.Join(", ", candidates)} (duration: {Constants.DefaultPunchRetries * Constants.DefaultPunchIntervalMs / 1000}s, interval: {Constants.DefaultPunchIntervalMs}ms)");
+
+            for (int i = 0; i < Constants.DefaultPunchRetries && !session.IsDirect && !ct.IsCancellationRequested; i++)
+            {
+                foreach (var ep in candidates)
+                {
+                    try
+                    {
+                        await udp.SendAsync(punchBuf, ep, ct);
+                    }
+                    catch { }
+                }
+                await Task.Delay(Constants.DefaultPunchIntervalMs, ct);
+            }
         }
 
         // 根据远端目标地址类型获取本机可达的本地端点（优先局域网/公网IP，若对端为回环则返回回环）

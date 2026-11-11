@@ -871,24 +871,6 @@ namespace UDRoute
                 "Failed to obtain probe response from Proxy ephemeral port (if Proxy security group only opens the primary port, this typically indicates Symmetric NAT 4 blocked due to port change, or ephemeral UDP traffic restricted). Relay via Proxy recommended."));
         }
 
-        public static bool IsGlobalUnicastIPv6(IPAddress addr)
-        {
-            if (addr.AddressFamily != AddressFamily.InterNetworkV6) return false;
-            if (addr.IsIPv6LinkLocal || addr.IsIPv6SiteLocal || addr.IsIPv6Multicast) return false;
-            if (IPAddress.IsLoopback(addr) || addr.IsIPv4MappedToIPv6) return false;
-
-            byte[] bytes = addr.GetAddressBytes();
-            // ULA (fc00::/7)
-            if ((bytes[0] & 0xFE) == 0xFC) return false;
-
-            bool allZero = true;
-            for (int i = 0; i < bytes.Length; i++)
-            {
-                if (bytes[i] != 0) { allZero = false; break; }
-            }
-            if (allZero) return false;
-
-            return true;
-        }
+        public static bool IsGlobalUnicastIPv6(IPAddress addr) => ProtocolHelper.IsGlobalUnicastIPv6(addr);
     }
 }

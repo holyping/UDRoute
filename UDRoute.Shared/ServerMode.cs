@@ -251,7 +251,13 @@ namespace UDRoute
                         {
                             if (res.Result != null)
                             {
-                                if (!localEps.Contains(res.Result)) localEps.Add(res.Result);
+                                if (!localEps.Any(e => ProtocolHelper.AreEndPointsEqual(e, res.Result)))
+                                {
+                                    if (res.Result.AddressFamily == AddressFamily.InterNetworkV6)
+                                        localEps.Insert(0, res.Result);
+                                    else
+                                        localEps.Add(res.Result);
+                                }
                             }
                             else if (res.Target.AddressFamily == AddressFamily.InterNetworkV6)
                             {
@@ -300,7 +306,13 @@ namespace UDRoute
                             {
                                 if (res.Result != null)
                                 {
-                                    if (!localEps.Contains(res.Result)) localEps.Add(res.Result);
+                                    if (!localEps.Any(e => ProtocolHelper.AreEndPointsEqual(e, res.Result)))
+                                    {
+                                        if (res.Result.AddressFamily == AddressFamily.InterNetworkV6)
+                                            localEps.Insert(0, res.Result);
+                                        else
+                                            localEps.Add(res.Result);
+                                    }
                                 }
                                 else
                                 {
@@ -328,16 +340,9 @@ namespace UDRoute
                         offset += ProtocolHelper.WriteString(buffer.AsSpan(offset), rec.Name);
                         offset += ProtocolHelper.WriteString(buffer.AsSpan(offset), _config.DevName);
 
-                        int countPos = offset++;
-                        byte epCount = 0;
-                        foreach (var ep in localEps)
-                        {
-                            if (offset + 21 > buffer.Length) break;
-                            offset += ProtocolHelper.WriteIPEndPoint(buffer.AsSpan(offset), ep);
-                            epCount++;
-                            if (epCount >= 10) break; // 最多带 10 个
-                        }
-                        buffer[countPos] = epCount;
+                        int countStart = offset;
+                        offset += ProtocolHelper.WriteLocalEndPoints(buffer.AsSpan(offset), localEps);
+                        byte epCount = buffer[countStart];
 
                         offset += ProtocolHelper.WriteString(buffer.AsSpan(offset), rec.Username ?? _config.Username ?? "");
                         byte[]? hash2Bytes = rec.Password ?? _config.Password;
@@ -523,11 +528,16 @@ namespace UDRoute
             offset += nLen;
             var (cPublicEp, epLen) = ProtocolHelper.ReadIPEndPoint(data.Slice(offset));
             offset += epLen;
+            if (offset >= data.Length) return;
 
             bool allowRelay = (data[offset] & 1) != 0;
             bool clientForceRelay = (data[offset] & 2) != 0;
             bool isReuse = (data[offset] & 4) != 0;
             offset++;
+
+            var cLocalEps = offset < data.Length
+                ? ProtocolHelper.ReadLocalEndPoints(data.Slice(offset), out _)
+                : null;
 
             var rec = _config.ServerRecords.FirstOrDefault(r =>
             {
@@ -554,7 +564,7 @@ namespace UDRoute
                 }
             }
 
-            Log.Info($"[S] RelayStart: Session {sessionId}, Context: {contextId} for '{targetName}', Client: {cPublicEp}, AllowRelay: {allowRelay}, ClientForceRelay: {clientForceRelay}, IsReuse: {isReuse}");
+            Log.Info($"[S] RelayStart: Session {sessionId}, Context: {contextId} for '{targetName}', Client: {cPublicEp}" + (cLocalEps != null && cLocalEps.Count > 0 ? $" (+{cLocalEps.Count} local/IPv6 EPs)" : "") + $", AllowRelay: {allowRelay}, ClientForceRelay: {clientForceRelay}, IsReuse: {isReuse}");
 
             if (rec != null)
             {
@@ -607,7 +617,7 @@ namespace UDRoute
                         try
                         {
                             int punchTimeoutMs = Constants.DefaultPunchRetries * Constants.DefaultPunchIntervalMs;
-                            _ = StartPunchingAsync(runSession, cPublicEp, ct);
+                            _ = StartPunchingAsync(runSession, cPublicEp, cLocalEps, ct);
                             bool punchSuccess = await runSession.WaitForDirectAsync(TimeSpan.FromMilliseconds(punchTimeoutMs), ct);
                             if (!punchSuccess)
                             {
@@ -716,7 +726,7 @@ namespace UDRoute
                     {
                         if (!clientForceRelay && !sessionToRun.IsDirect)
                         {
-                            _ = StartPunchingAsync(sessionToRun, cPublicEp, ct);
+                            _ = StartPunchingAsync(sessionToRun, cPublicEp, cLocalEps, ct);
                         }
                         return;
                     }
@@ -725,7 +735,7 @@ namespace UDRoute
                     {
                         if (!clientForceRelay)
                         {
-                            _ = StartPunchingAsync(sessionToRun, cPublicEp, ct);
+                            _ = StartPunchingAsync(sessionToRun, cPublicEp, cLocalEps, ct);
                         }
                         else
                         {
@@ -1116,44 +1126,11 @@ namespace UDRoute
             return false;
         }
 
-        private async Task StartPunchingAsync(TunnelSession session, IPEndPoint cPublicEp, CancellationToken ct)
+        private async Task StartPunchingAsync(TunnelSession session, IPEndPoint cPublicEp, IReadOnlyList<IPEndPoint>? cLocalEps, CancellationToken ct)
         {
-            byte[] punchBuf = new byte[36];
-            punchBuf[0] = (byte)MsgType.Punch;
-            BinaryPrimitives.WriteUInt16LittleEndian(punchBuf.AsSpan(1, 2), 0);
-            session.SessionId.TryWriteBytes(punchBuf.AsSpan(3, 16));
-            _config.InstanceId.TryWriteBytes(punchBuf.AsSpan(19, 16));
-            punchBuf[35] = 2; // Direct Punch
-
-            var localIps = ProtocolHelper.GetLocalIPAddresses();
             int myLocalPort = _udp.LocalEndPoint is IPEndPoint myLp ? myLp.Port : 0;
-
-            var candidates = new List<IPEndPoint>();
-            if (cPublicEp != null && !(myLocalPort > 0 && cPublicEp.Port == myLocalPort && (localIps.Contains(cPublicEp.Address) || IPAddress.IsLoopback(cPublicEp.Address))))
-            {
-                candidates.Add(cPublicEp);
-            }
-
-            if (candidates.Count == 0)
-            {
-                Log.Info($"[S] Session {session.SessionId}: All candidate endpoints were filtered out (no remote targets). Skipping UDP punch and continuing with Proxy relay.");
-                return;
-            }
-
-            Log.Info($"[S] Session {session.SessionId} starting UDP punch to targets: {string.Join(", ", candidates)} (duration: {Constants.DefaultPunchRetries * Constants.DefaultPunchIntervalMs / 1000}s, interval: {Constants.DefaultPunchIntervalMs}ms)");
-
-            for (int i = 0; i < Constants.DefaultPunchRetries && !session.IsDirect && !ct.IsCancellationRequested; i++)
-            {
-                foreach (var ep in candidates)
-                {
-                    try
-                    {
-                        await _udp.SendAsync(punchBuf, ep, ct);
-                    }
-                    catch { }
-                }
-                await Task.Delay(Constants.DefaultPunchIntervalMs, ct);
-            }
+            var candidates = ProtocolHelper.BuildPunchCandidates(cPublicEp, 0, cLocalEps, myLocalPort, "S");
+            await ProtocolHelper.RunUdpPunchLoopAsync(_udp, session, _config.InstanceId, candidates, "S", ct);
         }
 
         private async Task RunPKeepAliveAsync(string pServer, int intervalSec, CancellationToken ct)

@@ -79,6 +79,7 @@ UDRoute 是一个 P2P/中继 隧道系统。该系统包含三种基本角色：
 - `[TargetName] (String)`
 - `[Flags] (1 byte)` (Bit0: ForceRelay, Bit1: IsReuse)
 - `[InstanceId] (16 bytes, Guid, C 节点运行实例唯一标识)`
+- `[EpCount] (1 byte, 可选)` + `[ClientLocalEps...] (可变长度，C 端本地/公网 IPv6 与 IPv4 候选端点列表，用于双向打洞)`
 
 **Query Response (复用 Punch 结构作为 P 对 C 的直接回复)**
 - 如果成功 (Status = 1):
@@ -107,6 +108,7 @@ UDRoute 是一个 P2P/中继 隧道系统。该系统包含三种基本角色：
 - `[TargetName] (String)`
 - `[ClientPublicEp] (EndPoint)`
 - `[Flags] (1 byte)` (Bit0: AllowRelay, Bit1: ClientForceRelay, Bit2: IsReuse)
+- `[EpCount] (1 byte, 可选)` + `[ClientLocalEps...] (可变长度，C 端本地/公网 IPv6 与 IPv4 候选端点列表，供 S 端双向打洞)`
 
 **RelayStartAck (14)**
 - `[MsgType = 14] (1 byte)`

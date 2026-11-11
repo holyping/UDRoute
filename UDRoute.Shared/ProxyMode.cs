@@ -485,6 +485,12 @@ namespace UDRoute
                 cInstanceId = new Guid(data.Slice(qOffset, 16));
                 qOffset += 16;
             }
+            List<IPEndPoint>? cLocalEps = null;
+            if (qOffset < data.Length)
+            {
+                cLocalEps = ProtocolHelper.ReadLocalEndPoints(data.Slice(qOffset), out int epRead);
+                qOffset += epRead;
+            }
             bool isClientLocal = (_config.InstanceId != Guid.Empty && cInstanceId == _config.InstanceId);
             if (isClientLocal)
             {
@@ -605,26 +611,10 @@ namespace UDRoute
                         sInfo.LastSeen = DateTime.UtcNow;
 
                         // 本地 S 模式通过委托直接进行内存级分发通知 (ContextId 为 0，无需 ACK)
-                        byte[] relayStartBuf = ArrayPool<byte>.Shared.Rent(512);
-                        try
+                        byte[] relayCopy = ProtocolHelper.BuildRelayStartPacket(0, sessionId, targetName, remoteEp, allowRelay, effectiveForceRelay, isReuse, cLocalEps);
+                        if (LocalServerRelayStartHandler != null)
                         {
-                            relayStartBuf[0] = (byte)MsgType.RelayStart;
-                            BinaryPrimitives.WriteUInt16LittleEndian(relayStartBuf.AsSpan(1, 2), 0);
-                            sessionId.TryWriteBytes(relayStartBuf.AsSpan(3, 16));
-                            int offset = 19;
-                            offset += ProtocolHelper.WriteString(relayStartBuf.AsSpan(offset), targetName);
-                            offset += ProtocolHelper.WriteIPEndPoint(relayStartBuf.AsSpan(offset), remoteEp);
-                            relayStartBuf[offset++] = (byte)((allowRelay ? 1 : 0) | (effectiveForceRelay ? 2 : 0) | (isReuse ? 4 : 0));
-
-                            byte[] relayCopy = relayStartBuf.AsSpan(0, offset).ToArray();
-                            if (LocalServerRelayStartHandler != null)
-                            {
-                                _ = LocalServerRelayStartHandler(relayCopy, remoteEp, ct);
-                            }
-                        }
-                        finally
-                        {
-                            ArrayPool<byte>.Shared.Return(relayStartBuf);
+                            _ = LocalServerRelayStartHandler(relayCopy, remoteEp, ct);
                         }
                     }
                     else
@@ -643,24 +633,8 @@ namespace UDRoute
                             _pendingProbes[probeContextId] = probeTcs;
 
                             // 通知 S 端发起准备与打洞 (RelayStart，带 ContextId 连发3次)
-                            byte[] probeBuf = ArrayPool<byte>.Shared.Rent(512);
-                            try
-                            {
-                                probeBuf[0] = (byte)MsgType.RelayStart;
-                                BinaryPrimitives.WriteUInt16LittleEndian(probeBuf.AsSpan(1, 2), probeContextId);
-                                sessionId.TryWriteBytes(probeBuf.AsSpan(3, 16));
-                                int offset = 19;
-                                offset += ProtocolHelper.WriteString(probeBuf.AsSpan(offset), targetName);
-                                offset += ProtocolHelper.WriteIPEndPoint(probeBuf.AsSpan(offset), remoteEp);
-                                probeBuf[offset++] = (byte)((allowRelay ? 1 : 0) | (effectiveForceRelay ? 2 : 0) | (isReuse ? 4 : 0));
-
-                                byte[] probeCopy = probeBuf.AsSpan(0, offset).ToArray();
-                                _ = ProtocolHelper.SendWithRetryAsync(_udp, probeCopy, sInfo.PublicEp, probeTcs.Task, ct);
-                            }
-                            finally
-                            {
-                                ArrayPool<byte>.Shared.Return(probeBuf);
-                            }
+                            byte[] probeCopy = ProtocolHelper.BuildRelayStartPacket(probeContextId, sessionId, targetName, remoteEp, allowRelay, effectiveForceRelay, isReuse, cLocalEps);
+                            _ = ProtocolHelper.SendWithRetryAsync(_udp, probeCopy, sInfo.PublicEp, probeTcs.Task, ct);
 
                             bool probeSuccess = false;
                             using (var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(_config.ProbeTimeout)))
@@ -714,40 +688,24 @@ namespace UDRoute
                         else
                         {
                             // 活跃通路：通知 S 端 (RelayStart 连发3次)
-                            byte[] relayStartBuf = ArrayPool<byte>.Shared.Rent(512);
-                            try
+                            ushort relayContextId = (ushort)Interlocked.Increment(ref _contextCounter);
+                            if (relayContextId == 0) relayContextId = (ushort)Interlocked.Increment(ref _contextCounter);
+
+                            byte[] relayCopy = ProtocolHelper.BuildRelayStartPacket(relayContextId, sessionId, targetName, remoteEp, allowRelay, effectiveForceRelay, isReuse, cLocalEps);
+                            var relayTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                            _pendingProbes[relayContextId] = relayTcs;
+                            await _udp.SendAsync(relayCopy, sInfo.PublicEp, ct);
+                            _ = Task.Run(async () =>
                             {
-                                ushort relayContextId = (ushort)Interlocked.Increment(ref _contextCounter);
-                                if (relayContextId == 0) relayContextId = (ushort)Interlocked.Increment(ref _contextCounter);
-
-                                relayStartBuf[0] = (byte)MsgType.RelayStart;
-                                BinaryPrimitives.WriteUInt16LittleEndian(relayStartBuf.AsSpan(1, 2), relayContextId);
-                                sessionId.TryWriteBytes(relayStartBuf.AsSpan(3, 16));
-                                int offset = 19;
-                                offset += ProtocolHelper.WriteString(relayStartBuf.AsSpan(offset), targetName);
-                                offset += ProtocolHelper.WriteIPEndPoint(relayStartBuf.AsSpan(offset), remoteEp);
-                                relayStartBuf[offset++] = (byte)((allowRelay ? 1 : 0) | (effectiveForceRelay ? 2 : 0) | (isReuse ? 4 : 0));
-
-                                byte[] relayCopy = relayStartBuf.AsSpan(0, offset).ToArray();
-                                var relayTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-                                _pendingProbes[relayContextId] = relayTcs;
-                                await _udp.SendAsync(relayCopy, sInfo.PublicEp, ct);
-                                _ = Task.Run(async () =>
+                                try
                                 {
-                                    try
-                                    {
-                                        await ProtocolHelper.SendWithRetryAsync(_udp, relayCopy, sInfo.PublicEp, relayTcs.Task, ct);
-                                    }
-                                    finally
-                                    {
-                                        _pendingProbes.TryRemove(relayContextId, out _);
-                                    }
-                                });
-                            }
-                            finally
-                            {
-                                ArrayPool<byte>.Shared.Return(relayStartBuf);
-                            }
+                                    await ProtocolHelper.SendWithRetryAsync(_udp, relayCopy, sInfo.PublicEp, relayTcs.Task, ct);
+                                }
+                                finally
+                                {
+                                    _pendingProbes.TryRemove(relayContextId, out _);
+                                }
+                            });
                         }
                     }
 

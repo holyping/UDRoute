@@ -609,71 +609,17 @@ namespace UDRoute
             }
         }
 
+        private List<IPEndPoint> GetMyLocalEndPoints()
+        {
+            int myLocalPort = _udp.LocalEndPoint is IPEndPoint lep ? lep.Port : _config.Port;
+            return myLocalPort > 0 ? ProtocolHelper.GetLocalEndPoints(myLocalPort) : new List<IPEndPoint>();
+        }
+
         private async Task StartPunchingAsync(TunnelSession session, Guid expectedDevId, IPEndPoint sPublicEp, int sWanPort, List<IPEndPoint> localEps, CancellationToken ct)
         {
-            byte[] punchBuf = new byte[36];
-            punchBuf[0] = (byte)MsgType.Punch;
-            BinaryPrimitives.WriteUInt16LittleEndian(punchBuf.AsSpan(1, 2), 0);
-            session.SessionId.TryWriteBytes(punchBuf.AsSpan(3, 16));
-            _config.InstanceId.TryWriteBytes(punchBuf.AsSpan(19, 16));
-            punchBuf[35] = 2; // Direct Punch
-
-            var localIps = ProtocolHelper.GetLocalIPAddresses();
             int myLocalPort = _udp.LocalEndPoint is IPEndPoint myLp ? myLp.Port : 0;
-
-            var candidates = new List<IPEndPoint>();
-            if (sPublicEp != null && !(myLocalPort > 0 && sPublicEp.Port == myLocalPort && (localIps.Contains(sPublicEp.Address) || IPAddress.IsLoopback(sPublicEp.Address))))
-            {
-                candidates.Add(sPublicEp);
-            }
-            if (sWanPort > 0 && sWanPort != sPublicEp?.Port)
-            {
-                var wanEp = new IPEndPoint(sPublicEp!.Address, sWanPort);
-                if (!(myLocalPort > 0 && wanEp.Port == myLocalPort && (localIps.Contains(wanEp.Address) || IPAddress.IsLoopback(wanEp.Address))))
-                {
-                    candidates.Add(wanEp);
-                }
-            }
-            if (localEps != null)
-            {
-                foreach (var ep in localEps)
-                {
-                    // 过滤与本机网卡相同的 IP 地址，避免向本机发包导致内核拦截或无效发包
-                    if (localIps.Contains(ep.Address))
-                    {
-                        Log.Debug($"[C] Skipping candidate endpoint {ep}: IP matches local machine IP.");
-                        continue;
-                    }
-
-                    if (IPAddress.IsLoopback(ep.Address) && myLocalPort > 0 && ep.Port == myLocalPort)
-                    {
-                        continue;
-                    }
-
-                    if (!candidates.Contains(ep)) candidates.Add(ep);
-                }
-            }
-
-            if (candidates.Count == 0)
-            {
-                Log.Info($"[C] Session {session.SessionId}: All candidate endpoints were filtered out (no remote targets). Skipping UDP punch and continuing with Proxy relay.");
-                return;
-            }
-
-            Log.Info($"[C] Session {session.SessionId} starting UDP punch to targets: {string.Join(", ", candidates)} (duration: {Constants.DefaultPunchRetries * Constants.DefaultPunchIntervalMs / 1000}s, interval: {Constants.DefaultPunchIntervalMs}ms)");
-
-            for (int i = 0; i < Constants.DefaultPunchRetries && !session.IsDirect && !ct.IsCancellationRequested; i++)
-            {
-                foreach (var ep in candidates)
-                {
-                    try
-                    {
-                        await _udp.SendAsync(punchBuf, ep, ct);
-                    }
-                    catch { }
-                }
-                await Task.Delay(Constants.DefaultPunchIntervalMs, ct);
-            }
+            var candidates = ProtocolHelper.BuildPunchCandidates(sPublicEp, sWanPort, localEps, myLocalPort, "C");
+            await ProtocolHelper.RunUdpPunchLoopAsync(_udp, session, _config.InstanceId, candidates, "C", ct);
         }
 
         private async Task AcceptUdpLoopAsync(ClientRecord rec, CancellationToken ct)
@@ -879,32 +825,17 @@ namespace UDRoute
                 var cEpToSend = ProtocolHelper.GetReachableLocalEndPoint(sInfo.PublicEp, _config.WanPort, myLocalPort);
 
                 // 通知 S 端刷新中继
-                byte[] relayStartBuf = ArrayPool<byte>.Shared.Rent(512);
-                try
-                {
-                    relayStartBuf[0] = (byte)MsgType.RelayStart;
-                    BinaryPrimitives.WriteUInt16LittleEndian(relayStartBuf.AsSpan(1, 2), 0);
-                    session.SessionId.TryWriteBytes(relayStartBuf.AsSpan(3, 16));
-                    int offset = 19;
-                    offset += ProtocolHelper.WriteString(relayStartBuf.AsSpan(offset), queryName);
-                    offset += ProtocolHelper.WriteIPEndPoint(relayStartBuf.AsSpan(offset), cEpToSend);
-                    bool allowRelay = localProxy.IsRelayAllowed(sInfo);
-                    bool effectiveForceRelay = rec.ForceRelay && allowRelay;
-                    relayStartBuf[offset++] = (byte)((allowRelay ? 1 : 0) | (effectiveForceRelay ? 2 : 0) | 4);
-                    byte[] relayCopy = relayStartBuf.AsSpan(0, offset).ToArray();
+                bool allowRelay = localProxy.IsRelayAllowed(sInfo);
+                bool effectiveForceRelay = rec.ForceRelay && allowRelay;
+                byte[] relayCopy = ProtocolHelper.BuildRelayStartPacket(0, session.SessionId, queryName, cEpToSend, allowRelay, effectiveForceRelay, true, GetMyLocalEndPoints());
 
-                    if (sInfo.IsLocalServer && localProxy.LocalServerRelayStartHandler != null)
-                    {
-                        _ = localProxy.LocalServerRelayStartHandler(relayCopy, cEpToSend, ct);
-                    }
-                    else
-                    {
-                        await _udp.SendAsync(relayCopy, sInfo.PublicEp, ct);
-                    }
-                }
-                finally
+                if (sInfo.IsLocalServer && localProxy.LocalServerRelayStartHandler != null)
                 {
-                    ArrayPool<byte>.Shared.Return(relayStartBuf);
+                    _ = localProxy.LocalServerRelayStartHandler(relayCopy, cEpToSend, ct);
+                }
+                else
+                {
+                    await _udp.SendAsync(relayCopy, sInfo.PublicEp, ct);
                 }
 
                 localProxy.RegisterLocalRelaySession(session.SessionId, cEpToSend, sInfo.PublicEp, sInfo.Timeout, sInfo.STimestamp, queryName);
@@ -923,24 +854,8 @@ namespace UDRoute
                 _pendingQueries[contextId] = new PendingQueryRequest(session.SessionId, contextId, tcs);
             }
 
-            byte[] qBuf = ArrayPool<byte>.Shared.Rent(256);
-            try
-            {
-                qBuf[0] = (byte)MsgType.Query;
-                BinaryPrimitives.WriteUInt16LittleEndian(qBuf.AsSpan(1, 2), contextId);
-                session.SessionId.TryWriteBytes(qBuf.AsSpan(3, 16));
-                int qLen = 19 + ProtocolHelper.WriteString(qBuf.AsSpan(19), queryName);
-                qBuf[qLen++] = (byte)((rec.ForceRelay ? 1 : 0) | 2); // Bit 0: ForceRelay, Bit 1: IsReuse
-                _config.InstanceId.TryWriteBytes(qBuf.AsSpan(qLen, 16));
-                qLen += 16;
-
-                byte[] qCopy = qBuf.AsSpan(0, qLen).ToArray();
-                _ = ProtocolHelper.SendWithRetryAsync(_udp, qCopy, pEndPoint, tcs.Task, ct);
-            }
-            finally
-            {
-                ArrayPool<byte>.Shared.Return(qBuf);
-            }
+            byte[] qCopy = ProtocolHelper.BuildQueryPacket(contextId, session.SessionId, queryName, rec.ForceRelay, true, _config.InstanceId, GetMyLocalEndPoints());
+            _ = ProtocolHelper.SendWithRetryAsync(_udp, qCopy, pEndPoint, tcs.Task, ct);
 
             int waitTimeoutSec = Math.Max(Constants.DefaultProbeTimeout + 2, 7);
             using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(waitTimeoutSec));
@@ -1180,30 +1095,15 @@ namespace UDRoute
                     var cEpToSend = ProtocolHelper.GetReachableLocalEndPoint(sInfo.PublicEp, _config.WanPort, myLocalPort);
 
                     // 通知 S 端发起准备与打洞 (RelayStart)
-                    byte[] relayStartBuf = ArrayPool<byte>.Shared.Rent(512);
-                    try
-                    {
-                        relayStartBuf[0] = (byte)MsgType.RelayStart;
-                        BinaryPrimitives.WriteUInt16LittleEndian(relayStartBuf.AsSpan(1, 2), 0);
-                        sessionId.TryWriteBytes(relayStartBuf.AsSpan(3, 16));
-                        int offset = 19;
-                        offset += ProtocolHelper.WriteString(relayStartBuf.AsSpan(offset), queryName);
-                        offset += ProtocolHelper.WriteIPEndPoint(relayStartBuf.AsSpan(offset), cEpToSend);
-                        relayStartBuf[offset++] = (byte)((allowRelay ? 1 : 0) | (effectiveForceRelay ? 2 : 0));
-                        byte[] relayCopy = relayStartBuf.AsSpan(0, offset).ToArray();
+                    byte[] relayCopy = ProtocolHelper.BuildRelayStartPacket(0, sessionId, queryName, cEpToSend, allowRelay, effectiveForceRelay, false, GetMyLocalEndPoints());
 
-                        if (sInfo.IsLocalServer && localProxy.LocalServerRelayStartHandler != null)
-                        {
-                            _ = localProxy.LocalServerRelayStartHandler(relayCopy, cEpToSend, ct);
-                        }
-                        else
-                        {
-                            await _udp.SendAsync(relayCopy, sInfo.PublicEp, ct);
-                        }
-                    }
-                    finally
+                    if (sInfo.IsLocalServer && localProxy.LocalServerRelayStartHandler != null)
                     {
-                        ArrayPool<byte>.Shared.Return(relayStartBuf);
+                        _ = localProxy.LocalServerRelayStartHandler(relayCopy, cEpToSend, ct);
+                    }
+                    else
+                    {
+                        await _udp.SendAsync(relayCopy, sInfo.PublicEp, ct);
                     }
 
                     localProxy.RegisterLocalRelaySession(sessionId, cEpToSend, sInfo.PublicEp, sInfo.Timeout, sInfo.STimestamp, queryName);
@@ -1267,24 +1167,8 @@ namespace UDRoute
                 _pendingQueries[contextId] = new PendingQueryRequest(sessionId, contextId, tcs);
             }
 
-            byte[] qBuf = ArrayPool<byte>.Shared.Rent(256);
-            try
-            {
-                qBuf[0] = (byte)MsgType.Query;
-                BinaryPrimitives.WriteUInt16LittleEndian(qBuf.AsSpan(1, 2), contextId);
-                sessionId.TryWriteBytes(qBuf.AsSpan(3, 16));
-                int qLen = 19 + ProtocolHelper.WriteString(qBuf.AsSpan(19), queryName);
-                qBuf[qLen++] = (byte)(rec.ForceRelay ? 1 : 0);
-                _config.InstanceId.TryWriteBytes(qBuf.AsSpan(qLen, 16));
-                qLen += 16;
-
-                byte[] qCopy = qBuf.AsSpan(0, qLen).ToArray();
-                _ = ProtocolHelper.SendWithRetryAsync(_udp, qCopy, pEndPoint, tcs.Task, ct);
-            }
-            finally
-            {
-                ArrayPool<byte>.Shared.Return(qBuf);
-            }
+            byte[] qCopy = ProtocolHelper.BuildQueryPacket(contextId, sessionId, queryName, rec.ForceRelay, false, _config.InstanceId, GetMyLocalEndPoints());
+            _ = ProtocolHelper.SendWithRetryAsync(_udp, qCopy, pEndPoint, tcs.Task, ct);
 
             int waitTimeoutSec = Math.Max(Constants.DefaultProbeTimeout + 2, 7);
             using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(waitTimeoutSec));
